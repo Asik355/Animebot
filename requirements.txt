@@ -1,0 +1,11 @@
+# Python 3.10+ required (python-telegram-bot 22.6+ dropped 3.9).
+# >=22.7 adds native InlineKeyboardButton(style=...) used for the green help-menu buttons.
+python-telegram-bot[job-queue]>=22.7,<23.0
+# Sync driver; the bot calls it through asyncio.to_thread (no Motor needed).
+pymongo>=4.6,<5.0
+# Needed for mongodb+srv:// (Atlas) URIs and the DNS resolver patch at the top of bot.py / migrate_to_mongo.py
+dnspython>=2.4.0,<3.0
+certifi>=2023.7.22
+python-dotenv>=1.0.0,<2.0
+# No web framework is needed: the health server and keep-alive ping use only the Python standard library
+# (http.server, urllib). Do NOT add gunicorn: it would start extra worker processes, and the bot must run as ONE instance.

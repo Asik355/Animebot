@@ -1,0 +1,4870 @@
+import asyncio
+import json
+import random
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timedelta
+
+from telegram import (
+    Update,
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ConversationHandler,
+    MessageHandler,
+    ContextTypes,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    filters,
+)
+
+from config import (
+    BOT_TOKEN,
+    ADMIN_IDS,
+    EXECUTIVE_IDS,
+    DB_NAME,
+    DAILY_COINS,
+    DAILY_RESET_HOUR,
+    ITEMS_PER_PAGE,
+)
+# ---------- AUTO-SPAWN GROUP REGISTRY ----------
+# Stored separately from the existing SQLite database. This lets automatic
+# spawning resume after a bot restart without changing the database.
+AUTO_SPAWN_GROUPS_FILE = Path(__file__).with_name("auto_spawn_groups.json")
+
+
+def load_auto_spawn_groups():
+    try:
+        if not AUTO_SPAWN_GROUPS_FILE.exists():
+            return set()
+        data = json.loads(AUTO_SPAWN_GROUPS_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, list):
+            return set()
+        return {int(chat_id) for chat_id in data}
+    except Exception as e:
+        print("Auto-spawn group registry load error:", e)
+        return set()
+
+
+def save_auto_spawn_groups(groups):
+    try:
+        AUTO_SPAWN_GROUPS_FILE.write_text(
+            json.dumps(sorted(int(chat_id) for chat_id in groups)),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        print("Auto-spawn group registry save error:", e)
+
+
+def register_auto_spawn_group(chat_id):
+    if not chat_id:
+        return
+    groups = load_auto_spawn_groups()
+    if chat_id not in groups:
+        groups.add(chat_id)
+        save_auto_spawn_groups(groups)
+
+
+def unregister_auto_spawn_group(chat_id):
+    groups = load_auto_spawn_groups()
+    if chat_id in groups:
+        groups.remove(chat_id)
+        save_auto_spawn_groups(groups)
+
+
+async def is_group_approved(chat_id):
+    """Return whether a group has explicit owner approval."""
+    approved_file = Path(__file__).with_name("approved_groups.json")
+    try:
+        if not approved_file.exists():
+            return False
+        data = json.loads(approved_file.read_text(encoding="utf-8"))
+        return int(chat_id) in {int(x) for x in data if str(x).lstrip("-").isdigit()}
+    except Exception as e:
+        print("Approved group registry read error:", e)
+        return False
+
+
+def save_approved_groups(groups):
+    approved_file = Path(__file__).with_name("approved_groups.json")
+    try:
+        approved_file.write_text(json.dumps(sorted(int(x) for x in groups)), encoding="utf-8")
+    except Exception as e:
+        print("Approved group registry save error:", e)
+
+
+def load_approved_groups():
+    approved_file = Path(__file__).with_name("approved_groups.json")
+    try:
+        if not approved_file.exists():
+            return set()
+        data = json.loads(approved_file.read_text(encoding="utf-8"))
+        return {int(x) for x in data if str(x).lstrip("-").isdigit()}
+    except Exception:
+        return set()
+
+
+async def require_auction_private(update):
+    """Auction actions/settings must be done in the bot's private chat."""
+    chat = getattr(update, "effective_chat", None)
+    if not chat or chat.type != "private":
+        if getattr(update, "message", None):
+            await update.message.reply_text(
+                "🚫 Auction actions are available only in the bot's PM.\n"
+                "Open the bot in private chat to bid, create, or end an auction."
+            )
+        return False
+    return True
+
+
+async def approve_group(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if update.effective_chat.type != "private" or len(context.args) != 1 or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage in owner DM: /approvegroup <group_chat_id>")
+        return
+    chat_id = int(context.args[0])
+    groups = load_approved_groups()
+    groups.add(chat_id)
+    save_approved_groups(groups)
+    register_auto_spawn_group(chat_id)
+    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
+    context.application.bot_data.setdefault("unapproved_notified", set()).discard(chat_id)
+    await update.message.reply_text(f"✅ Group {chat_id} approved. Bot is now active in that group.")
+
+
+async def revoke_group(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if update.effective_chat.type != "private" or len(context.args) != 1 or not context.args[0].lstrip("-").isdigit():
+        await update.message.reply_text("Usage in owner DM: /revokegroup <group_chat_id>")
+        return
+    chat_id = int(context.args[0])
+    groups = load_approved_groups()
+    groups.discard(chat_id)
+    save_approved_groups(groups)
+    unregister_auto_spawn_group(chat_id)
+    await update.message.reply_text(f"✅ Approval removed for {chat_id}. Auction also turned OFF.")
+
+
+async def track_group_chat(update, context):
+    """Remember only owner-approved groups for automatic spawning."""
+    chat = getattr(update, "effective_chat", None)
+    if chat and chat.type in ("group", "supergroup") and await is_group_approved(chat.id):
+        register_auto_spawn_group(chat.id)
+        context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
+
+
+async def track_bot_membership(update, context):
+    """Require explicit owner approval before the bot stays in a group."""
+    chat = getattr(update, "effective_chat", None)
+    member_update = getattr(update, "my_chat_member", None)
+    if not chat or chat.type not in ("group", "supergroup") or not member_update:
+        return
+
+    status = member_update.new_chat_member.status
+    if status in ("member", "administrator"):
+        if await is_group_approved(chat.id):
+            register_auto_spawn_group(chat.id)
+            context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
+            return
+
+        # Stay in the group, but remain completely inactive until the owner approves it.
+        # Only send the approval notice once per group to avoid spam.
+        notified = context.application.bot_data.setdefault("unapproved_notified", set())
+        if chat.id not in notified:
+            notified.add(chat.id)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=(
+                        "🚫 This group is not approved yet.\n"
+                        "👑 Contact the bot owner to approve this group.\n"
+                        f"🆔 Group ID: {chat.id}"
+                    ),
+                )
+            except Exception as e:
+                print(f"Unapproved group notice error for {chat.id}:", e)
+            owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+            if owner_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=owner_id,
+                        text=(
+                            "🚫 New group needs approval.\n\n"
+                            f"🏷️ Group: {chat.title or 'Unknown'}\n"
+                            f"🆔 Chat ID: {chat.id}\n\n"
+                            f"Approve with: /approvegroup {chat.id}"
+                        ),
+                    )
+                except Exception as e:
+                    print("Owner group-approval notification error:", e)
+        unregister_auto_spawn_group(chat.id)
+        context.application.bot_data.setdefault("active_chats", set()).discard(chat.id)
+    elif status in ("left", "kicked"):
+        unregister_auto_spawn_group(chat.id)
+        context.application.bot_data.setdefault("active_chats", set()).discard(chat.id)
+
+
+# ---------- SETTINGS ----------
+SPAWN_LIFETIME = 600  # 10 minutes
+PERSONAL_SPAWN_COOLDOWN = 3600  # 1 hour
+GROUP_SPAWN_COOLDOWN = 70       # 70 seconds
+SYMBOL = {
+    "Common": "⚪",
+    "Rare": "🔵",
+    "Epic": "🟣",
+    "Legendary": "💎",
+    "Mythic": "💠",
+    "Celestial": "🧠",
+}
+
+WORTH = {
+    "Common": 50,
+    "Rare": 100,
+    "Epic": 200,
+    "Legendary": 500,
+    "Mythic": 750,
+    "Celestial": 1000,
+}
+
+CHANCES = [
+    ("Common", 50),
+    ("Rare", 28),
+    ("Epic", 15),
+    ("Legendary", 5),
+    ("Mythic", 1.8),
+    ("Celestial", 0.2),
+]
+
+# Global rarity limits for normal / automatic spawning:
+# Common   = unlimited
+# Rare     = unlimited
+# Epic     = unlimited
+# Legendary = max 8 per day
+# Mythic    = max 3 per day
+# Celestial = once every 48-72 hours
+LEGENDARY_DAILY_LIMIT = 8
+MYTHIC_DAILY_LIMIT = 3
+CELESTIAL_MIN_HOURS = 48
+CELESTIAL_MAX_HOURS = 72
+
+
+# Popularity-based rarity overrides for seeded characters.
+# These are applied on startup so existing database rows are updated too.
+POPULAR_RARITY_OVERRIDES = {
+    "Naruto": "Mythic",
+    "Kakashi": "Legendary",
+    "Itachi": "Legendary",
+    "Madara": "Mythic",
+    "Naruto Baryon Mode": "Mythic",
+    "Luffy": "Mythic",
+    "Zoro": "Legendary",
+    "Law": "Legendary",
+    "Shanks": "Mythic",
+    "Gol D. Roger": "Mythic",
+    "Goku": "Mythic",
+    "Vegeta": "Legendary",
+    "Gohan": "Legendary",
+    "Broly": "Mythic",
+    "Ultra Instinct Goku": "Mythic",
+    "Gojo Satoru": "Mythic",
+    "Sukuna": "Mythic",
+    "Tanjiro Kamado": "Legendary",
+    "Kyojuro Rengoku": "Legendary",
+    "Yoriichi": "Mythic",
+    "Eren Yeager": "Legendary",
+    "Mikasa Ackerman": "Legendary",
+    "Levi Ackerman": "Mythic",
+    "Founding Titan Eren": "Mythic",
+}
+
+CHARACTERS = [
+    ("Naruto", "Naruto", "Rare"),
+    ("Sakura", "Naruto", "Common"),
+    ("Kakashi", "Naruto", "Rare"),
+    ("Itachi", "Naruto", "Epic"),
+    ("Madara", "Naruto", "Mythic"),
+    ("Naruto Baryon Mode", "Naruto", "Legendary"),
+    ("Luffy", "One Piece", "Legendary"),
+    ("Nami", "One Piece", "Common"),
+    ("Zoro", "One Piece", "Rare"),
+    ("Sanji", "One Piece", "Rare"),
+    ("Law", "One Piece", "Epic"),
+    ("Shanks", "One Piece", "Legendary"),
+    ("Gol D. Roger", "One Piece", "Mythic"),
+    ("Goku", "Dragon Ball", "Mythic"),
+    ("Vegeta", "Dragon Ball", "Epic"),
+    ("Piccolo", "Dragon Ball", "Rare"),
+    ("Gohan", "Dragon Ball", "Epic"),
+    ("Broly", "Dragon Ball", "Legendary"),
+    ("Ultra Instinct Goku", "Dragon Ball", "Mythic"),
+    ("Yuji Itadori", "Jujutsu Kaisen", "Common"),
+    ("Nobara Kugisaki", "Jujutsu Kaisen", "Common"),
+    ("Megumi Fushiguro", "Jujutsu Kaisen", "Rare"),
+    ("Maki Zenin", "Jujutsu Kaisen", "Epic"),
+    ("Gojo Satoru", "Jujutsu Kaisen", "Mythic"),
+    ("Sukuna", "Jujutsu Kaisen", "Legendary"),
+    ("Tanjiro Kamado", "Demon Slayer", "Common"),
+    ("Zenitsu Agatsuma", "Demon Slayer", "Common"),
+    ("Inosuke Hashibira", "Demon Slayer", "Rare"),
+    ("Giyu Tomioka", "Demon Slayer", "Epic"),
+    ("Kyojuro Rengoku", "Demon Slayer", "Legendary"),
+    ("Yoriichi", "Demon Slayer", "Mythic"),
+    ("Eren Yeager", "Attack on Titan", "Common"),
+    ("Mikasa Ackerman", "Attack on Titan", "Rare"),
+    ("Armin Arlert", "Attack on Titan", "Rare"),
+    ("Levi Ackerman", "Attack on Titan", "Legendary"),
+    ("Erwin Smith", "Attack on Titan", "Epic"),
+    ("Founding Titan Eren", "Attack on Titan", "Mythic"),
+]
+
+
+# ---------- DATABASE ----------
+def connect():
+    # Keep SQLite operations from freezing the Telegram event loop for a long
+    # time when another update is writing. WAL lets readers continue while a
+    # writer is active, and the short timeout prevents a lock from stalling
+    # the whole bot.
+    c = sqlite3.connect(DB_NAME, timeout=2.0)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=2000")
+    return c
+
+
+def setup_database():
+    c = connect()
+    x = c.cursor()
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS users_v2 (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            coins INTEGER DEFAULT 0,
+            last_daily TEXT
+        )
+    """)
+
+    # Safe migrations for existing databases.
+    for table, column, definition in [
+        ("users_v2", "last_name", "TEXT"),
+    ]:
+        try:
+            x.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS characters_v2 (
+            code TEXT PRIMARY KEY,
+            name TEXT UNIQUE COLLATE NOCASE,
+            anime TEXT NOT NULL,
+            rarity TEXT NOT NULL,
+            worth INTEGER NOT NULL,
+            photo_file_id TEXT
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS character_recruit_names_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            character_code TEXT NOT NULL,
+            recruit_name TEXT NOT NULL COLLATE NOCASE,
+            UNIQUE(character_code, recruit_name)
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS collections_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            character_code TEXT NOT NULL,
+            caught_at TEXT
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS favorites_v2 (
+            user_id INTEGER PRIMARY KEY,
+            character_code TEXT NOT NULL,
+            set_at TEXT NOT NULL
+        )
+    """)
+
+    # New support/report tables. Existing database data is preserved.
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS issues_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            issue_text TEXT NOT NULL,
+            photo_file_id TEXT,
+            created_at TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS ideas_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            idea_text TEXT NOT NULL,
+            photo_file_id TEXT,
+            created_at TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS appeals_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            appeal_text TEXT NOT NULL,
+            photo_file_id TEXT,
+            created_at TEXT NOT NULL,
+            status TEXT DEFAULT 'pending'
+        )
+    """)
+
+    # Auction system. A listed character is moved out of the seller collection
+    # into escrow until the auction expires or is ended.
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS auctions_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            seller_id INTEGER NOT NULL,
+            character_code TEXT NOT NULL,
+            start_bid INTEGER NOT NULL,
+            current_bid INTEGER NOT NULL,
+            highest_bidder_id INTEGER,
+            ends_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS auction_bids_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            auction_id INTEGER NOT NULL,
+            bidder_id INTEGER NOT NULL,
+            amount INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    # Global rarity-spawn counters.
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS staff_roles_v2 (
+            user_id INTEGER PRIMARY KEY,
+            role TEXT NOT NULL,
+            added_at TEXT NOT NULL
+        )
+    """)
+
+    # Load persisted executives first, then merge config-based IDs.
+    x.execute("SELECT user_id FROM staff_roles_v2 WHERE role='executive'")
+    for (stored_id,) in x.fetchall():
+        if stored_id not in EXECUTIVE_IDS:
+            EXECUTIVE_IDS.append(stored_id)
+
+    x.execute("SELECT user_id FROM staff_roles_v2 WHERE role='scout'")
+    for (stored_id,) in x.fetchall():
+        if stored_id not in EXECUTIVE_IDS and stored_id not in SCOUT_IDS:
+            SCOUT_IDS.append(stored_id)
+
+    # Repair any legacy conflict deterministically: Owner/Executive always
+    # outrank Scout, so a user cannot receive two staff roles accidentally.
+    if EXECUTIVE_IDS and SCOUT_IDS:
+        conflicting = set(EXECUTIVE_IDS) & set(SCOUT_IDS)
+        for conflicting_id in conflicting:
+            x.execute("DELETE FROM staff_roles_v2 WHERE user_id=? AND role='scout'", (conflicting_id,))
+        SCOUT_IDS[:] = [uid for uid in SCOUT_IDS if uid not in conflicting]
+
+
+    # Keep config-based executives synchronized without touching user/collection data.
+    for executive_id in EXECUTIVE_IDS:
+        x.execute(
+            "INSERT INTO staff_roles_v2(user_id, role, added_at) VALUES(?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET role=excluded.role",
+            (executive_id, "executive", timestamp()),
+        )
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS spawn_limits_v2 (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            day_key TEXT NOT NULL,
+            legendary_count INTEGER DEFAULT 0,
+            mythic_count INTEGER DEFAULT 0,
+            celestial_next_at TEXT
+        )
+    """)
+
+    # Seed characters without overwriting existing rows/photos.
+    for code, (name, anime, rarity) in enumerate(CHARACTERS, 1001):
+        x.execute("""
+            INSERT OR IGNORE INTO characters_v2
+            (code, name, anime, rarity, worth, photo_file_id)
+            VALUES (?, ?, ?, ?, ?, NULL)
+        """, (str(code), name, anime, rarity, WORTH[rarity]))
+
+    # Apply popularity-based rarity changes to existing seeded characters too.
+    # Their worth follows the new rarity automatically.
+    for name, rarity in POPULAR_RARITY_OVERRIDES.items():
+        x.execute(
+            "UPDATE characters_v2 SET rarity=?, worth=? WHERE name=? COLLATE NOCASE",
+            (rarity, WORTH[rarity], name),
+        )
+
+    today_key = datetime.now().strftime("%Y-%m-%d")
+    x.execute("""
+        INSERT OR IGNORE INTO spawn_limits_v2
+        (id, day_key, legendary_count, mythic_count, celestial_next_at)
+        VALUES (1, ?, 0, 0, NULL)
+    """, (today_key,))
+
+    # Event system: one active event at a time.
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS events_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            description TEXT DEFAULT '',
+            reward_type TEXT NOT NULL,
+            reward_value TEXT NOT NULL,
+            end_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    try:
+        x.execute("ALTER TABLE events_v2 ADD COLUMN trigger_text TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS event_claims_v2 (
+            event_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY (event_id, user_id)
+        )
+    """)
+
+    # Redeem codes can be used once per user.
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS redeem_codes_v2 (
+            code TEXT PRIMARY KEY COLLATE NOCASE,
+            reward_type TEXT NOT NULL,
+            reward_value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            active INTEGER DEFAULT 1
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS redeem_claims_v2 (
+            code TEXT NOT NULL COLLATE NOCASE,
+            user_id INTEGER NOT NULL,
+            claimed_at TEXT NOT NULL,
+            PRIMARY KEY (code, user_id)
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS spawn_history_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            character_code TEXT NOT NULL,
+            rarity TEXT NOT NULL,
+            spawned_by TEXT NOT NULL DEFAULT 'auto',
+            spawned_at TEXT NOT NULL,
+            caught_by INTEGER,
+            caught_at TEXT
+        )
+    """)
+
+    x.execute("""
+        CREATE TABLE IF NOT EXISTS activity_log_v2 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            chat_id INTEGER NOT NULL,
+            command TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+
+    c.commit()
+    c.close()
+
+
+def save_user(u):
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        INSERT INTO users_v2(user_id, username, first_name, last_name)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+        username=excluded.username,
+        first_name=excluded.first_name,
+        last_name=excluded.last_name
+    """, (u.id, u.username or "", u.first_name or "", u.last_name or ""))
+    c.commit()
+    c.close()
+
+
+def get_recruit_names(character_code):
+    c = connect(); x = c.cursor()
+    x.execute("SELECT recruit_name FROM character_recruit_names_v2 WHERE character_code=? ORDER BY id", (str(character_code),))
+    rows = [r[0] for r in x.fetchall()]
+    c.close()
+    return rows
+
+
+def set_recruit_names(character_code, names):
+    cleaned = []
+    seen = set()
+    for name in names or []:
+        value = str(name).strip()
+        key = value.casefold()
+        if value and key not in seen:
+            seen.add(key); cleaned.append(value)
+    c = connect(); x = c.cursor()
+    try:
+        x.execute("DELETE FROM character_recruit_names_v2 WHERE character_code=?", (str(character_code),))
+        x.executemany(
+            "INSERT INTO character_recruit_names_v2(character_code,recruit_name) VALUES(?,?)",
+            [(str(character_code), name) for name in cleaned]
+        )
+        c.commit()
+    finally:
+        c.close()
+    return cleaned
+
+
+def find_character_by_recruit_name(value):
+    value = str(value).strip()
+    if not value:
+        return None
+    c = connect(); x = c.cursor()
+    x.execute("""
+        SELECT c.code,c.name,c.anime,c.rarity,c.worth,c.photo_file_id
+        FROM character_recruit_names_v2 r
+        JOIN characters_v2 c ON c.code=r.character_code
+        WHERE r.recruit_name=? COLLATE NOCASE
+        LIMIT 1
+    """, (value,))
+    row=x.fetchone(); c.close(); return row
+
+
+def find_characters_by_recruit_name_partial(value):
+    value = str(value).strip()
+    if not value:
+        return []
+    c = connect(); x = c.cursor()
+    x.execute("""
+        SELECT DISTINCT c.code,c.name,c.anime,c.rarity,c.worth,c.photo_file_id
+        FROM character_recruit_names_v2 r
+        JOIN characters_v2 c ON c.code=r.character_code
+        WHERE r.recruit_name LIKE ? COLLATE NOCASE
+        ORDER BY CAST(c.code AS INTEGER)
+    """, (f"%{value}%",))
+    rows=x.fetchall(); c.close(); return rows
+
+
+def get_character_recruit_names_map(character_code):
+    return get_recruit_names(character_code)
+
+
+def get_character(value):
+    c = connect(); x = c.cursor()
+    value = str(value).strip()
+    if value.isdigit() and 1 <= int(value) <= 9999:
+        code = value.zfill(4)
+        x.execute("SELECT code,name,anime,rarity,worth,photo_file_id FROM characters_v2 WHERE code=? LIMIT 1", (code,))
+    else:
+        x.execute("""
+            SELECT code,name,anime,rarity,worth,photo_file_id
+            FROM characters_v2
+            WHERE name=? COLLATE NOCASE
+            LIMIT 1
+        """, (value,))
+    row = x.fetchone(); c.close()
+    if row:
+        return row
+    return find_character_by_recruit_name(value)
+
+def get_character_by_code(code):
+    code = str(code).strip()
+    if not (code.isdigit() and 1 <= int(code) <= 9999):
+        return None
+    code = code.zfill(4)
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        SELECT code,name,anime,rarity,worth,photo_file_id
+        FROM characters_v2
+        WHERE code=?
+        LIMIT 1
+    """, (code,))
+    row = x.fetchone()
+    c.close()
+    return row
+
+
+def get_all_characters():
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        SELECT code,name,anime,rarity,worth,photo_file_id
+        FROM characters_v2
+        ORDER BY CAST(code AS INTEGER)
+    """)
+    rows = x.fetchall()
+    c.close()
+    return rows
+
+
+def get_characters_by_rarity(rarity):
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        SELECT code,name,anime,rarity,worth,photo_file_id
+        FROM characters_v2
+        WHERE rarity=?
+        ORDER BY CAST(code AS INTEGER)
+    """, (rarity,))
+    rows = x.fetchall()
+    c.close()
+    return rows
+
+
+def choose_character_for_rarity(rarity):
+    rows = get_characters_by_rarity(rarity)
+    return random.choice(rows) if rows else None
+
+
+# ---------- HELPERS ----------
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+def is_owner(user_id):
+    return bool(ADMIN_IDS) and user_id == ADMIN_IDS[0]
+
+
+def is_executive(user_id):
+    return user_id in EXECUTIVE_IDS
+
+
+# Scouts are character-management staff. They can use only the character
+# management commands, while Owner/Executive keep their existing powers.
+SCOUT_IDS = []
+
+# Runtime guard: the role lists are populated from the database during startup.
+# Keep them separate so one user cannot accidentally become both Executive and Scout.
+def is_scout(user_id):
+    # Use both runtime cache and SQLite so Scout permissions keep working
+    # even if the process was restarted or the in-memory list was not refreshed.
+    if user_id in SCOUT_IDS:
+        return True
+    try:
+        c = connect(); x = c.cursor()
+        x.execute("SELECT 1 FROM staff_roles_v2 WHERE user_id=? AND role='scout' LIMIT 1", (user_id,))
+        found = x.fetchone() is not None
+        c.close()
+        if found and user_id not in SCOUT_IDS and user_id not in EXECUTIVE_IDS and not is_owner(user_id):
+            SCOUT_IDS.append(user_id)
+        return found
+    except Exception as e:
+        print("Scout role lookup error:", e)
+        return False
+
+
+def can_manage_characters(user_id):
+    return is_owner(user_id) or is_executive(user_id) or is_scout(user_id)
+
+
+def staff_role(user_id):
+    if is_owner(user_id):
+        return "Owner"
+    if is_executive(user_id):
+        return "Executive"
+    if is_scout(user_id):
+        return "Scout"
+    return "User"
+
+
+def skip_keyboard():
+    return ReplyKeyboardMarkup([["⏭ Skip"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def is_skip_text(text):
+    return (text or "").strip().lower() in ("/skip", "⏭ skip")
+
+
+def format_duration(seconds):
+    """Format every cooldown/remaining timer as hours + minutes + seconds."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, seconds = divmod(rem, 60)
+    return (
+        f"{hours} hour" + ("s" if hours != 1 else "") + ", "
+        f"{minutes} minute" + ("s" if minutes != 1 else "") + " and "
+        f"{seconds} second" + ("s" if seconds != 1 else "")
+    )
+
+
+def spawn_name_matches(spawn_name, entered_parts):
+    """Return True only when every entered word is part of the spawned name.
+
+    Matching is case-insensitive, ignores extra whitespace, accepts any subset
+    of the name words and allows those words in any order. Duplicate entered
+    words must also exist with the same multiplicity in the real name.
+    """
+    if not entered_parts:
+        return False
+    import collections
+    name_words = collections.Counter(spawn_name.casefold().split())
+    entered_words = collections.Counter(
+        word.strip().casefold() for word in entered_parts if word.strip()
+    )
+    if not entered_words:
+        return False
+    return all(name_words[word] >= count for word, count in entered_words.items())
+
+
+def build_help_text():
+    return (
+        "🎮 Anime Character Catcher\n\n"
+        "👤 User Commands\n"
+        "/start — Start the bot\n"
+        "/help — Show help\n"
+        "/spawn — Spawn a character\n"
+        "/add — Catch the spawned character\n"
+        "/mycollection — Show your collection\n"
+        "/myfav <code> — Set favourite\n"
+        "/mystats — Show stats\n"
+        "/daily — Daily reward\n"
+        "/characters — Character list\n"
+        "/view <code> — View character\n"
+        "/check <code/name> — Check character and owners\n"
+        "/sell <code> [quantity] — Sell character\n"
+        "/transfer <code> — Transfer character by reply\n"
+        "/issue — Report an issue\n"
+        "/idea — Send a suggestion\n"
+        "/appeal — Appeal a restriction\n"
+        "/event — View the active event\n"
+        "/redeem <code> — Redeem a code\n"
+        "/auction — View active auctions\n"
+        "/bid <auction_id> <amount> — Place a bid\n"
+        "/addauction — List your character in an auction (stays in collection until sold)\n"
+        "/endauction <auction_id> — End your own auction\n"
+        "/cancel — Cancel current action"
+        "\n\n"
+        "⏱️ Auto Spawn: a new character is checked/spawned every 15 minutes in approved active groups."
+    )
+
+
+def staff_help_keyboard(user_id):
+    rows = []
+    if is_owner(user_id) or is_executive(user_id):
+        rows.append([InlineKeyboardButton("⚡ Executive Commands", callback_data="help:executive")])
+    if is_owner(user_id) or is_executive(user_id) or is_scout(user_id):
+        rows.append([InlineKeyboardButton("🔭 Scout Commands", callback_data="help:scout")])
+    if is_owner(user_id):
+        rows.append([InlineKeyboardButton("👑 Owner Commands", callback_data="help:owner")])
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def executive_help_text():
+    return (
+        "⚡ Executive Commands\n\n"
+        "/addcharacter — Add character\n"
+        "/addphoto <name/code> — Add photo\n"
+        "/editcharacter <4-digit code> — Edit character\n"
+        "/scouts — List Scouts\n"
+        "/addscout <user_id> — Add Scout\n\n"
+        "✏️ Character editor includes:\n"
+        "• Edit Name\n"
+        "• Edit Anime\n"
+        "• Edit Rank/Rarity\n"
+        "• Edit Worth\n"
+        "• Edit 4-digit Code\n\n"
+        "❌ Delete Character and /removescout are Owner-only."
+    )
+
+
+def scout_help_text():
+    return (
+        "🔭 Scout Commands\n\n"
+        "/addcharacter — Add character\n"
+        "/addphoto <name/code> — Add photo\n"
+        "/editcharacter <4-digit code> — Edit a character"
+    )
+
+
+def owner_help_text():
+    return (
+        "👑 Owner Commands\n\n"
+        "/callchar <4-digit code> — Spawn by code\n"
+        "/gift <4-digit code> — Gift character by reply (Owner only; 15 min cooldown)\n"
+        "/delete <name/code> — Delete character\n"
+        "/addphoto <name/code> — Add photo\n"
+        "/addcharacter — Add character\n"
+        "/editcharacter <4-digit code> — Edit character\n"
+        "/executives — List executives\n"
+        "/addexec <user_id> — Add executive\n"
+        "/setexec <user_id> — Add executive (alias)\n"
+        "/removeexec <user_id> — Remove executive\n"
+        "/scouts — List Scouts\n"
+        "/addscout <user_id> — Add Scout\n"
+        "/removescout <user_id> — Remove Scout\n\n"
+        "✏️ Character editor includes Name, Anime, Rank/Rarity, Worth and Code."
+    )
+
+
+def help_back_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⬅️ Back to Help", callback_data="help:back")]
+    ])
+
+
+def rarity_text(rarity):
+    if not rarity:
+        return "— Not set"
+    return f"{SYMBOL.get(rarity, '⭐')} {rarity}"
+
+
+def timestamp():
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def display_user(user):
+    username = f"@{user.username}" if user.username else "No username"
+    name = user.first_name or "Unknown"
+    return f"{name} | ID: {user.id} | {username}"
+
+
+def get_active_event():
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        SELECT id, name, description, reward_type, reward_value, end_at, created_at
+        FROM events_v2 WHERE active=1 ORDER BY id DESC LIMIT 1
+    """)
+    row = x.fetchone()
+    c.close()
+    if not row:
+        return None
+    try:
+        if datetime.fromisoformat(row[5]) <= datetime.now():
+            c = connect(); x = c.cursor()
+            x.execute("UPDATE events_v2 SET active=0 WHERE id=?", (row[0],))
+            c.commit(); c.close()
+            return None
+    except ValueError:
+        pass
+    return row
+
+
+def format_reward(reward_type, reward_value):
+    if reward_type == "coins":
+        return f"🪙 {reward_value} coins"
+    if reward_type == "character":
+        character = get_character_by_code(str(reward_value))
+        if character:
+            return f"🎭 {character[1]} [{character[0]}]"
+        return f"🎭 Character code {reward_value}"
+    return str(reward_value)
+
+
+def parse_reward(reward_type, reward_value):
+    reward_type = reward_type.lower().strip()
+    if reward_type == "coins":
+        if not reward_value.isdigit() or int(reward_value) <= 0:
+            return None
+        return reward_type, str(int(reward_value))
+    if reward_type == "character":
+        if not (reward_value.isdigit() and len(reward_value) == 4 and get_character_by_code(reward_value)):
+            return None
+        return reward_type, reward_value
+    return None
+
+
+def get_spawn_lock(app):
+    lock = app.bot_data.get("spawn_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        app.bot_data["spawn_lock"] = lock
+    return lock
+
+
+def get_today_key():
+    now = datetime.now()
+    # The configured daily reset hour determines the active "day".
+    if now.hour < DAILY_RESET_HOUR:
+        now -= timedelta(days=1)
+    return now.strftime("%Y-%m-%d")
+
+
+def reserve_rarity(rarity):
+    """
+    Reserve a rarity for a normal/automatic spawn.
+    Returns (True, "") when allowed.
+    Returns (False, reason) when the rarity is currently blocked.
+
+    This function is intentionally NOT used for daily rewards.
+    """
+    if rarity in ("Common", "Rare", "Epic"):
+        return True, ""
+
+    c = connect()
+    x = c.cursor()
+
+    today_key = get_today_key()
+
+    x.execute("""
+        SELECT day_key, legendary_count, mythic_count, celestial_next_at
+        FROM spawn_limits_v2
+        WHERE id=1
+    """)
+    row = x.fetchone()
+
+    if not row:
+        x.execute("""
+            INSERT INTO spawn_limits_v2
+            (id, day_key, legendary_count, mythic_count, celestial_next_at)
+            VALUES (1, ?, 0, 0, NULL)
+        """, (today_key,))
+        day_key, legendary_count, mythic_count, celestial_next_at = (
+            today_key, 0, 0, None
+        )
+    else:
+        day_key, legendary_count, mythic_count, celestial_next_at = row
+
+    # Reset daily counters when the configured daily period changes.
+    if day_key != today_key:
+        legendary_count = 0
+        mythic_count = 0
+        x.execute("""
+            UPDATE spawn_limits_v2
+            SET day_key=?, legendary_count=0, mythic_count=0
+            WHERE id=1
+        """, (today_key,))
+
+    now_dt = datetime.now()
+
+    if rarity == "Legendary":
+        if legendary_count >= LEGENDARY_DAILY_LIMIT:
+            c.commit()
+            c.close()
+            return False, "💎 Today's Legendary spawn limit (8) has been reached."
+        legendary_count += 1
+        x.execute("""
+            UPDATE spawn_limits_v2
+            SET day_key=?, legendary_count=?
+            WHERE id=1
+        """, (today_key, legendary_count))
+
+    elif rarity == "Mythic":
+        if mythic_count >= MYTHIC_DAILY_LIMIT:
+            c.commit()
+            c.close()
+            return False, "💠 Today's Mythic spawn limit (3) has been reached."
+        mythic_count += 1
+        x.execute("""
+            UPDATE spawn_limits_v2
+            SET day_key=?, mythic_count=?
+            WHERE id=1
+        """, (today_key, mythic_count))
+
+    elif rarity == "Celestial":
+        next_dt = None
+        if celestial_next_at:
+            try:
+                next_dt = datetime.fromisoformat(celestial_next_at)
+            except ValueError:
+                next_dt = None
+
+        if next_dt and now_dt < next_dt:
+            remaining = next_dt - now_dt
+            remaining_text = format_duration(remaining.total_seconds())
+            c.commit()
+            c.close()
+            return False, (
+                f"🧠 Celestial is on cooldown.\n"
+                f"⏳ Try again in {remaining_text}."
+            )
+
+        # A Celestial spawn starts a new random 48-72 hour cooldown.
+        cooldown_hours = random.randint(
+            CELESTIAL_MIN_HOURS,
+            CELESTIAL_MAX_HOURS
+        )
+        next_dt = now_dt + timedelta(hours=cooldown_hours)
+
+        x.execute("""
+            UPDATE spawn_limits_v2
+            SET day_key=?, celestial_next_at=?
+            WHERE id=1
+        """, (today_key, next_dt.isoformat(timespec="seconds")))
+
+    c.commit()
+    c.close()
+    return True, ""
+
+
+def rollback_rarity_reservation(rarity):
+    """Undo a rarity reservation when Telegram rejects the spawn message."""
+    if rarity in ("Common", "Rare", "Epic"):
+        return
+
+    c = connect()
+    x = c.cursor()
+    today_key = get_today_key()
+    x.execute(
+        "SELECT day_key, legendary_count, mythic_count FROM spawn_limits_v2 WHERE id=1"
+    )
+    row = x.fetchone()
+    if not row:
+        c.close()
+        return
+
+    day_key, legendary_count, mythic_count = row
+    if day_key != today_key:
+        c.close()
+        return
+
+    if rarity == "Legendary":
+        x.execute(
+            "UPDATE spawn_limits_v2 SET legendary_count=? WHERE id=1",
+            (max(0, legendary_count - 1),),
+        )
+    elif rarity == "Mythic":
+        x.execute(
+            "UPDATE spawn_limits_v2 SET mythic_count=? WHERE id=1",
+            (max(0, mythic_count - 1),),
+        )
+    elif rarity == "Celestial":
+        # Celestial was eligible only because its cooldown had expired;
+        # undo the newly-created cooldown if the message was not sent.
+        x.execute(
+            "UPDATE spawn_limits_v2 SET celestial_next_at=NULL WHERE id=1"
+        )
+
+    c.commit()
+    c.close()
+
+
+def allowed_rarities():
+    result = []
+
+    for rarity in ("Common", "Rare", "Epic", "Legendary", "Mythic", "Celestial"):
+        c = connect()
+        x = c.cursor()
+
+        today_key = get_today_key()
+        x.execute("""
+            SELECT day_key, legendary_count, mythic_count, celestial_next_at
+            FROM spawn_limits_v2
+            WHERE id=1
+        """)
+        row = x.fetchone()
+        c.close()
+
+        if not row:
+            result.append(rarity)
+            continue
+
+        day_key, legendary_count, mythic_count, celestial_next_at = row
+        if day_key != today_key:
+            legendary_count = 0
+            mythic_count = 0
+
+        if rarity in ("Common", "Rare", "Epic"):
+            result.append(rarity)
+        elif rarity == "Legendary" and legendary_count < LEGENDARY_DAILY_LIMIT:
+            result.append(rarity)
+        elif rarity == "Mythic" and mythic_count < MYTHIC_DAILY_LIMIT:
+            result.append(rarity)
+        elif rarity == "Celestial":
+            if not celestial_next_at:
+                result.append(rarity)
+            else:
+                try:
+                    if datetime.now() >= datetime.fromisoformat(celestial_next_at):
+                        result.append(rarity)
+                except ValueError:
+                    result.append(rarity)
+
+    return result
+
+
+def choose_character():
+    """
+    Choose a random character while respecting global rarity limits.
+    High-rarity choices that are currently blocked are removed from the
+    weighted pool, so the bot falls back to available rarities.
+    """
+    allowed = set(allowed_rarities())
+    available = [(r, w) for r, w in CHANCES if r in allowed]
+
+    # If a configured high-rarity class has no characters, remove it.
+    available = [
+        (rarity, weight)
+        for rarity, weight in available
+        if get_characters_by_rarity(rarity)
+    ]
+
+    if not available:
+        return None
+
+    rarity = random.choices(
+        [r for r, _ in available],
+        weights=[w for _, w in available],
+        k=1,
+    )[0]
+
+    return choose_character_for_rarity(rarity)
+
+
+async def send_spawn(chat_id, context, character):
+    code, name, anime, rarity, worth, photo = character
+    app = getattr(context, "application", context)
+    bot = getattr(context, "bot", None) or app.bot
+
+    active = app.bot_data.setdefault("active_spawns", {})
+
+    # spawn_reserved() reserves this entry before the network call. Keep a
+    # fallback here for any legacy/direct caller.
+    active.setdefault(chat_id, {
+        "code": code, "name": name, "anime": anime, "rarity": rarity,
+        "worth": worth, "photo": photo,
+        "expires_at": datetime.now() + timedelta(seconds=SPAWN_LIFETIME),
+    })
+
+    try:
+        if photo:
+            await asyncio.wait_for(
+                bot.send_photo(
+                    chat_id=chat_id, photo=photo,
+                    caption=(f"A {rarity} {SYMBOL.get(rarity, '⭐')} character has appeared...\n\n"
+                              "Use /add to catch them!"),
+                ),
+                timeout=20,
+            )
+        else:
+            await asyncio.wait_for(
+                bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"A {rarity} {SYMBOL.get(rarity, '⭐')} character has appeared...\n\n"
+                          "📷 Photo not added yet.\n"
+                          "Use /add to catch them!"),
+                ),
+                timeout=20,
+            )
+    except Exception:
+        active.pop(chat_id, None)
+        raise
+
+    app.bot_data.setdefault("chat_spawn_cooldowns", {})[chat_id] = (
+        datetime.now() + timedelta(seconds=GROUP_SPAWN_COOLDOWN)
+    )
+
+
+async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
+    app = getattr(context, "application", context)
+    lock = get_spawn_lock(app)
+
+    # Only protect the in-memory reservation. Never hold this global lock while
+    # waiting for Telegram, otherwise one slow group can freeze all spawns.
+    async with lock:
+        active = app.bot_data.setdefault("active_spawns", {})
+        if chat_id in active:
+            return False, "❌ A character is already spawned in this chat."
+        allowed, reason = reserve_rarity(character[3])
+        if not allowed:
+            return False, reason
+        active[chat_id] = {
+            "code": character[0], "name": character[1], "anime": character[2],
+            "rarity": character[3], "worth": character[4], "photo": character[5],
+            "recruit_names": get_recruit_names(character[0]),
+            "expires_at": datetime.now() + timedelta(seconds=SPAWN_LIFETIME),
+        }
+
+    try:
+        await send_spawn(chat_id, context, character)
+    except Exception:
+        async with lock:
+            app.bot_data.setdefault("active_spawns", {}).pop(chat_id, None)
+            rollback_rarity_reservation(character[3])
+        raise
+
+    try:
+        history_id = record_spawn_history(chat_id, character, spawned_by)
+        app.bot_data["active_spawns"].get(chat_id, {})["history_id"] = history_id
+    except Exception as e:
+        # History must never make an already-sent spawn fail.
+        print("Spawn history error:", e)
+    return True, ""
+
+
+# ---------- BASIC COMMANDS ----------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.effective_user)
+    await update.message.reply_text(build_help_text())
+
+
+async def help_command(update, context):
+    save_user(update.effective_user)
+    if update.effective_chat.type == "private":
+        await update.message.reply_text(
+            build_help_text() + "\n\n🔐 Staff panels are below:",
+            reply_markup=staff_help_keyboard(update.effective_user.id),
+        )
+    else:
+        await update.message.reply_text(build_help_text())
+
+
+async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    action = query.data.split(":", 1)[1]
+    user_id = query.from_user.id
+
+    if action == "executive":
+        if not (is_executive(user_id) or is_owner(user_id)):
+            await query.answer("⚠️ You need to be an executive to use this command.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(executive_help_text(), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back to Help", callback_data="help:back")
+        ]]))
+        return
+
+    if action == "scout":
+        if not (is_scout(user_id) or is_executive(user_id) or is_owner(user_id)):
+            await query.answer("⚠️ You need to be a Scout, Executive or Owner to use this panel.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(scout_help_text(), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back to Help", callback_data="help:back")
+        ]]))
+        return
+
+    if action == "owner":
+        if not is_owner(user_id):
+            await query.answer("⚠️ You need to be the owner to use this command.", show_alert=True)
+            return
+        await query.answer()
+        await query.edit_message_text(owner_help_text(), reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("⬅️ Back to Help", callback_data="help:back")
+        ]]))
+        return
+
+    if action == "back":
+        await query.answer()
+        await query.edit_message_text(
+            build_help_text() + "\n\n🔐 Staff panels are below:",
+            reply_markup=staff_help_keyboard(update.effective_user.id),
+        )
+
+
+# ---------- GROUP-ONLY SPAWN ----------
+def is_group_chat(update):
+    """Return True only for Telegram groups/supergroups."""
+    chat = getattr(update, "effective_chat", None)
+    return bool(chat and chat.type in ("group", "supergroup"))
+
+
+async def require_group_spawn(update):
+    """Block character spawning/catching in private DMs."""
+    if is_group_chat(update):
+        return True
+    if getattr(update, "message", None):
+        await update.message.reply_text(
+            "🚫 Character spawning works only in groups.\n"
+            "➜ Add me to a group and use /spawn there."
+        )
+    return False
+
+
+# ---------- RANDOM / OWNER SPAWN ----------
+async def spawn(update, context):
+    save_user(update.effective_user)
+    if not await require_group_spawn(update):
+        return
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    now_dt = datetime.now()
+
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    if chat_id in active:
+        await update.message.reply_text(
+            "❌ A character is already spawned in this chat.\nUse /add to catch it."
+        )
+        return
+
+    # Personal cooldown: 1 hour from this user's last successful /spawn.
+    last_calls = context.application.bot_data.setdefault("last_calls", {})
+    last = last_calls.get(user_id)
+    if last:
+        try:
+            last_dt = last if isinstance(last, datetime) else datetime.fromisoformat(last)
+            remaining = PERSONAL_SPAWN_COOLDOWN - (now_dt - last_dt).total_seconds()
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining > 0:
+            # Show the exact remaining 1-hour cooldown, including seconds.
+            remaining_text = format_duration(remaining)
+            await update.message.reply_text(
+                f"⚠️ Please wait {remaining_text} before spawning again."
+            )
+            return
+
+    # Chat cooldown: 70 seconds from the exact successful spawn time.
+    chat_cooldowns = context.application.bot_data.setdefault("chat_spawn_cooldowns", {})
+    cooldown_until = chat_cooldowns.get(chat_id)
+    if cooldown_until:
+        remaining = (cooldown_until - now_dt).total_seconds()
+        if remaining > 0:
+            await update.message.reply_text(
+                f"⏳ This chat can spawn again in {format_duration(remaining)}."
+            )
+            return
+        chat_cooldowns.pop(chat_id, None)
+
+    character = choose_character()
+    if not character:
+        await update.message.reply_text("❌ No characters available.")
+        return
+
+    try:
+        success, reason = await spawn_reserved(chat_id, context, character, "manual_spawn")
+    except Exception as e:
+        print("Call spawn error:", e)
+        await update.message.reply_text("❌ Failed to spawn character.")
+        return
+
+    if not success:
+        await update.message.reply_text(reason)
+        return
+
+    # Start the personal cooldown only after the spawn was actually sent.
+    last_calls[user_id] = datetime.now()
+    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
+
+
+async def callchar(update, context):
+    save_user(update.effective_user)
+    if not await require_group_spawn(update):
+        return
+    chat_id = update.effective_chat.id
+
+    async def tell(text):
+        await context.bot.send_message(chat_id=chat_id, text=text)
+
+    if not is_owner(update.effective_user.id):
+        await tell("⚠️ You need to be the owner to use this command.")
+        return
+
+    if not context.args:
+        await tell(
+            "Usage: /callchar <4-digit code>\n\nExample:\n/callchar 1001"
+        )
+        return
+
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    if chat_id in active:
+        await tell("❌ A character is already spawned in this chat.\nUse /add to catch it first.")
+        return
+
+    code = " ".join(context.args).strip()
+    if not (code.isdigit() and len(code) == 4 and 1 <= int(code) <= 9999):
+        await tell("❌ Use the character's unique 4-digit code (0001-9999).")
+        return
+
+    character = get_character_by_code(code)
+    if not character:
+        await tell("❌ Character not found for that code.")
+        return
+
+    try:
+        success, reason = await spawn_reserved(chat_id, context, character, "owner_callchar")
+    except Exception as e:
+        print("Callchar spawn error:", e)
+        await tell("❌ Failed to spawn character.")
+        return
+
+    if not success:
+        await tell(reason)
+        return
+
+    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
+
+
+# ---------- CATCH ----------
+async def add(update, context):
+    save_user(update.effective_user)
+    # Catching is group-only too. Keep DMs silent for /add, matching the
+    # existing silent behavior for /add without arguments.
+    if not is_group_chat(update):
+        return
+    chat_id = update.effective_chat.id
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    spawn = active.get(chat_id)
+
+    # /add without a name must be completely silent.
+    if not context.args:
+        return
+
+    if not spawn:
+        return
+
+    now_dt = datetime.now()
+    if now_dt >= spawn["expires_at"]:
+        del active[chat_id]
+        try:
+            rollback_rarity_reservation(spawn.get("rarity"))
+        except Exception as e:
+            print("Catch expiry rarity rollback error:", e)
+        await update.message.reply_text("⏰ The character is gone! No one added them.")
+        return
+
+    # Serialize catch/expiry handling so two users cannot both catch the
+    # same in-memory spawn between the validation and the delete.
+    lock = get_spawn_lock(context.application)
+    async with lock:
+        active = context.application.bot_data.setdefault("active_spawns", {})
+        spawn = active.get(chat_id)
+        if not spawn:
+            return
+        if datetime.now() >= spawn["expires_at"]:
+            del active[chat_id]
+            try:
+                rollback_rarity_reservation(spawn.get("rarity"))
+            except Exception as e:
+                print("Locked catch expiry rarity rollback error:", e)
+            await update.message.reply_text("⏰ The character is gone! No one added them.")
+            return
+
+        # Validate against the CURRENT locked spawn. This prevents a stale
+        # validation from ever catching a different character.
+        entered = [part for part in context.args if part.strip()]
+        entered_text = " ".join(entered).strip()
+        valid_code = (
+            entered_text.isdigit()
+            and len(entered_text) == 4
+            and entered_text == str(spawn["code"])
+        )
+        valid_name = spawn_name_matches(spawn["name"], entered)
+        if not valid_name:
+            for recruit_name in spawn.get("recruit_names", []):
+                if spawn_name_matches(recruit_name, entered):
+                    valid_name = True
+                    break
+        if not (valid_code or valid_name):
+            return
+
+        c = connect()
+        x = c.cursor()
+        try:
+            x.execute(
+                "INSERT INTO collections_v2(user_id, character_code, caught_at) VALUES(?,?,?)",
+                (update.effective_user.id, spawn["code"], timestamp()),
+            )
+            x.execute(
+                "UPDATE users_v2 SET coins=coins+50 WHERE user_id=?",
+                (update.effective_user.id,),
+            )
+            c.commit()
+        except Exception:
+            c.rollback()
+            c.close()
+            return
+        c.close()
+
+        mark_spawn_caught(spawn.get("history_id"), update.effective_user.id)
+        del active[chat_id]
+
+    # No 5-6 minute post-catch wait. The auto-spawn loop will spawn again
+    # on its next cycle. The chat's 70-second manual cooldown remains based
+    # on the original spawn time.
+    caught_rarity = spawn["rarity"]
+    caught_symbol = SYMBOL.get(caught_rarity, "⭐")
+    await update.message.reply_text(
+        "🎉 Character added to your collection!\n\n"
+        f"Name: {spawn['name']}\n"
+        f"Code: {spawn['code']}\n"
+        f"Tier: {caught_rarity} {caught_symbol}\n"
+        f"Worth: {spawn['worth']} 🪙\n\n"
+        "💰 +50 coins"
+    )
+
+
+# ---------- COLLECTION ----------
+async def get_collection_rows(user_id, sort_mode="tier"):
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        SELECT c.code,c.name,c.anime,c.rarity,c.photo_file_id,
+               COUNT(k.id) AS qty, MAX(k.caught_at) AS last_caught
+        FROM collections_v2 k
+        JOIN characters_v2 c ON c.code=k.character_code
+        WHERE k.user_id=?
+        GROUP BY c.code,c.name,c.anime,c.rarity,c.photo_file_id
+    """, (user_id,))
+    rows = x.fetchall()
+    c.close()
+
+    rarity_order = {
+        "Celestial": 0,
+        "Mythic": 1,
+        "Legendary": 2,
+        "Epic": 3,
+        "Rare": 4,
+        "Common": 5,
+    }
+
+    if sort_mode == "time":
+        rows.sort(key=lambda r: r[6] or "", reverse=True)
+    elif sort_mode == "name":
+        rows.sort(key=lambda r: r[1].lower())
+    elif sort_mode == "qty":
+        rows.sort(key=lambda r: (-r[5], r[1].lower()))
+    else:
+        rows.sort(key=lambda r: (rarity_order.get(r[3], 99), r[1].lower()))
+
+    return rows
+
+
+def get_favorite_code(user_id):
+    c = connect()
+    x = c.cursor()
+    x.execute("SELECT character_code FROM favorites_v2 WHERE user_id=?", (user_id,))
+    row = x.fetchone()
+    c.close()
+    return row[0] if row else None
+
+
+def set_favorite(user_id, character_code):
+    c = connect()
+    x = c.cursor()
+    x.execute("""
+        INSERT INTO favorites_v2(user_id, character_code, set_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            character_code=excluded.character_code,
+            set_at=excluded.set_at
+    """, (user_id, character_code, timestamp()))
+    c.commit()
+    c.close()
+
+
+def clear_favorite(user_id):
+    c = connect()
+    x = c.cursor()
+    x.execute("DELETE FROM favorites_v2 WHERE user_id=?", (user_id,))
+    c.commit()
+    c.close()
+
+
+def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code):
+    buttons = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"coll:{user_id}:{sort_mode}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"📖 {page+1}/{total_pages}", callback_data=f"coll:{user_id}:nochange:0"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"coll:{user_id}:{sort_mode}:{page+1}"))
+    buttons.append(nav)
+
+    buttons.append([
+        InlineKeyboardButton("🔹 Tier", callback_data=f"coll:{user_id}:tier:0"),
+        InlineKeyboardButton("🔤 Name", callback_data=f"coll:{user_id}:name:0"),
+    ])
+    buttons.append([
+        InlineKeyboardButton("🔢 Quantity", callback_data=f"coll:{user_id}:qty:0"),
+        InlineKeyboardButton("🕒 Recent", callback_data=f"coll:{user_id}:time:0"),
+    ])
+
+    if favorite_code:
+        buttons.append([
+            InlineKeyboardButton("⭐ Favourite", callback_data=f"coll:{user_id}:nochange:0"),
+            InlineKeyboardButton("❌ Clear Favourite", callback_data=f"coll:{user_id}:clearfav:0"),
+        ])
+    return InlineKeyboardMarkup(buttons)
+
+
+def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name="Player"):
+    total_pages = max(1, (len(rows) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    page_rows = rows[page * per_page:(page + 1) * per_page]
+
+    text = (
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"❀• {owner_name} •❀'s crew  ➜  Page {page + 1}/{total_pages}\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"📚 Collection: {total_copies} total | {len(rows)} unique\n"
+    )
+
+    current_rarity = None
+    for code, name, anime, rarity, photo, qty, last_caught in page_rows:
+        if rarity != current_rarity:
+            text += f"\n➜ {rarity_text(rarity)}\n"
+            current_rarity = rarity
+        star = "⭐ " if code == favorite_code else ""
+        text += f"{star}|{code}| {name} {qty}X\n"
+
+    text += "\n━━━━━━━━━━━━━━━━━━"
+    labels = {"tier": "🔹 Sorted by Tier", "time": "🕒 Sorted by Recent", "name": "🔤 Sorted by Name", "qty": "🔢 Sorted by Quantity"}
+    text += "\n" + labels.get(sort_mode, "🔹 Sorted by Tier")
+    if favorite_code:
+        fav = next((r for r in rows if r[0] == favorite_code), None)
+        if fav:
+            text += f"\n⭐ Favourite: {fav[1]} [{fav[0]}]"
+    return text, total_pages, page
+
+
+async def send_collection(update_or_query, context, user_id, page=0, sort_mode="tier", edit=False, owner_name=None):
+    rows = await get_collection_rows(user_id, sort_mode)
+    if not rows:
+        message = "📚 Your collection is empty. Catch a character with /spawn then use /add."
+        if edit:
+            await update_or_query.edit_message_text(message)
+        else:
+            await update_or_query.message.reply_text(message)
+        return
+
+    c = connect()
+    x = c.cursor()
+    x.execute("SELECT COUNT(*) FROM collections_v2 WHERE user_id=?", (user_id,))
+    total_copies = x.fetchone()[0]
+    c.close()
+
+    favorite_code = get_favorite_code(user_id)
+    per_page = max(1, ITEMS_PER_PAGE)
+    if owner_name is None:
+        owner_name = (
+            update_or_query.from_user.first_name
+            if hasattr(update_or_query, "from_user")
+            else "Player"
+        ) or "Player"
+    text, total_pages, page = build_collection_text(
+        rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name
+    )
+    keyboard = collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code)
+
+    photo = None
+    if favorite_code:
+        for row in rows:
+            if row[0] == favorite_code:
+                photo = row[4]
+                break
+    if not photo:
+        page_rows = rows[page * per_page:(page + 1) * per_page]
+        if page_rows:
+            photo = page_rows[0][4]
+
+    if edit:
+        message = update_or_query.message
+        if photo and message.photo:
+            try:
+                await message.edit_media(
+                    media=InputMediaPhoto(media=photo, caption=text),
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception:
+                # Some Telegram media-edit failures are recoverable by
+                # replacing the message entirely.
+                try:
+                    await message.delete()
+                    await context.bot.send_photo(
+                        chat_id=message.chat_id,
+                        photo=photo,
+                        caption=text,
+                        reply_markup=keyboard,
+                    )
+                    return
+                except Exception:
+                    pass
+        if message.photo and not photo:
+            try:
+                await message.delete()
+                await context.bot.send_message(
+                    chat_id=message.chat_id,
+                    text=text + "\n📷 No saved photo available.",
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception:
+                pass
+        if photo and not message.photo:
+            try:
+                await message.delete()
+                await context.bot.send_photo(
+                    chat_id=message.chat_id,
+                    photo=photo,
+                    caption=text,
+                    reply_markup=keyboard,
+                )
+                return
+            except Exception:
+                pass
+        try:
+            await update_or_query.edit_message_text(text=text, reply_markup=keyboard)
+            return
+        except Exception:
+            pass
+
+    if photo:
+        await update_or_query.message.reply_photo(
+            photo=photo, caption=text, reply_markup=keyboard
+        )
+    else:
+        await update_or_query.message.reply_text(
+            text + "\n📷 No saved photo available.", reply_markup=keyboard
+        )
+
+
+async def mycollection(update, context):
+    save_user(update.effective_user)
+    await send_collection(
+        update, context, update.effective_user.id, 0, "tier",
+        edit=False, owner_name=update.effective_user.first_name or "Player"
+    )
+
+
+async def myfav(update, context):
+    save_user(update.effective_user)
+    user_id = update.effective_user.id
+
+    if not context.args:
+        current = get_favorite_code(user_id)
+        if current:
+            character = get_character(current)
+            if character:
+                await update.message.reply_text(
+                    f"⭐ Your favourite is {character[1]} [{character[0]}].\n\n"
+                    "Use /myfav <4-digit code> to change it, or /myfav off to remove it."
+                )
+                return
+        await update.message.reply_text(
+            "⭐ No favourite set.\n\n"
+            "Use /myfav <4-digit character code>\n"
+            "Example: /myfav 1001"
+        )
+        return
+
+    value = " ".join(context.args).strip()
+    if value.lower() in {"off", "remove", "none"}:
+        clear_favorite(user_id)
+        await update.message.reply_text("❌ Favourite removed.")
+        return
+
+    if not (value.isdigit() and len(value) == 4 and 1 <= int(value) <= 9999):
+        await update.message.reply_text("❌ Favourite must be set using the character's unique 4-digit code.")
+        return
+
+    character = get_character_by_code(value)
+    if not character:
+        await update.message.reply_text("❌ Character not found for that code.")
+        return
+
+    code, name, anime, rarity, worth, photo = character
+
+    c = connect()
+    x = c.cursor()
+    x.execute(
+        "SELECT 1 FROM collections_v2 WHERE user_id=? AND character_code=? LIMIT 1",
+        (user_id, code),
+    )
+    owned = x.fetchone()
+    c.close()
+
+    if not owned:
+        await update.message.reply_text(
+            f"❌ You don't own {name} [{code}] yet. Catch it first, then set it as favourite."
+        )
+        return
+
+    set_favorite(user_id, code)
+    await update.message.reply_text(
+        f"⭐ Favourite set!\n\n"
+        f"🎭 {name} [{code}]\n"
+        f"🏷 {rarity_text(rarity)}\n\n"
+        "Use /mycollection to see it highlighted."
+    )
+
+
+async def collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+
+    parts = (query.data or "").split(":")
+    if len(parts) != 4 or parts[0] != "coll":
+        return
+
+    try:
+        owner_id = int(parts[1])
+        page = int(parts[3])
+    except ValueError:
+        return
+
+    user_id = query.from_user.id
+    if user_id != owner_id:
+        await query.answer("❌ This collection belongs to another user.", show_alert=True)
+        return
+
+    await query.answer()
+    action = parts[2]
+    if action == "nochange":
+        return
+    if action == "clearfav":
+        clear_favorite(user_id)
+        page = 0
+        action = "tier"
+
+    if action not in {"tier", "time", "name", "qty"}:
+        action = "tier"
+
+    # Re-render the same collection message so the buttons and photo stay in sync.
+    await send_collection(
+        query, context, user_id, page, action, edit=True,
+        owner_name=query.from_user.first_name or "Player"
+    )
+
+
+async def mystats(update, context):
+    save_user(update.effective_user)
+
+    c = connect()
+    x = c.cursor()
+
+    x.execute(
+        "SELECT coins FROM users_v2 WHERE user_id=?",
+        (update.effective_user.id,),
+    )
+    row = x.fetchone()
+    coins = row[0] if row else 0
+
+    x.execute(
+        "SELECT COUNT(*) FROM collections_v2 WHERE user_id=?",
+        (update.effective_user.id,),
+    )
+    count = x.fetchone()[0]
+
+    c.close()
+
+    favorite = get_favorite_code(update.effective_user.id)
+    fav_text = "None"
+    if favorite:
+        fav = get_character_by_code(favorite)
+        if fav:
+            fav_text = f"{fav[1]} [{fav[0]}]"
+    unique_c = len(await get_collection_rows(update.effective_user.id, "tier"))
+
+    await update.message.reply_text(
+        f"👤 {update.effective_user.first_name}\n\n"
+        f"🛡 Role: {staff_role(update.effective_user.id)}\n"
+        f"💰 Coins: {coins}\n"
+        f"🎭 Characters: {count} copies / {unique_c} unique\n"
+        f"⭐ Favourite: {fav_text}"
+    )
+
+
+# ---------- CHARACTER LIST / VIEW ----------
+async def characters(update, context):
+    rows = get_all_characters()
+
+    if not rows:
+        await update.message.reply_text("❌ No characters found.")
+        return
+
+    text = "🎭 Character List\n\n"
+    text += "\n".join(
+        f"{i}. {rarity_text(r)} {name} [{code}]"
+        for i, (code, name, anime, r, worth, photo) in enumerate(rows, 1)
+    )
+
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
+async def view(update, context):
+    """View ANY character in the master character database, not just owned ones."""
+    save_user(update.effective_user)
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /view <4-digit code or character name>\n"
+            "Example: /view 1001"
+        )
+        return
+
+    query = " ".join(context.args).strip()
+    character = None
+
+    # First resolve by code. Leading zeroes are accepted (1 == 0001).
+    if query.isdigit():
+        character = get_character_by_code(query)
+    else:
+        # Exact name first, then a unique partial name/anime match. This is
+        # independent of the user's collection.
+        c = connect(); x = c.cursor()
+        x.execute("""
+            SELECT code,name,anime,rarity,worth,photo_file_id
+            FROM characters_v2
+            WHERE name=? COLLATE NOCASE OR anime=? COLLATE NOCASE
+            ORDER BY CAST(code AS INTEGER)
+        """, (query, query))
+        exact_rows = x.fetchall()
+        if len(exact_rows) == 1:
+            character = exact_rows[0]
+        elif len(exact_rows) > 1:
+            c.close()
+            await update.message.reply_text(
+                "❓ Multiple characters found. Please use the 4-digit code."
+            )
+            return
+        else:
+            like = f"%{query}%"
+            x.execute("""
+                SELECT code,name,anime,rarity,worth,photo_file_id
+                FROM characters_v2
+                WHERE name LIKE ? COLLATE NOCASE OR anime LIKE ? COLLATE NOCASE
+                ORDER BY CAST(code AS INTEGER)
+            """, (like, like))
+            rows = x.fetchall()
+            if len(rows) == 1:
+                character = rows[0]
+            elif len(rows) > 1:
+                c.close()
+                await update.message.reply_text(
+                    "❓ Multiple characters found. Please use the 4-digit code."
+                )
+                return
+        c.close()
+
+    if not character:
+        await update.message.reply_text("❌ Character not found.")
+        return
+
+    code, name, anime, rarity, worth, photo = character
+    text = (
+        f"🎭 {name}\n"
+        f"📺 Anime: {anime or '—'}\n"
+        f"🏷 Rarity: {rarity_text(rarity) if rarity else '— Not set'}\n"
+        f"💰 Worth: {worth}\n"
+        f"🔢 Code: {code}"
+    )
+
+    if photo:
+        await update.message.reply_photo(photo=photo, caption=text)
+    else:
+        await update.message.reply_text(text + "\n📷 Photo: Not added")
+
+
+# ---------- CHECK ----------
+async def check(update, context):
+    save_user(update.effective_user)
+    query=" ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Usage: /check <4-digit code or first/last/full name>"); return
+    character=None
+    if query.isdigit(): character=get_character_by_code(query)
+    if not character:
+        c=connect(); x=c.cursor()
+        x.execute("""
+            SELECT code,name,anime,rarity,worth,photo_file_id
+            FROM characters_v2
+            WHERE name=? COLLATE NOCASE
+               OR name LIKE ? COLLATE NOCASE
+               OR anime=? COLLATE NOCASE
+               OR anime LIKE ? COLLATE NOCASE
+        """, (query, f"%{query}%", query, f"%{query}%"))
+        rows=x.fetchall(); c.close()
+        if len(rows)==1: character=rows[0]
+        elif len(rows)>1:
+            await update.message.reply_text("❓ Multiple characters found. Please use 4-digit code or full name."); return
+    if not character:
+        await update.message.reply_text("❌ Character not found."); return
+    code,name,anime,rarity,worth,photo=character
+    c=connect(); x=c.cursor()
+    x.execute("SELECT user_id, COUNT(*) FROM collections_v2 WHERE character_code=? GROUP BY user_id ORDER BY COUNT(*) DESC",(code,))
+    owners=x.fetchall(); lines=[f"🎭 {name}",f"📺 Anime: {anime or '—'}",f"🏷 Rarity: {rarity_text(rarity) if rarity else '— Not set'}",f"💰 Worth: {worth}",f"🔢 Code: {code}","","👑 Owners:"]
+    for uid,qty in owners:
+        x.execute("SELECT first_name,last_name,username FROM users_v2 WHERE user_id=?",(uid,)); u=x.fetchone()
+        first,last,username=u if u else ("Unknown","","")
+        display=" ".join(v for v in [first,last] if v).strip() or "Unknown"
+        handle=f"@{username}" if username else "No username"
+        lines.append(f"• {display} ({handle}) ×{qty}")
+    if not owners: lines.append("• No owners yet")
+    c.close()
+    text="\n".join(lines)
+    if photo:
+        await update.message.reply_photo(photo=photo,caption=text)
+    else: await update.message.reply_text(text)
+
+# ---------- SELL ----------
+async def sell(update, context):
+    save_user(update.effective_user)
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /sell <4-digit code or exact name> [quantity]\nExample: /sell 1001 2"
+        )
+        return
+
+    quantity = 1
+    lookup_args = context.args
+    if len(context.args) >= 2 and context.args[-1].isdigit():
+        quantity = int(context.args[-1])
+        lookup_args = context.args[:-1]
+    if quantity <= 0:
+        await update.message.reply_text("❌ Quantity must be at least 1.")
+        return
+    lookup = " ".join(lookup_args).strip()
+    c = connect()
+    x = c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("""
+            SELECT code,name,anime,rarity,worth,photo_file_id
+            FROM characters_v2
+            WHERE code=? OR name=? COLLATE NOCASE
+            LIMIT 1
+        """, (lookup, lookup))
+        character = x.fetchone()
+        if not character:
+            c.rollback(); c.close()
+            await update.message.reply_text("❌ Character not found.")
+            return
+
+        code, name, anime, rarity, worth, photo = character
+        x.execute("SELECT id FROM auctions_v2 WHERE seller_id=? AND character_code=? AND active=1 LIMIT 1", (update.effective_user.id, code))
+        if x.fetchone():
+            c.rollback(); c.close()
+            await update.message.reply_text("❌ This character is currently listed in your active auction. Wait until the auction ends before selling it.")
+            return
+        x.execute("""
+            SELECT id FROM collections_v2
+            WHERE user_id=? AND character_code=?
+            LIMIT ?
+        """, (update.effective_user.id, code, quantity))
+        owned = x.fetchall()
+
+        if len(owned) < quantity:
+            c.rollback(); c.close()
+            await update.message.reply_text(
+                f"❌ You only have {len(owned)} copy/copies of {name}."
+            )
+            return
+
+        x.executemany("DELETE FROM collections_v2 WHERE id=?", [(row[0],) for row in owned])
+        total_value = worth * quantity
+        x.execute(
+            "UPDATE users_v2 SET coins=coins+? WHERE user_id=?",
+            (total_value, update.effective_user.id),
+        )
+        c.commit()
+    except Exception:
+        c.rollback(); c.close()
+        await update.message.reply_text("❌ Could not complete the sale. Please try again.")
+        return
+    c.close()
+
+    await update.message.reply_text(
+        f"💸 Sold {name} [{code}] x{quantity}!\n💰 +{total_value} coins"
+    )
+
+
+# ---------- CHARACTER TRANSFER / OWNER GIFT ----------
+PENDING_TRANSFERS = {}
+TRANSFER_TTL = 3600
+
+async def transfer(update, context):
+    save_user(update.effective_user)
+    if not is_group_chat(update) or not update.message.reply_to_message:
+        await update.message.reply_text("❌ Group mein recipient ke message ko reply karke /transfer <4-digit code> use karo.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /transfer <4-digit character code>")
+        return
+    code = context.args[0].strip()
+    character = get_character_by_code(code)
+    if not character:
+        await update.message.reply_text("❌ Character not found.")
+        return
+    sender_id = update.effective_user.id
+    target_id = update.message.reply_to_message.from_user.id
+    if target_id == sender_id:
+        await update.message.reply_text("❌ You cannot transfer to yourself.")
+        return
+    c=connect(); x=c.cursor()
+    x.execute("SELECT id FROM auctions_v2 WHERE seller_id=? AND character_code=? AND active=1 LIMIT 1", (sender_id, character[0]))
+    if x.fetchone():
+        c.close()
+        await update.message.reply_text("❌ This character is currently listed in your active auction. Wait until the auction ends before transferring it.")
+        return
+    x.execute("SELECT COUNT(*) FROM collections_v2 WHERE user_id=? AND character_code=?", (sender_id, character[0]))
+    owned=x.fetchone()[0]
+    c.close()
+    if owned < 1:
+        await update.message.reply_text("❌ You don't own this character.")
+        return
+    transfer_id=f"{sender_id}:{target_id}:{character[0]}:{update.message.message_id}"
+    PENDING_TRANSFERS[transfer_id]={"sender":sender_id,"target":target_id,"code":character[0],"expires":datetime.now()+timedelta(seconds=TRANSFER_TTL)}
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Accept", callback_data=f"tr_accept:{transfer_id}"), InlineKeyboardButton("❌ Decline", callback_data=f"tr_decline:{transfer_id}")]])
+    await update.message.reply_text(
+        f"🎁 {character[1]} [{character[0]}] transfer request\n"
+        f"👤 From: {update.effective_user.first_name or sender_id}\n"
+        f"👤 To: {update.message.reply_to_message.from_user.first_name or target_id}\n"
+        "⏰ Valid for 1 hour.", reply_markup=kb
+    )
+
+async def transfer_callback(update, context):
+    q=update.callback_query
+    data=q.data or ""
+    action, transfer_id = data.split(":",1)
+    item=PENDING_TRANSFERS.get(transfer_id)
+    if not item:
+        await q.answer("⚠️ Transfer expire ho gaya ya bot restart hua.", show_alert=True); return
+    if q.from_user.id != item["target"]:
+        await q.answer("❌ Sirf recipient is request ko accept/decline kar sakta hai.", show_alert=True); return
+    if datetime.now() >= item["expires"]:
+        PENDING_TRANSFERS.pop(transfer_id,None)
+        await q.answer("⏰ Transfer expire ho gaya.", show_alert=True)
+        await q.edit_message_text("⏰ Accept karne mein der ho gayi, isliye character nahi aaya.")
+        return
+    if action == "tr_decline":
+        PENDING_TRANSFERS.pop(transfer_id,None)
+        await q.answer("Transfer declined.")
+        await q.edit_message_text("❌ Transfer declined. Character sender ke paas hi rahega.")
+        return
+    c=connect(); x=c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("SELECT id FROM collections_v2 WHERE user_id=? AND character_code=? LIMIT 1", (item["sender"],item["code"]))
+        row=x.fetchone()
+        if not row:
+            c.rollback(); c.close(); PENDING_TRANSFERS.pop(transfer_id,None)
+            await q.answer("❌ Sender ab ye character own nahi karta.", show_alert=True); await q.edit_message_text("❌ Transfer failed: sender ke paas character nahi hai."); return
+        x.execute("INSERT OR IGNORE INTO users_v2(user_id,username,first_name,coins) VALUES(?,?,?,0)",(item["target"],q.from_user.username or "",q.from_user.first_name or ""))
+        x.execute("UPDATE collections_v2 SET user_id=? WHERE id=?",(item["target"],row[0]))
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        c.close()
+        print("Transfer transaction error:", e)
+        await q.answer("❌ Transfer failed. Please try again.", show_alert=True)
+        return
+    c.close()
+    PENDING_TRANSFERS.pop(transfer_id, None)
+    await q.answer("✅ Character received!")
+    await q.edit_message_text(f"✅ Transfer accepted! [{item['code']}] character recipient ke collection mein aa gaya.")
+
+async def gift(update, context):
+    # Owner-only gift command.
+    owner_id = update.effective_user.id
+    if not is_owner(owner_id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+
+    target_id = None
+    code = None
+    reply = update.message.reply_to_message
+
+    # Group: reply to target user and use /gift <4-digit-code>.
+    if is_group_chat(update) and reply and reply.from_user and len(context.args) == 1:
+        target = reply.from_user
+        if target.is_bot:
+            await update.message.reply_text("❌ You cannot gift a character to a bot.")
+            return
+        target_id = target.id
+        code = context.args[0].strip()
+
+    # DM: /gift <4-digit-code> <user_id>.
+    elif update.effective_chat.type == "private" and len(context.args) == 2:
+        code = context.args[0].strip()
+        target_text = context.args[1].strip()
+        if not target_text.isdigit():
+            await update.message.reply_text("❌ User ID must contain numbers only.")
+            return
+        target_id = int(target_text)
+
+    else:
+        await update.message.reply_text(
+            "🎁 Gift Usage\n\n"
+            "Owner DM: /gift <4-digit character code> <user_id>\n"
+            "Group reply: /gift <4-digit character code>"
+        )
+        return
+
+    if not (code.isdigit() and len(code) == 4):
+        await update.message.reply_text("❌ Character code must be exactly 4 digits (example: 0001).")
+        return
+
+    character = get_character_by_code(code)
+    if not character:
+        await update.message.reply_text(f"❌ Character not found: {code}")
+        return
+
+    if target_id == update.effective_user.id:
+        await update.message.reply_text("❌ You cannot gift a character to yourself.")
+        return
+
+    c = connect()
+    x = c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute(
+            "INSERT OR IGNORE INTO users_v2(user_id,username,first_name,coins) VALUES(?,?,?,0)",
+            (target_id, "", ""),
+        )
+        x.execute(
+            "INSERT INTO collections_v2(user_id,character_code,caught_at) VALUES(?,?,?)",
+            (target_id, character[0], timestamp()),
+        )
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        print("Gift transaction error:", e)
+        await update.message.reply_text("❌ Gift failed due to a database error. Check the bot console.")
+        return
+    finally:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+    await update.message.reply_text(
+        f"🎁 Gift sent successfully!\n🎭 {character[1]} [{character[0]}]\n👤 User ID: {target_id}"
+    )
+
+    # Notification is best-effort; a failed PM must not undo the gift.
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=f"🎁 You received a character gift!\n🎭 {character[1]} [{character[0]}]\n👑 From: Owner"
+        )
+    except Exception as e:
+        print(f"Gift recipient notification error for {target_id}: {e}")
+
+# ---------- AUCTION ----------
+AUCTION_CODE, AUCTION_START_BID, AUCTION_DURATION, AUCTION_CONFIRM = range(400, 404)
+
+
+def auction_row_text(row):
+    auction_id, seller_id, code, start_bid, current_bid, bidder_id, ends_at = row
+    character = get_character_by_code(code)
+    name = character[1] if character else f"Character [{code}]"
+    try:
+        remaining = max(0, (datetime.fromisoformat(ends_at) - datetime.now()).total_seconds())
+    except Exception:
+        remaining = 0
+    bid_text = f"{current_bid} coins" if bidder_id else f"Starting bid: {start_bid} coins"
+    return (
+        f"🔨 Auction #{auction_id}\n"
+        f"🎭 {name} [{code}]\n"
+        f"💰 {bid_text}\n"
+        f"⏳ Ends in: {format_duration(remaining)}\n"
+        f"🆔 Seller ID: {seller_id}"
+    )
+
+
+async def auction(update, context):
+    # Auction listing is the only auction feature available in groups.
+    c=connect(); x=c.cursor()
+    x.execute("SELECT id,seller_id,character_code,start_bid,current_bid,highest_bidder_id,ends_at FROM auctions_v2 WHERE active=1 ORDER BY id DESC")
+    rows=x.fetchall(); c.close()
+    active=[]
+    for row in rows:
+        try:
+            if datetime.fromisoformat(row[6]) > datetime.now():
+                active.append(row)
+        except Exception:
+            pass
+    if not active:
+        await update.message.reply_text("🔨 No active auctions right now.")
+        return
+    text="🔨 ACTIVE AUCTIONS\n\n" + "\n\n".join(auction_row_text(r) for r in active[:20])
+    text += "\n\n💡 Bid: /bid <auction_id> <amount>"
+    await update.message.reply_text(text)
+
+
+async def auction_add_start(update, context):
+    save_user(update.effective_user)
+    if not await require_auction_private(update):
+        return ConversationHandler.END
+    for key in ("auction_code", "auction_start_bid", "auction_duration"):
+        context.user_data.pop(key, None)
+    await update.message.reply_text(
+        "🔨 Auction setup — Step 1/4\n\n"
+        "Send the character's 4-digit code only.\n"
+        "Example: 1001"
+    )
+    return AUCTION_CODE
+
+
+async def auction_add_code(update, context):
+    code = (update.message.text or "").strip()
+    if not (code.isdigit() and len(code) == 4):
+        await update.message.reply_text("❌ Code must be exactly 4 digits. Example: 1001")
+        return AUCTION_CODE
+    character = get_character_by_code(code)
+    if not character:
+        await update.message.reply_text("❌ Character not found. Send another 4-digit code.")
+        return AUCTION_CODE
+    user_id = update.effective_user.id
+    c = connect(); x = c.cursor()
+    x.execute("SELECT id FROM collections_v2 WHERE user_id=? AND character_code=? LIMIT 1", (user_id, code))
+    owned = x.fetchone(); c.close()
+    if not owned:
+        await update.message.reply_text("❌ You do not own this character.")
+        return AUCTION_CODE
+    context.user_data["auction_code"] = code
+    await update.message.reply_text(
+        "💰 Auction setup — Step 2/4\n\n"
+        "Send the base price / starting bid in coins.\n"
+        "It must be a positive whole number."
+    )
+    return AUCTION_START_BID
+
+
+async def auction_add_start_bid(update, context):
+    value = (update.message.text or "").strip()
+    if not value.isdigit() or int(value) < 1:
+        await update.message.reply_text("❌ Base price must be a positive whole number.")
+        return AUCTION_START_BID
+    context.user_data["auction_start_bid"] = int(value)
+    await update.message.reply_text(
+        "⏱️ Auction setup — Step 3/4\n\n"
+        "Send auction duration like:\n"
+        "• 3h\n• 1d\n• 1d 5h\n• 2d 12h 30m\n\n"
+        "Minimum duration: 3 hours.\n"
+        "Example: 1d 5h"
+    )
+    return AUCTION_DURATION
+
+
+def parse_auction_duration(text):
+    import re
+    value = (text or "").strip().lower()
+    if not value:
+        return None
+    # Accept combinations such as 3h, 1d 5h, 2d 12h 30m.
+    # Units are days/hours/minutes; each unit may appear at most once.
+    matches = re.findall(r"(\d+)\s*([dhm])\b", value)
+    remainder = re.sub(r"(\d+)\s*([dhm])\b", "", value).strip()
+    if not matches or remainder:
+        return None
+    units = {}
+    for amount, unit in matches:
+        if unit in units:
+            return None
+        units[unit] = int(amount)
+    if any(v < 0 for v in units.values()):
+        return None
+    total_minutes = units.get("d", 0) * 1440 + units.get("h", 0) * 60 + units.get("m", 0)
+    if total_minutes < 180:
+        return None
+    return total_minutes
+
+
+async def auction_add_duration(update, context):
+    duration = parse_auction_duration(update.message.text)
+    if duration is None:
+        await update.message.reply_text(
+            "❌ Invalid duration. Minimum is 3 hours.\n"
+            "Use formats like 3h, 1d, 1d 5h, or 2d 12h 30m."
+        )
+        return AUCTION_DURATION
+
+    code = context.user_data.get("auction_code")
+    start_bid = context.user_data.get("auction_start_bid")
+    if not code or not start_bid:
+        await update.message.reply_text("❌ Auction setup expired. Start again with /addauction.")
+        return ConversationHandler.END
+
+    character = get_character_by_code(code)
+    name = character[1] if character else f"Character [{code}]"
+    context.user_data["auction_duration"] = duration
+    confirmation = (
+        "🔨 Auction setup — Step 4/4\n\n"
+        f"🎭 Character: {name} [{code}]\n"
+        f"💰 Base price: {start_bid} coins\n"
+        f"⏱️ Duration: {format_duration(duration * 60)}\n\n"
+        "Do you want to list this character in the auction?"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ YES — List Auction", callback_data="auction_confirm:yes"),
+            InlineKeyboardButton("❌ NO — Cancel", callback_data="auction_confirm:no"),
+        ]
+    ])
+    await update.message.reply_text(confirmation, reply_markup=keyboard)
+    return AUCTION_CONFIRM
+
+
+async def auction_confirm_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "auction_confirm:no":
+        for key in ("auction_code", "auction_start_bid", "auction_duration"):
+            context.user_data.pop(key, None)
+        await query.edit_message_text("❌ Auction cancelled. Character was not added to the auction.")
+        return ConversationHandler.END
+    if data != "auction_confirm:yes":
+        await query.edit_message_text("❌ Invalid auction confirmation.")
+        return ConversationHandler.END
+
+    user_id = query.from_user.id
+    code = context.user_data.get("auction_code")
+    start_bid = context.user_data.get("auction_start_bid")
+    duration = context.user_data.get("auction_duration")
+    if not code or not start_bid or not duration:
+        await query.edit_message_text("❌ Auction setup expired. Start again with /addauction.")
+        return ConversationHandler.END
+
+    c = connect(); x = c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute(
+            "SELECT id FROM collections_v2 WHERE user_id=? AND character_code=? LIMIT 1",
+            (user_id, code),
+        )
+        owned = x.fetchone()
+        if not owned:
+            c.rollback()
+            await query.edit_message_text("❌ You no longer own this character. Auction cancelled.")
+            return ConversationHandler.END
+        # Keep the character in the seller collection while the auction is active.
+        # It is transferred only when the auction is finally settled.
+        ends = (datetime.now() + timedelta(minutes=int(duration))).isoformat(timespec="seconds")
+        x.execute(
+            "INSERT INTO auctions_v2(seller_id,character_code,start_bid,current_bid,highest_bidder_id,ends_at,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
+            (user_id, code, start_bid, start_bid, None, ends, timestamp()),
+        )
+        auction_id = x.lastrowid
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        print("Auction create error:", e)
+        await query.edit_message_text("❌ Could not create auction. Your character was not removed.")
+        return ConversationHandler.END
+    finally:
+        c.close()
+
+    character = get_character_by_code(code)
+    name = character[1] if character else f"Character [{code}]"
+    for key in ("auction_code", "auction_start_bid", "auction_duration"):
+        context.user_data.pop(key, None)
+    end_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔴 End Auction", callback_data=f"auction_end:{auction_id}")]])
+    await query.edit_message_text(
+        f"✅ Auction #{auction_id} listed successfully!\n"
+        f"🎭 {name} [{code}]\n"
+        f"💰 Base price: {start_bid} coins\n"
+        f"⏳ Duration: {format_duration(duration * 60)}\n\n"
+        "The auction will automatically close when the duration ends.",
+        reply_markup=end_kb,
+    )
+    return ConversationHandler.END
+
+
+async def bid(update, context):
+    save_user(update.effective_user)
+    # Bidding is intentionally allowed in both groups and the bot PM.
+    if len(context.args)!=2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.message.reply_text("Usage: /bid <auction_id> <amount>")
+        return
+    auction_id=int(context.args[0]); amount=int(context.args[1])
+    if amount<1:
+        await update.message.reply_text("❌ Bid must be at least 1 coin.")
+        return
+    bidder=update.effective_user.id
+    c=connect(); x=c.cursor()
+    previous_bidder=None; previous_amount=0; seller_id=None; code=None
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("SELECT seller_id,character_code,start_bid,current_bid,highest_bidder_id,ends_at FROM auctions_v2 WHERE id=? AND active=1",(auction_id,))
+        row=x.fetchone()
+        if not row:
+            c.rollback(); c.close(); await update.message.reply_text("❌ Auction not found or already ended."); return
+        seller_id,code,start_bid,current_bid,previous_bidder,ends_at=row
+        if datetime.fromisoformat(ends_at) <= datetime.now():
+            c.rollback(); c.close(); await update.message.reply_text("⏰ This auction has expired. Please wait for settlement."); return
+        if bidder==seller_id:
+            c.rollback(); c.close(); await update.message.reply_text("❌ You cannot bid on your own auction."); return
+        minimum=max(start_bid,current_bid+1 if previous_bidder else start_bid)
+        if amount<minimum:
+            c.rollback(); c.close(); await update.message.reply_text(f"❌ Minimum bid is {minimum} coins."); return
+        x.execute("SELECT coins FROM users_v2 WHERE user_id=?",(bidder,)); b=x.fetchone()
+        bidder_coins=b[0] if b else 0
+        # A bidder's previous active bid is not stacked; they must have enough
+        # coins for the new total amount. The old high bid is refunded first.
+        available = bidder_coins + (current_bid if previous_bidder == bidder else 0)
+        if available < amount:
+            c.rollback(); c.close(); await update.message.reply_text(f"❌ You need {amount} coins for this bid. You have {available} available."); return
+        if previous_bidder:
+            x.execute("UPDATE users_v2 SET coins=coins+? WHERE user_id=?",(current_bid,previous_bidder))
+            previous_amount=current_bid
+        x.execute("UPDATE users_v2 SET coins=coins-? WHERE user_id=?",(amount,bidder))
+        x.execute("INSERT INTO auction_bids_v2(auction_id,bidder_id,amount,created_at) VALUES(?,?,?,?)",(auction_id,bidder,amount,timestamp()))
+        x.execute("UPDATE auctions_v2 SET current_bid=?,highest_bidder_id=? WHERE id=?",(amount,bidder,auction_id))
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close(); print("Auction bid error:",e); await update.message.reply_text("❌ Bid failed. Please try again."); return
+    c.close()
+    await update.message.reply_text(f"✅ Bid placed!\n🔨 Auction #{auction_id}\n💰 {amount} coins")
+    try:
+        if previous_bidder and previous_bidder!=bidder:
+            await context.bot.send_message(previous_bidder, f"↩️ You were outbid on Auction #{auction_id}.\nYour {current_bid} coins have been refunded.")
+        await context.bot.send_message(seller_id, f"🔔 New bid on your Auction #{auction_id}!\n🎭 [{code}]\n💰 Bid: {amount} coins\n👤 Bidder ID: {bidder}")
+    except Exception as e:
+        print("Auction bid notification error:",e)
+
+
+async def settle_auction(context, auction_id, reason="expired"):
+    c=connect(); x=c.cursor(); seller_id=winner_id=code=None; amount=0; returned=False
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("SELECT seller_id,character_code,current_bid,highest_bidder_id,ends_at FROM auctions_v2 WHERE id=? AND active=1",(auction_id,))
+        row=x.fetchone()
+        if not row:
+            c.rollback(); c.close(); return None
+        seller_id,code,amount,winner_id,ends_at=row
+        if reason=="expired" and datetime.fromisoformat(ends_at)>datetime.now():
+            c.rollback(); c.close(); return None
+        if winner_id:
+            # Character stayed in seller collection during the auction.
+            # Remove exactly one copy now, then give it to the winner.
+            x.execute(
+                "SELECT id FROM collections_v2 WHERE user_id=? AND character_code=? LIMIT 1",
+                (seller_id, code),
+            )
+            seller_row = x.fetchone()
+            if not seller_row:
+                c.rollback()
+                c.close()
+                print(f"Auction settlement blocked: seller {seller_id} no longer owns {code}.")
+                return None
+            x.execute("DELETE FROM collections_v2 WHERE id=?", (seller_row[0],))
+            x.execute(
+                "INSERT INTO collections_v2(user_id,character_code,caught_at) VALUES(?,?,?)",
+                (winner_id, code, timestamp()),
+            )
+            x.execute("UPDATE auctions_v2 SET active=0 WHERE id=?",(auction_id,))
+            x.execute("UPDATE users_v2 SET coins=coins+? WHERE user_id=?",(amount,seller_id))
+        else:
+            # No bids: character was never removed, so simply close the auction.
+            x.execute("UPDATE auctions_v2 SET active=0 WHERE id=?",(auction_id,))
+            returned=True
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close(); print("Auction settle error:",e); return None
+    c.close()
+    return {"seller_id":seller_id,"winner_id":winner_id,"code":code,"amount":amount,"returned":returned,"reason":reason}
+
+
+async def end_auction(update, context):
+    if not await require_auction_private(update):
+        return
+    if len(context.args)!=1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /endauction <auction_id>"); return
+    auction_id=int(context.args[0]); c=connect(); x=c.cursor(); x.execute("SELECT seller_id,ends_at FROM auctions_v2 WHERE id=? AND active=1",(auction_id,)); row=x.fetchone(); c.close()
+    if not row:
+        await update.message.reply_text("❌ Auction not found or already ended."); return
+    if row[0]!=update.effective_user.id:
+        await update.message.reply_text("❌ Only the seller who created this auction can end it."); return
+    result=await settle_auction(context,auction_id,reason="manual")
+    if not result:
+        await update.message.reply_text("❌ Could not end the auction."); return
+    character=get_character_by_code(result["code"]); name=character[1] if character else f"Character [{result['code']}]"
+    if result["winner_id"]:
+        await update.message.reply_text(f"✅ Auction #{auction_id} ended.\n🏆 Winner: {result['winner_id']}\n🎭 {name} [{result['code']}]\n💰 Final bid: {result['amount']} coins")
+        try: await context.bot.send_message(result["winner_id"],f"🏆 You won Auction #{auction_id}!\n🎭 {name} [{result['code']}]\n💰 Paid: {result['amount']} coins")
+        except Exception: pass
+    else:
+        await update.message.reply_text(f"✅ Auction #{auction_id} ended with no bids.\n🎭 {name} [{result['code']}] returned to your collection.")
+
+
+async def auction_end_callback(update, context):
+    query = update.callback_query
+    if getattr(getattr(update, "effective_chat", None), "type", None) != "private":
+        await query.answer("🚫 Open the bot in PM to end an auction.", show_alert=True)
+        return
+    await query.answer()
+    data = query.data or ""
+    try:
+        auction_id = int(data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Invalid auction.")
+        return
+
+    c = connect(); x = c.cursor()
+    x.execute("SELECT seller_id FROM auctions_v2 WHERE id=? AND active=1", (auction_id,))
+    row = x.fetchone(); c.close()
+    if not row:
+        await query.edit_message_text("❌ Auction not found or already ended.")
+        return
+    if row[0] != query.from_user.id:
+        await query.answer("❌ Sirf auction owner ise end kar sakta hai.", show_alert=True)
+        return
+
+    result = await settle_auction(context, auction_id, reason="manual")
+    if not result:
+        await query.edit_message_text("❌ Could not end the auction.")
+        return
+    character = get_character_by_code(result["code"])
+    name = character[1] if character else f"Character [{result['code']}]"
+    if result["winner_id"]:
+        text = (
+            f"✅ Auction #{auction_id} ended.\n"
+            f"🏆 Winner: {result['winner_id']}\n"
+            f"🎭 {name} [{result['code']}]\n"
+            f"💰 Final bid: {result['amount']} coins"
+        )
+        try:
+            await context.bot.send_message(
+                result["winner_id"],
+                f"🏆 You won Auction #{auction_id}!\n🎭 {name} [{result['code']}]\n💰 Paid: {result['amount']} coins",
+            )
+        except Exception:
+            pass
+    else:
+        text = (
+            f"✅ Auction #{auction_id} ended with no bids.\n"
+            f"🎭 {name} [{result['code']}] returned to your collection."
+        )
+    await query.edit_message_text(text)
+
+
+async def auction_expiry_loop(app):
+    while True:
+        try:
+            c=connect(); x=c.cursor(); x.execute("SELECT id FROM auctions_v2 WHERE active=1 AND ends_at<=?", (timestamp(),)); ids=[r[0] for r in x.fetchall()]; c.close()
+            for auction_id in ids:
+                result=await settle_auction(app,auction_id,"expired")
+                if result:
+                    character=get_character_by_code(result["code"]); name=character[1] if character else f"Character [{result['code']}]"
+                    if result["winner_id"]:
+                        try: await app.bot.send_message(result["winner_id"],f"🏆 Auction #{auction_id} expired and you won!\n🎭 {name} [{result['code']}]\n💰 Paid: {result['amount']} coins")
+                        except Exception: pass
+                        try: await app.bot.send_message(result["seller_id"],f"💰 Auction #{auction_id} expired.\n🎭 {name} [{result['code']}] sold for {result['amount']} coins to User {result['winner_id']}.")
+                        except Exception: pass
+                    else:
+                        try: await app.bot.send_message(result["seller_id"],f"⏰ Auction #{auction_id} expired with no bids.\n🎭 {name} [{result['code']}] was returned to your collection.")
+                        except Exception: pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("Auction expiry loop error:",e)
+        await asyncio.sleep(5)
+
+
+# ---------- DAILY ----------
+async def daily(update, context):
+    save_user(update.effective_user)
+    user_id = update.effective_user.id
+    now_dt = datetime.now()
+
+    # Read reward pools before opening the write transaction.
+    rare_characters = get_characters_by_rarity("Rare")
+    common_characters = get_characters_by_rarity("Common")
+    if not rare_characters or len(common_characters) < 2:
+        await update.message.reply_text(
+            "❌ Daily reward cannot be prepared because the required Rare/Common characters are missing."
+        )
+        return
+
+    rare = random.choice(rare_characters)
+    common_pool = random.sample(common_characters, 2)
+    rewards = [rare, common_pool[0], common_pool[1]]
+
+    c = connect()
+    x = c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("SELECT last_daily FROM users_v2 WHERE user_id=?", (user_id,))
+        row = x.fetchone()
+
+        if row and row[0]:
+            try:
+                last = datetime.fromisoformat(row[0])
+                reset = now_dt.replace(hour=DAILY_RESET_HOUR, minute=0, second=0, microsecond=0)
+                if now_dt < reset:
+                    reset -= timedelta(days=1)
+                if last >= reset:
+                    c.rollback()
+                    await update.message.reply_text("⏳ Daily already claimed.")
+                    return
+            except (ValueError, TypeError):
+                # Bad legacy timestamp should not permanently block daily.
+                pass
+
+        x.execute("UPDATE users_v2 SET coins=coins+?, last_daily=? WHERE user_id=?",
+                  (DAILY_COINS, timestamp(), user_id))
+        if x.rowcount != 1:
+            raise RuntimeError("daily user row missing")
+
+        caught_at = timestamp()
+        for character in rewards:
+            x.execute("INSERT INTO collections_v2(user_id, character_code, caught_at) VALUES(?,?,?)",
+                      (user_id, character[0], caught_at))
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        print("Daily transaction error:", e)
+        await update.message.reply_text("❌ Daily reward could not be claimed. Please try again.")
+        return
+    finally:
+        c.close()
+
+    await update.message.reply_text(
+        "🎁 Daily Reward!\n\n"
+        f"💰 +{DAILY_COINS} coins\n"
+        "🎭 +1 Rare character\n"
+        "⚪ +2 Common characters\n\n"
+        f"🔵 {rare[1]} [{rare[0]}]\n"
+        f"⚪ {common_pool[0][1]} [{common_pool[0][0]}]\n"
+        f"⚪ {common_pool[1][1]} [{common_pool[1][0]}]"
+    )
+
+    for character in rewards:
+        photo = character[5]
+        if photo:
+            try:
+                await update.message.reply_photo(
+                    photo=photo,
+                    caption=f"{rarity_text(character[3])} {character[1]}",
+                )
+            except Exception as e:
+                print("Daily photo error:", e)
+
+
+# ---------- ADMIN ADD CHARACTER ----------
+ADD_NAME, ADD_RECRUIT, ADD_ANIME, ADD_RARITY, ADD_WORTH, ADD_CODE, ADD_PHOTO = range(7)
+
+
+async def addcharacter_start(update, context):
+    if not can_manage_characters(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be Owner, Executive or Scout to use this command.")
+        return ConversationHandler.END
+
+    # Clear only character-creation state so an interrupted previous flow
+    # cannot leak values into a new /addcharacter session.
+    for key in ("name", "anime", "rarity", "worth", "code"):
+        context.user_data.pop(key, None)
+
+    await update.message.reply_text("1️⃣ Send character name:")
+    return ADD_NAME
+
+
+async def addcharacter_name(update, context):
+    name = update.message.text.strip()
+    if not name or is_skip_text(name):
+        await update.message.reply_text("❌ Character name is required. Please send a valid name.")
+        return ADD_NAME
+    context.user_data["name"] = name
+    await update.message.reply_text(
+        "2️⃣ Send recruitment names (comma separated), or tap ⏭ Skip:\n"
+        "Example: Naruto, Uzumaki, Hero of the Village\n\n"
+        "⚠️ These are only search/catch names. The real character name stays unchanged." ,
+        reply_markup=skip_keyboard()
+    )
+    return ADD_RECRUIT
+
+
+async def addcharacter_recruit(update, context):
+    text = update.message.text.strip()
+    if is_skip_text(text):
+        names = []
+    else:
+        # Keep aliases as search-only data. Deduplicate case-insensitively and
+        # never replace the real character name.
+        names = []
+        seen = set()
+        for part in text.split(","):
+            alias = " ".join(part.split()).strip()
+            key = alias.casefold()
+            if alias and key not in seen:
+                seen.add(key)
+                names.append(alias)
+    context.user_data["recruit_names"] = names
+    await update.message.reply_text("3️⃣ Send anime name, or tap ⏭ Skip:", reply_markup=skip_keyboard())
+    return ADD_ANIME
+
+
+async def addcharacter_anime(update, context):
+    text = update.message.text.strip()
+    context.user_data["anime"] = "" if is_skip_text(text) else text
+    await update.message.reply_text(
+        "3️⃣ Send rarity:\n"
+        "Common / Rare / Epic / Legendary / Mythic / Celestial"
+    )
+    return ADD_RARITY
+
+
+async def addcharacter_rarity(update, context):
+    text = update.message.text.strip()
+    if is_skip_text(text):
+        context.user_data["rarity"] = ""
+        await update.message.reply_text("4️⃣ Send worth in coins (required):")
+        return ADD_WORTH
+    rarity = text.title()
+
+    if rarity not in SYMBOL:
+        await update.message.reply_text("❌ Invalid rarity.")
+        return ADD_RARITY
+
+    context.user_data["rarity"] = rarity
+    await update.message.reply_text("4️⃣ Send worth in coins:")
+    return ADD_WORTH
+
+
+async def addcharacter_worth(update, context):
+    try:
+        worth = int(update.message.text.strip())
+        if worth < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Worth must be a number.")
+        return ADD_WORTH
+
+    context.user_data["worth"] = worth
+    await update.message.reply_text("5️⃣ Send unique 4-digit code:")
+    return ADD_CODE
+
+
+async def addcharacter_code(update, context):
+    code = update.message.text.strip()
+
+    if not (code.isdigit() and len(code) == 4 and 1 <= int(code) <= 9999):
+        await update.message.reply_text(
+            "❌ Code must be exactly 4 digits (0001-9999)."
+        )
+        return ADD_CODE
+
+    if get_character(code):
+        await update.message.reply_text("❌ Code already exists.")
+        return ADD_CODE
+
+    context.user_data["code"] = code
+    await update.message.reply_text("6️⃣ Send the character photo, or tap ⏭ Skip:", reply_markup=skip_keyboard())
+    return ADD_PHOTO
+
+
+async def addcharacter_photo(update, context):
+    if is_skip_text(update.message.text):
+        photo_id = None
+    elif update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+    else:
+        await update.message.reply_text("❌ Send a photo or /skip.")
+        return ADD_PHOTO
+
+    d = context.user_data
+
+    c = connect()
+    x = c.cursor()
+
+    try:
+        x.execute("""
+            INSERT INTO characters_v2
+            (code,name,anime,rarity,worth,photo_file_id)
+            VALUES(?,?,?,?,?,?)
+        """, (
+            d["code"], d["name"], d["anime"], d["rarity"], d["worth"], photo_id,
+        ))
+        c.commit()
+        set_recruit_names(d["code"], d.get("recruit_names", []))
+    except sqlite3.IntegrityError:
+        c.rollback()
+        context.user_data.clear()
+        await update.message.reply_text("❌ Name or code already exists.")
+        return ConversationHandler.END
+    except Exception as e:
+        c.rollback()
+        print("Add character error:", e)
+        context.user_data.clear()
+        await update.message.reply_text("❌ Could not add character. Please try again.")
+        return ConversationHandler.END
+    finally:
+        c.close()
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"✅ Character added successfully!\n"
+        f"🎭 {d['name']}\n"
+        f"🏷 {rarity_text(d['rarity'])}\n"
+        f"💰 {d['worth']}\n"
+        f"🔢 {d['code']}"
+    )
+
+    return ConversationHandler.END
+
+
+# ---------- ADMIN PHOTO ----------
+async def addphoto(update, context):
+    if not can_manage_characters(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be Owner, Executive or Scout to use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /addphoto <name or code>"
+        )
+        return
+
+    character = get_character(" ".join(context.args))
+
+    if not character:
+        await update.message.reply_text("❌ Character not found.")
+        return
+
+    context.user_data["photo_code"] = character[0]
+    await update.message.reply_text(
+        f"📷 Send photo for {character[1]}."
+    )
+
+
+async def receive_photo(update, context):
+    code = context.user_data.get("photo_code")
+
+    if (
+        not code
+        or not can_manage_characters(update.effective_user.id)
+        or not update.message.photo
+    ):
+        return
+
+    c = connect()
+    x = c.cursor()
+    try:
+        x.execute(
+            "UPDATE characters_v2 SET photo_file_id=? WHERE code=?",
+            (update.message.photo[-1].file_id, code),
+        )
+        if x.rowcount != 1:
+            c.rollback()
+            await update.message.reply_text("❌ Character no longer exists.")
+            return
+        c.commit()
+    except Exception as e:
+        c.rollback()
+        print("Photo save error:", e)
+        await update.message.reply_text("❌ Could not save the photo. Please try again.")
+        return
+    finally:
+        c.close()
+
+    context.user_data.pop("photo_code", None)
+    await update.message.reply_text("✅ Photo saved.", reply_markup=ReplyKeyboardRemove())
+
+
+# ---------- CHARACTER EDIT ----------
+EDIT_NAME, EDIT_ANIME, EDIT_RARITY, EDIT_WORTH, EDIT_CODE = range(10, 15)
+
+async def editcharacter(update, context):
+    if not can_manage_characters(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be Owner, Executive or Scout to use this command.")
+        return ConversationHandler.END
+    if not context.args or not (len(context.args) == 1 and context.args[0].isdigit()):
+        await update.message.reply_text("Usage: /editcharacter <4-digit code>")
+        return ConversationHandler.END
+    code = context.args[0]
+    character = get_character_by_code(code)
+    if not character:
+        await update.message.reply_text("❌ Character not found.")
+        return ConversationHandler.END
+    context.user_data["edit_code_original"] = code
+    context.user_data["edit_character"] = character
+    await update.message.reply_text(
+        f"✏️ Editing {character[1]} [{character[0]}]\n\n"
+        "1️⃣ Send new character name, or tap ⏭ Skip to keep current."
+        f"\nCurrent: {character[1]}"
+    )
+    return EDIT_NAME
+
+async def edit_name(update, context):
+    if is_skip_text(update.message.text):
+        context.user_data["edit_name"] = context.user_data["edit_character"][1]
+    else:
+        name = update.message.text.strip()
+        if not name:
+            await update.message.reply_text("❌ Character name cannot be empty. Send a valid name or /skip.")
+            return EDIT_NAME
+        context.user_data["edit_name"] = name
+    await update.message.reply_text("2️⃣ Send new anime name, or tap ⏭ Skip to keep current.", reply_markup=skip_keyboard())
+    return EDIT_ANIME
+
+async def edit_anime(update, context):
+    if is_skip_text(update.message.text):
+        context.user_data["edit_anime"] = context.user_data["edit_character"][2]
+    else:
+        context.user_data["edit_anime"] = update.message.text.strip()
+    await update.message.reply_text("3️⃣ Send rarity (Common/Rare/Epic/Legendary/Mythic/Celestial), or tap ⏭ Skip.", reply_markup=skip_keyboard())
+    return EDIT_RARITY
+
+async def edit_rarity(update, context):
+    text = update.message.text.strip()
+    if is_skip_text(text):
+        rarity = context.user_data["edit_character"][3]
+    else:
+        rarity = text.title()
+        if rarity not in SYMBOL:
+            await update.message.reply_text("❌ Invalid rarity.")
+            return EDIT_RARITY
+    context.user_data["edit_rarity"] = rarity
+    await update.message.reply_text("4️⃣ Send new worth, or tap ⏭ Skip to keep current worth.", reply_markup=skip_keyboard())
+    return EDIT_WORTH
+
+async def edit_worth(update, context):
+    text = update.message.text.strip()
+    if is_skip_text(text):
+        worth = context.user_data["edit_character"][4]
+    else:
+        try:
+            worth = int(text)
+            if worth < 0: raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Worth must be a non-negative number.")
+            return EDIT_WORTH
+    context.user_data["edit_worth"] = worth
+    await update.message.reply_text("5️⃣ Send new unique 4-digit code, or tap ⏭ Skip to keep current.", reply_markup=skip_keyboard())
+    return EDIT_CODE
+
+async def edit_code(update, context):
+    text = update.message.text.strip()
+    old_code = context.user_data["edit_code_original"]
+    if is_skip_text(text):
+        new_code = old_code
+    else:
+        if not (text.isdigit() and len(text) == 4 and 1 <= int(text) <= 9999):
+            await update.message.reply_text("❌ Code must be exactly 4 digits (0001-9999).")
+            return EDIT_CODE
+        existing = get_character_by_code(text)
+        if existing and text != old_code:
+            await update.message.reply_text("❌ That code already exists.")
+            return EDIT_CODE
+        new_code = text
+
+    d = context.user_data
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    if any(str(spawn.get("code")) == str(old_code) for spawn in active.values()):
+        await update.message.reply_text("❌ This character is currently spawned in a group. Catch/expire that spawn before editing it.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    c = connect(); x = c.cursor()
+    try:
+        if new_code != old_code:
+            x.execute("UPDATE collections_v2 SET character_code=? WHERE character_code=?", (new_code, old_code))
+            x.execute("UPDATE favorites_v2 SET character_code=? WHERE character_code=?", (new_code, old_code))
+            x.execute("UPDATE characters_v2 SET code=?, name=?, anime=?, rarity=?, worth=? WHERE code=?",
+                      (new_code, d["edit_name"], d["edit_anime"], d["edit_rarity"], d["edit_worth"], old_code))
+        else:
+            x.execute("UPDATE characters_v2 SET name=?, anime=?, rarity=?, worth=? WHERE code=?",
+                      (d["edit_name"], d["edit_anime"], d["edit_rarity"], d["edit_worth"], old_code))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close()
+        await update.message.reply_text("❌ Update failed: name or code may already exist.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    c.close()
+    await update.message.reply_text(
+        f"✅ Character edit successfully!\n\n🎭 {d['edit_name']}\n📺 {d['edit_anime']}\n"
+        f"🏷 {rarity_text(d['edit_rarity'])}\n💰 {d['edit_worth']}\n🔢 {new_code}"
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+# ---------- ADMIN DELETE ----------
+async def delete(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /delete <name or code>"
+        )
+        return
+
+    character = get_character(" ".join(context.args))
+
+    if not character:
+        await update.message.reply_text("❌ Character not found.")
+        return
+
+    code, name, anime, rarity, worth, photo = character
+
+    # Do not leave an active in-memory spawn pointing at a character that
+    # has just been deleted. Serialize this with /add and spawn operations.
+    lock = get_spawn_lock(context.application)
+    async with lock:
+        active = context.application.bot_data.setdefault("active_spawns", {})
+        removed_active = {}
+        for chat_id, spawn_data in list(active.items()):
+            if str(spawn_data.get("code")) == str(code):
+                removed_active[chat_id] = spawn_data
+                del active[chat_id]
+
+        c = connect()
+        x = c.cursor()
+        try:
+            x.execute(
+                "DELETE FROM collections_v2 WHERE character_code=?",
+                (code,),
+            )
+            x.execute(
+                "DELETE FROM favorites_v2 WHERE character_code=?",
+                (code,),
+            )
+            x.execute(
+                "DELETE FROM characters_v2 WHERE code=?",
+                (code,),
+            )
+            c.commit()
+        except Exception as e:
+            c.rollback()
+            c.close()
+            # Restore any active spawns if the DB deletion failed.
+            active.update(removed_active)
+            print("delete character error:", e)
+            await update.message.reply_text("❌ Could not delete the character.")
+            return
+        c.close()
+
+        # The active spawn had already consumed its rarity reservation.
+        # Since deletion removes that spawn without a catch, release it.
+        for spawn_data in removed_active.values():
+            rollback_rarity_reservation(spawn_data.get("rarity"))
+
+    await update.message.reply_text(
+        f"🗑 Deleted {name} [{code}]."
+        + (f"\n🧹 Removed {len(removed_active)} active spawn(s)." if removed_active else "")
+    )
+
+
+# ---------- EXECUTIVE MANAGEMENT ----------
+async def executives(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if not EXECUTIVE_IDS:
+        await update.message.reply_text("👔 No Executive staff configured.")
+        return
+    c = connect(); x = c.cursor()
+    lines = [f"👔 Executive Staff ({len(EXECUTIVE_IDS)})", ""]
+    for uid in EXECUTIVE_IDS:
+        x.execute("SELECT first_name,last_name,username FROM users_v2 WHERE user_id=?", (uid,))
+        row = x.fetchone()
+        if row:
+            first, last, username = row
+            name = " ".join(v for v in [first, last] if v).strip() or "Unknown"
+            handle = f"@{username}" if username else "No username"
+        else:
+            name, handle = "Unknown", "No username"
+        lines.append(f"• {name} ({handle}) — ID: {uid}")
+    c.close()
+    await update.message.reply_text("\n".join(lines))
+
+async def addexec(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /addexec <telegram_user_id>")
+        return
+    uid = int(context.args[0])
+    if uid == update.effective_user.id or uid in EXECUTIVE_IDS or uid in SCOUT_IDS or is_owner(uid):
+        await update.message.reply_text("❌ This user is already Owner/Executive/Scout.")
+        return
+    c = connect(); x = c.cursor()
+    try:
+        x.execute("INSERT INTO staff_roles_v2(user_id,role,added_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role", (uid,"executive",timestamp()))
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close()
+        print("addexec error:", e)
+        await update.message.reply_text("❌ Could not add this Executive.")
+        return
+    c.close()
+    if uid not in EXECUTIVE_IDS:
+        EXECUTIVE_IDS.append(uid)
+    await refresh_command_menu(context.bot, uid)
+    await update.message.reply_text(f"✅ {uid} added as Executive.")
+
+async def removeexec(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /removeexec <telegram_user_id>")
+        return
+    uid=int(context.args[0])
+    if uid not in EXECUTIVE_IDS:
+        await update.message.reply_text("❌ Executive not found.")
+        return
+    c = connect(); x = c.cursor()
+    try:
+        x.execute("DELETE FROM staff_roles_v2 WHERE user_id=? AND role='executive'", (uid,))
+        if x.rowcount == 0:
+            c.rollback(); c.close()
+            await update.message.reply_text("❌ Executive not found in database.")
+            return
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close()
+        print("removeexec error:", e)
+        await update.message.reply_text("❌ Could not remove this Executive.")
+        return
+    c.close()
+    EXECUTIVE_IDS.remove(uid)
+    await refresh_command_menu(context.bot, uid)
+    await update.message.reply_text(f"✅ {uid} removed from Executive staff.")
+
+
+# ---------- SCOUT MANAGEMENT ----------
+async def scouts(update, context):
+    if not (is_owner(update.effective_user.id) or is_executive(update.effective_user.id)):
+        await update.message.reply_text("⚠️ You need to be the owner or an executive to use this command.")
+        return
+
+    # Always read Scouts from SQLite so the command works after restart and
+    # never depends on a stale in-memory cache.
+    c = connect(); x = c.cursor()
+    x.execute("SELECT user_id FROM staff_roles_v2 WHERE role='scout' ORDER BY user_id")
+    db_ids = [int(row[0]) for row in x.fetchall()]
+    SCOUT_IDS[:] = [uid for uid in db_ids if uid not in EXECUTIVE_IDS and not is_owner(uid)]
+
+    if not SCOUT_IDS:
+        c.close()
+        await update.message.reply_text("🔭 No Scouts added yet.")
+        return
+
+    lines = [f"🔭 Scout Staff ({len(SCOUT_IDS)})", ""]
+    for uid in SCOUT_IDS:
+        x.execute("SELECT first_name,last_name,username FROM users_v2 WHERE user_id=?", (uid,))
+        row = x.fetchone()
+        if row:
+            first, last, username = row
+            name = " ".join(v for v in [first, last] if v).strip() or "Unknown"
+            handle = f"@{username}" if username else "No username"
+        else:
+            name, handle = "Unknown", "No username"
+        lines.append(f"• {name} ({handle}) — ID: {uid}")
+    c.close()
+    await update.message.reply_text("\n".join(lines))
+
+
+async def addscout(update, context):
+    if not (is_owner(update.effective_user.id) or is_executive(update.effective_user.id)):
+        await update.message.reply_text("⚠️ Only Owner/Executive can add Scouts.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /addscout <telegram_user_id>")
+        return
+    uid = int(context.args[0])
+    if uid == update.effective_user.id or is_owner(uid) or is_executive(uid) or is_scout(uid):
+        await update.message.reply_text("❌ This user is already Owner/Executive/Scout.")
+        return
+    c = connect(); x = c.cursor()
+    try:
+        x.execute("INSERT INTO staff_roles_v2(user_id,role,added_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET role=excluded.role", (uid, "scout", timestamp()))
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close()
+        print("addscout error:", e)
+        await update.message.reply_text("❌ Could not add this Scout.")
+        return
+    c.close()
+    if uid not in SCOUT_IDS:
+        SCOUT_IDS.append(uid)
+    await refresh_command_menu(context.bot, uid)
+    await update.message.reply_text(f"✅ {uid} added as Scout.\n\n🔭 Scout commands are now enabled for this user in Bot PM.")
+
+
+async def removescout(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ Only Owner can remove Scouts.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /removescout <telegram_user_id>")
+        return
+    uid = int(context.args[0])
+    if uid not in SCOUT_IDS:
+        await update.message.reply_text("❌ Scout not found.")
+        return
+    c = connect(); x = c.cursor()
+    try:
+        x.execute("DELETE FROM staff_roles_v2 WHERE user_id=? AND role='scout'", (uid,))
+        if x.rowcount == 0:
+            c.rollback(); c.close()
+            await update.message.reply_text("❌ Scout not found in database.")
+            return
+        c.commit()
+    except Exception as e:
+        c.rollback(); c.close()
+        print("removescout error:", e)
+        await update.message.reply_text("❌ Could not remove this Scout.")
+        return
+    c.close()
+    SCOUT_IDS.remove(uid)
+    await refresh_command_menu(context.bot, uid)
+    await update.message.reply_text(f"✅ {uid} removed from Scout staff.")
+
+
+# ---------- ISSUE / IDEA / APPEAL ----------
+ISSUE_TEXT, ISSUE_ATTACHMENT = range(100, 102)
+IDEA_TEXT, IDEA_ATTACHMENT = range(200, 202)
+APPEAL_TEXT, APPEAL_ATTACHMENT = range(300, 302)
+
+
+async def issue_start(update, context):
+    save_user(update.effective_user)
+    await update.message.reply_text(
+        "🛠 Please send your issue details.\n\n"
+        "After that, you can optionally send a photo/screenshot.\n"
+        "If you don't have a photo, send /skip."
+    )
+    return ISSUE_TEXT
+
+
+async def issue_text(update, context):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Please send issue details.")
+        return ISSUE_TEXT
+
+    context.user_data["issue_text"] = text
+    await update.message.reply_text(
+        "📷 Optional: send a photo/screenshot.\n"
+        "Or send /skip."
+    )
+    return ISSUE_ATTACHMENT
+
+
+async def issue_attachment(update, context):
+    if update.message.photo:
+        context.user_data["issue_photo"] = update.message.photo[-1].file_id
+        return await finish_issue(update, context)
+
+    if update.message.document and update.message.document.mime_type:
+        if update.message.document.mime_type.startswith("image/"):
+            context.user_data["issue_photo"] = update.message.document.file_id
+            return await finish_issue(update, context)
+
+    await update.message.reply_text(
+        "❌ Please send an image/screenshot or tap ⏭ Skip."
+        , reply_markup=skip_keyboard()
+    )
+    return ISSUE_ATTACHMENT
+
+
+async def issue_skip(update, context):
+    return await finish_issue(update, context)
+
+
+async def finish_issue(update, context):
+    user = update.effective_user
+    text = context.user_data.get("issue_text", "").strip()
+    photo = context.user_data.get("issue_photo")
+
+    c = connect()
+    x = c.cursor()
+    try:
+        x.execute("""
+            INSERT INTO issues_v2
+            (user_id, username, first_name, issue_text, photo_file_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            text,
+            photo,
+            timestamp(),
+        ))
+        issue_id = x.lastrowid
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        c.close()
+        print("Issue submission database error:", e)
+        await update.message.reply_text("❌ Issue could not be submitted. Please try again.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    c.close()
+
+    username_str = f"@{user.username}" if user.username else "No username"
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "Unknown"
+
+    notification = (
+        f"📥 OWNER PM — NEW ISSUE #{issue_id}\n\n"
+        f"👤 Name: {full_name}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"🔗 Username: {username_str}\n\n"
+        f"📝 Issue:\n{text}"
+    )
+
+    await notify_admins(context, notification, photo)
+
+    context.user_data.pop("issue_text", None)
+    context.user_data.pop("issue_photo", None)
+
+    await update.message.reply_text(
+        f"✅ Issue submitted successfully.\n"
+        f"🆔 Issue ID: #{issue_id}\n"
+        "👨‍💼 It has been sent to the owner/admin for review.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def idea_start(update, context):
+    save_user(update.effective_user)
+    await update.message.reply_text(
+        "💡 Please send your idea.\n\n"
+        "After that, you can optionally send a photo/screenshot.\n"
+        "If you don't have a photo, send /skip."
+    )
+    return IDEA_TEXT
+
+
+async def idea_text(update, context):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Please send your idea.")
+        return IDEA_TEXT
+
+    context.user_data["idea_text"] = text
+    await update.message.reply_text(
+        "📷 Optional: send a photo/screenshot.\n"
+        "Or send /skip."
+    )
+    return IDEA_ATTACHMENT
+
+
+async def idea_attachment(update, context):
+    if update.message.photo:
+        context.user_data["idea_photo"] = update.message.photo[-1].file_id
+        return await finish_idea(update, context)
+
+    if update.message.document and update.message.document.mime_type:
+        if update.message.document.mime_type.startswith("image/"):
+            context.user_data["idea_photo"] = update.message.document.file_id
+            return await finish_idea(update, context)
+
+    await update.message.reply_text(
+        "❌ Please send an image/screenshot or tap ⏭ Skip."
+        , reply_markup=skip_keyboard()
+    )
+    return IDEA_ATTACHMENT
+
+
+async def idea_skip(update, context):
+    return await finish_idea(update, context)
+
+
+async def finish_idea(update, context):
+    user = update.effective_user
+    text = context.user_data.get("idea_text", "").strip()
+    photo = context.user_data.get("idea_photo")
+
+    c = connect()
+    x = c.cursor()
+    try:
+        x.execute("""
+            INSERT INTO ideas_v2
+            (user_id, username, first_name, idea_text, photo_file_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            text,
+            photo,
+            timestamp(),
+        ))
+        idea_id = x.lastrowid
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        c.close()
+        print("Idea submission database error:", e)
+        await update.message.reply_text("❌ Idea could not be submitted. Please try again.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    c.close()
+
+    username = f"@{user.username}" if user.username else "No username"
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "Unknown"
+    notification = (
+        f"📥 OWNER PM — NEW IDEA #{idea_id}\n\n"
+        f"👤 Name: {full_name}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"🔗 Username: {username}\n\n"
+        f"📝 Idea:\n{text}"
+    )
+
+    await notify_admins(context, notification, photo)
+
+    context.user_data.pop("idea_text", None)
+    context.user_data.pop("idea_photo", None)
+
+    await update.message.reply_text(
+        f"✅ Idea submitted successfully.\n"
+        f"🆔 Idea ID: #{idea_id}\n"
+        "👨‍💼 It has been sent to the owner/admin for review.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def appeal_start(update, context):
+    save_user(update.effective_user)
+    await update.message.reply_text(
+        "⚖️ Please send your appeal details.\n\n"
+        "Mention the punishment/restriction and why you think it should "
+        "be reviewed.\n"
+        "After that, you can optionally send a photo/screenshot.\n"
+        "If you don't have a photo, send /skip."
+    )
+    return APPEAL_TEXT
+
+
+async def appeal_text(update, context):
+    text = (update.message.text or "").strip()
+    if not text:
+        await update.message.reply_text("❌ Please send appeal details.")
+        return APPEAL_TEXT
+
+    context.user_data["appeal_text"] = text
+    await update.message.reply_text(
+        "📷 Optional: send a photo/screenshot.\n"
+        "Or send /skip."
+    )
+    return APPEAL_ATTACHMENT
+
+
+async def appeal_attachment(update, context):
+    if update.message.photo:
+        context.user_data["appeal_photo"] = update.message.photo[-1].file_id
+        return await finish_appeal(update, context)
+
+    if update.message.document and update.message.document.mime_type:
+        if update.message.document.mime_type.startswith("image/"):
+            context.user_data["appeal_photo"] = update.message.document.file_id
+            return await finish_appeal(update, context)
+
+    await update.message.reply_text(
+        "❌ Please send an image/screenshot or tap ⏭ Skip."
+        , reply_markup=skip_keyboard()
+    )
+    return APPEAL_ATTACHMENT
+
+
+async def appeal_skip(update, context):
+    return await finish_appeal(update, context)
+
+
+async def finish_appeal(update, context):
+    user = update.effective_user
+    text = context.user_data.get("appeal_text", "").strip()
+    photo = context.user_data.get("appeal_photo")
+
+    c = connect()
+    x = c.cursor()
+    try:
+        x.execute("""
+            INSERT INTO appeals_v2
+            (user_id, username, first_name, appeal_text, photo_file_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            user.first_name or "",
+            text,
+            photo,
+            timestamp(),
+        ))
+        appeal_id = x.lastrowid
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        c.close()
+        print("Appeal submission database error:", e)
+        await update.message.reply_text("❌ Appeal could not be submitted. Please try again.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+    c.close()
+
+    username = f"@{user.username}" if user.username else "No username"
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])) or "Unknown"
+    notification = (
+        f"📥 OWNER PM — NEW APPEAL #{appeal_id}\n\n"
+        f"👤 Name: {full_name}\n"
+        f"🆔 User ID: {user.id}\n"
+        f"🔗 Username: {username}\n\n"
+        f"📝 Appeal:\n{text}"
+    )
+
+    await notify_admins(context, notification, photo)
+
+    context.user_data.pop("appeal_text", None)
+    context.user_data.pop("appeal_photo", None)
+
+    await update.message.reply_text(
+        f"✅ Appeal submitted successfully.\n"
+        f"🆔 Appeal ID: #{appeal_id}\n"
+        "👨‍💼 It has been sent to the owner/admin for review.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
+
+
+async def notify_admins(context, text, photo_file_id=None):
+    """Deliver Issue/Idea/Appeal submissions to Owner AND every Executive.
+
+    Executive IDs are read from SQLite on every submission, so persisted
+    Executive staff are notified even after a bot restart. Config-based IDs
+    are also included. One failed recipient never blocks the others.
+    """
+    owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+
+    executive_ids = set()
+    try:
+        c = connect(); x = c.cursor()
+        x.execute("SELECT user_id FROM staff_roles_v2 WHERE role='executive'")
+        executive_ids.update(int(row[0]) for row in x.fetchall())
+        c.close()
+    except Exception as e:
+        print("Executive notification lookup error:", e)
+
+    executive_ids.update(int(uid) for uid in EXECUTIVE_IDS)
+
+    recipients = []
+    if owner_id is not None:
+        recipients.append(owner_id)
+    recipients.extend(uid for uid in sorted(executive_ids) if uid != owner_id)
+
+    if not recipients:
+        print("Staff notification skipped: no Owner/Executive recipient configured")
+        return
+
+    delivered = 0
+    for staff_id in recipients:
+        try:
+            if photo_file_id:
+                if len(text) <= 1024:
+                    await asyncio.wait_for(
+                        context.bot.send_photo(
+                            chat_id=staff_id,
+                            photo=photo_file_id,
+                            caption=text,
+                        ),
+                        timeout=15,
+                    )
+                else:
+                    await asyncio.wait_for(
+                        context.bot.send_photo(
+                            chat_id=staff_id,
+                            photo=photo_file_id,
+                            caption="📎 Attachment for the submission below.",
+                        ),
+                        timeout=15,
+                    )
+                    await asyncio.wait_for(
+                        context.bot.send_message(chat_id=staff_id, text=text),
+                        timeout=15,
+                    )
+            else:
+                await asyncio.wait_for(
+                    context.bot.send_message(chat_id=staff_id, text=text),
+                    timeout=15,
+                )
+            delivered += 1
+            print(f"Staff notification delivered to {staff_id}")
+        except asyncio.TimeoutError:
+            print(f"Staff notification timeout for {staff_id}")
+        except Exception as e:
+            print(f"Staff notification error for {staff_id}: {e}")
+
+    print(f"Staff notification result: {delivered}/{len(recipients)} delivered")
+
+
+# ---------- OWNER MONITORING ----------
+def log_activity(update, command=None):
+    try:
+        u = update.effective_user
+        chat = update.effective_chat
+        if not u or not chat:
+            return
+        if command is None and getattr(update, "message", None):
+            text = update.message.text or ""
+            command = text.split()[0].split("@")[0] if text.startswith("/") else "message"
+        command = command or "unknown"
+        c = connect(); x = c.cursor()
+        x.execute(
+            "INSERT INTO activity_log_v2(user_id,username,first_name,chat_id,command,created_at) VALUES(?,?,?,?,?,?)",
+            (u.id, u.username or "", u.first_name or "", chat.id, command, timestamp()),
+        )
+        c.commit(); c.close()
+    except Exception as e:
+        print("Activity log error:", e)
+
+
+async def log_command_activity(update, context):
+    if getattr(update, "message", None) and getattr(update.message, "text", None):
+        text = update.message.text.strip()
+        if text.startswith("/"):
+            log_activity(update)
+
+
+def record_spawn_history(chat_id, character, spawned_by="auto"):
+    try:
+        c = connect(); x = c.cursor()
+        x.execute(
+            "INSERT INTO spawn_history_v2(chat_id,character_code,rarity,spawned_by,spawned_at) VALUES(?,?,?,?,?)",
+            (chat_id, str(character[0]), character[3], spawned_by, timestamp()),
+        )
+        history_id = x.lastrowid
+        c.commit(); c.close()
+        return history_id
+    except Exception as e:
+        print("Spawn history error:", e)
+        return None
+
+
+def mark_spawn_caught(history_id, user_id):
+    if not history_id:
+        return
+    try:
+        c = connect(); x = c.cursor()
+        x.execute("UPDATE spawn_history_v2 SET caught_by=?, caught_at=? WHERE id=?", (user_id, timestamp(), history_id))
+        c.commit(); c.close()
+    except Exception as e:
+        print("Spawn catch history error:", e)
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only spawn history. Usage: /history or /history 20"""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⛔ This command is Owner-only.")
+        return
+
+    limit = 20
+    if context.args:
+        try:
+            limit = max(1, min(int(context.args[0]), 50))
+        except ValueError:
+            await update.message.reply_text("Usage: /history [1-50]")
+            return
+
+    rows = []
+    try:
+        conn = connect()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT h.character_code, h.rarity, h.spawned_by, h.spawned_at,
+                   h.caught_by, h.caught_at, c.name
+            FROM spawn_history_v2 h
+            LEFT JOIN characters_v2 c ON c.code = h.character_code
+            ORDER BY h.id DESC
+            LIMIT ?
+        """, (limit,))
+        rows = cur.fetchall()
+        conn.close()
+    except Exception as e:
+        print("history error:", e)
+        await update.message.reply_text("❌ Could not load spawn history.")
+        return
+
+    if not rows:
+        await update.message.reply_text("📜 No spawn history yet.")
+        return
+
+    now = datetime.now()
+    lines = [f"📜 <b>Spawn History</b> — latest {len(rows)}", ""]
+    for i, row in enumerate(rows, 1):
+        code, rarity, spawned_by, spawned_at, caught_by, caught_at, name = row
+        char_name = name or "Unknown Character"
+        try:
+            spawned_dt = datetime.fromisoformat(spawned_at)
+            spawned_text = spawned_dt.strftime("%d %b %Y, %H:%M")
+            expired = (now - spawned_dt).total_seconds() >= SPAWN_LIFETIME
+        except Exception:
+            spawned_text = str(spawned_at)
+            expired = False
+
+        source_map = {
+            "auto_spawn": "Auto",
+            "manual_spawn": "Manual /spawn",
+            "owner_callchar": "Owner /callchar",
+            "auto": "Auto",
+            "manual": "Manual",
+        }
+        source = source_map.get(spawned_by, spawned_by or "Unknown")
+
+        if caught_by:
+            caught_text = f"Caught by <code>{caught_by}</code>"
+            if caught_at:
+                try:
+                    caught_text += f" at {datetime.fromisoformat(caught_at).strftime('%d %b %Y, %H:%M')}"
+                except Exception:
+                    caught_text += f" at {caught_at}"
+        elif expired:
+            caught_text = "⏰ Expired / uncaught"
+        else:
+            caught_text = "🟢 Still active / uncaught"
+
+        lines.append(
+            f"<b>#{i} {char_name}</b> [{rarity}]\n"
+            f"Code: <code>{code}</code> • Spawned: {spawned_text}\n"
+            f"By: {source}\n"
+            f"{caught_text}"
+        )
+
+    await update.message.reply_text("\n\n".join(lines), parse_mode="HTML")
+
+async def spawnstats(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    c = connect(); x = c.cursor()
+    x.execute("SELECT COUNT(*) FROM spawn_history_v2")
+    total = x.fetchone()[0]
+    counts = {}
+    for rarity in WORTH:
+        x.execute("SELECT COUNT(*) FROM spawn_history_v2 WHERE rarity=?", (rarity,))
+        counts[rarity] = x.fetchone()[0]
+    x.execute("SELECT COUNT(*) FROM spawn_history_v2 WHERE caught_by IS NOT NULL")
+    caught = x.fetchone()[0]
+    x.execute("SELECT COUNT(*) FROM spawn_history_v2 WHERE caught_by IS NULL")
+    missed = x.fetchone()[0]
+    x.execute("SELECT COUNT(*) FROM spawn_history_v2 WHERE id > COALESCE((SELECT MAX(id) FROM spawn_history_v2 WHERE rarity='Legendary'), 0)")
+    since_legendary = x.fetchone()[0]
+    c.close()
+    await update.message.reply_text(
+        "📊 Spawn Statistics (Owner Only)\n\n"
+        f"🔢 Total spawns: {total}\n"
+        f"⚪ Common: {counts.get('Common', 0)}\n"
+        f"🔵 Rare: {counts.get('Rare', 0)}\n"
+        f"🟣 Epic: {counts.get('Epic', 0)}\n"
+        f"💎 Legendary: {counts.get('Legendary', 0)}\n"
+        f"💠 Mythic: {counts.get('Mythic', 0)}\n"
+        f"🧠 Celestial: {counts.get('Celestial', 0)}\n\n"
+        f"✅ Caught: {caught}\n"
+        f"⏰ Uncaught/expired: {missed}\n"
+        f"📈 Spawns since last Legendary: {since_legendary}"
+    )
+
+
+async def activity(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    limit = 20
+    if context.args and context.args[0].isdigit():
+        limit = min(50, max(1, int(context.args[0])))
+    c = connect(); x = c.cursor()
+    x.execute("SELECT user_id,username,first_name,chat_id,command,created_at FROM activity_log_v2 ORDER BY id DESC LIMIT ?", (limit,))
+    rows = x.fetchall(); c.close()
+    if not rows:
+        await update.message.reply_text("📋 No activity recorded yet.")
+        return
+    lines = ["📋 Recent Bot Activity (Owner Only)", ""]
+    for user_id, username, first_name, chat_id, command, created_at in rows:
+        who = f"@{username}" if username else (first_name or str(user_id))
+        lines.append(f"• {created_at} — {who} — {command}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def status(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    c = connect(); x = c.cursor()
+    x.execute("SELECT COUNT(*) FROM users_v2")
+    users = x.fetchone()[0]
+    x.execute("SELECT COUNT(*) FROM characters_v2")
+    characters = x.fetchone()[0]
+    x.execute("SELECT COUNT(*) FROM collections_v2")
+    catches = x.fetchone()[0]
+    c.close()
+    lines = [
+        "🟢 Bot Status (Owner Only)", "",
+        f"👤 Registered users: {users}",
+        f"🎭 Characters: {characters}",
+        f"🎯 Total catches: {catches}",
+        f"🔥 Active spawns: {len(active)}",
+    ]
+    if active:
+        lines += ["", "🔥 Current active spawns:"]
+        for chat_id, sp in list(active.items())[:10]:
+            remaining = max(0, int((sp["expires_at"] - datetime.now()).total_seconds()))
+            lines.append(f"• Chat {chat_id}: {sp['name']} [{sp['rarity']}] — {format_duration(remaining)} left")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------- EVENTS & REDEEM ----------
+async def event(update, context):
+    save_user(update.effective_user)
+    row = get_active_event()
+    if not row:
+        await update.message.reply_text("🎉 No active event right now.")
+        return
+
+    event_id, name, description, reward_type, reward_value, end_at, _ = row
+    c = connect(); x = c.cursor()
+    x.execute("SELECT trigger_text FROM events_v2 WHERE id=?", (event_id,))
+    trigger_row = x.fetchone()
+    trigger_text = (trigger_row[0] if trigger_row else "") or name
+    c.close()
+    try:
+        end_text = datetime.fromisoformat(end_at).strftime("%d %b %Y, %I:%M %p")
+    except ValueError:
+        end_text = end_at
+
+    c = connect(); x = c.cursor()
+    x.execute("SELECT 1 FROM event_claims_v2 WHERE event_id=? AND user_id=?", (event_id, update.effective_user.id))
+    claimed = x.fetchone() is not None
+    c.close()
+
+    text = (
+        f"🎉 EVENT: {name}\n\n"
+        f"{description or 'Special event is live!'}\n\n"
+        f"🎁 Reward: {format_reward(reward_type, reward_value)}\n"
+        f"💬 Trigger: {trigger_text}\n"
+        f"⏰ Ends: {end_text}"
+    )
+    if claimed:
+        text += "\n\n✅ You have already claimed this event reward."
+    await update.message.reply_text(text)
+
+
+EVENT_NAME, EVENT_REWARD_TYPE, EVENT_REWARD_VALUE, EVENT_TRIGGER, EVENT_END = range(400,405)
+
+async def add_event_start(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command."); return ConversationHandler.END
+    await update.message.reply_text("1️⃣ Event name:"); return EVENT_NAME
+
+async def add_event_name(update, context):
+    text=update.message.text.strip()
+    if not text: await update.message.reply_text("❌ Event name required."); return EVENT_NAME
+    context.user_data["event_name"]=text; await update.message.reply_text("2️⃣ Reward type: Coins or Character"); return EVENT_REWARD_TYPE
+
+async def add_event_reward_type(update, context):
+    text=update.message.text.strip().lower()
+    if text not in ("coins","character"): await update.message.reply_text("❌ Send Coins or Character."); return EVENT_REWARD_TYPE
+    context.user_data["event_reward_type"]=text
+    await update.message.reply_text("3️⃣ Send coin amount:" if text=="coins" else "3️⃣ Send existing 4-digit character code:")
+    return EVENT_REWARD_VALUE
+
+async def add_event_reward_value(update, context):
+    text=update.message.text.strip()
+    typ=context.user_data["event_reward_type"]
+    if typ=="coins":
+        if not text.isdigit() or int(text)<=0: await update.message.reply_text("❌ Amount must be positive."); return EVENT_REWARD_VALUE
+        value=text
+    else:
+        char=get_character_by_code(text)
+        if not char: await update.message.reply_text("❌ Character code not found."); return EVENT_REWARD_VALUE
+        value=char[0]
+    context.user_data["event_reward_value"]=value
+    await update.message.reply_text("4️⃣ Exact trigger phrase users must type:")
+    return EVENT_TRIGGER
+
+async def add_event_trigger(update, context):
+    text=update.message.text.strip()
+    if not text or text.startswith("/"):
+        await update.message.reply_text("❌ Trigger phrase required and cannot start with /."); return EVENT_TRIGGER
+    context.user_data["event_trigger"]=text
+    await update.message.reply_text("5️⃣ End date/time in YYYY-MM-DD HH:MM, or tap ⏭ Skip for no end date:", reply_markup=skip_keyboard())
+    return EVENT_END
+
+async def add_event_end(update, context):
+    text=update.message.text.strip()
+    if is_skip_text(text): end_at=""
+    else:
+        try: dt=datetime.strptime(text,"%Y-%m-%d %H:%M")
+        except ValueError: await update.message.reply_text("❌ Format: YYYY-MM-DD HH:MM or /skip"); return EVENT_END
+        if dt<=datetime.now(): await update.message.reply_text("❌ End time must be in the future."); return EVENT_END
+        end_at=dt.isoformat(timespec="seconds")
+    d=context.user_data; c=connect(); x=c.cursor(); x.execute("UPDATE events_v2 SET active=0 WHERE active=1"); x.execute("INSERT INTO events_v2(name,description,reward_type,reward_value,end_at,active,created_at,trigger_text) VALUES(?,?,?,?,?,1,?,?)",(d["event_name"],"",d["event_reward_type"],d["event_reward_value"],end_at,timestamp(),d["event_trigger"])); c.commit(); c.close(); context.user_data.clear()
+    await update.message.reply_text(f"✅ Event created!\n🎉 {d['event_name']}\n🎁 {format_reward(d['event_reward_type'],d['event_reward_value'])}\n💬 Trigger: {d['event_trigger']}\n⏰ Ends: {end_at or 'No end date'}", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+async def event_trigger_message(update, context):
+    if not update.message or not update.message.text or update.message.text.startswith("/"): return
+    row=get_active_event()
+    if not row: return
+    event_id,name,description,reward_type,reward_value,end_at,active=row
+    save_user(update.effective_user)
+    c=connect(); x=c.cursor(); x.execute("SELECT trigger_text FROM events_v2 WHERE id=?",(event_id,)); r=x.fetchone(); trigger=(r[0] if r else "") or name
+    if update.message.text.strip().casefold()!=trigger.strip().casefold(): c.close(); return
+    if end_at:
+        try:
+            if datetime.fromisoformat(end_at)<=datetime.now(): x.execute("UPDATE events_v2 SET active=0 WHERE id=?",(event_id,)); c.commit(); c.close(); return
+        except ValueError: pass
+    uid=update.effective_user.id
+    c.execute("BEGIN IMMEDIATE")
+    # Claim + reward must be atomic. The primary key on event_claims_v2
+    # prevents duplicate claims, even if two matching messages arrive together.
+    try:
+        x.execute("INSERT INTO event_claims_v2(event_id,user_id,claimed_at) VALUES(?,?,?)", (event_id,uid,timestamp()))
+    except sqlite3.IntegrityError:
+        c.rollback(); c.close(); return
+
+    if reward_type=="coins":
+        x.execute("UPDATE users_v2 SET coins=coins+? WHERE user_id=?",(int(reward_value),uid))
+        reward=f"🪙 {reward_value} coins"
+    else:
+        x.execute("SELECT name FROM characters_v2 WHERE code=? LIMIT 1",(str(reward_value),))
+        char_row=x.fetchone()
+        if not char_row:
+            c.rollback(); c.close(); return
+        x.execute("INSERT INTO collections_v2(user_id,character_code,caught_at) VALUES(?,?,?)",(uid,reward_value,timestamp()))
+        reward=f"🎭 {char_row[0]} [{reward_value}]"
+
+    c.commit(); c.close()
+    await update.message.reply_text(f"🎉 Event reward!\n🎁 {reward}")
+
+
+async def end_event(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    c = connect(); x = c.cursor()
+    x.execute("UPDATE events_v2 SET active=0 WHERE active=1")
+    changed = x.rowcount
+    c.commit(); c.close()
+    await update.message.reply_text("✅ Event ended." if changed else "ℹ️ No active event.")
+
+
+async def event_claim_callback(update, context):
+    query = update.callback_query
+    await query.answer("🎯 Event reward claim karne ke liye trigger phrase type karo.", show_alert=True)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+
+REDEEM_TYPE, REDEEM_REWARD, REDEEM_CODE = range(500,503)
+
+async def add_redeem_start(update, context):
+    if not is_owner(update.effective_user.id): await update.message.reply_text("⚠️ You need to be the owner to use this command."); return ConversationHandler.END
+    await update.message.reply_text("1️⃣ Reward type: Character or Coins"); return REDEEM_TYPE
+async def add_redeem_type(update, context):
+    text=update.message.text.strip().lower()
+    if text not in ("character","coins"): await update.message.reply_text("❌ Send Character or Coins."); return REDEEM_TYPE
+    context.user_data["redeem_type"]=text; await update.message.reply_text("2️⃣ Existing 4-digit character code:" if text=="character" else "2️⃣ Coin amount:"); return REDEEM_REWARD
+async def add_redeem_reward(update, context):
+    text=update.message.text.strip(); typ=context.user_data["redeem_type"]
+    if typ=="character":
+        char=get_character_by_code(text)
+        if not char: await update.message.reply_text("❌ Character code not found."); return REDEEM_REWARD
+        value=char[0]
+    else:
+        if not text.isdigit() or int(text)<=0: await update.message.reply_text("❌ Coin amount must be positive."); return REDEEM_REWARD
+        value=text
+    context.user_data["redeem_reward"]=value; await update.message.reply_text("3️⃣ Send a unique 6-digit redeem code:"); return REDEEM_CODE
+async def add_redeem_code(update, context):
+    code = update.message.text.strip()
+    if not (code.isdigit() and len(code) == 6):
+        await update.message.reply_text("❌ Redeem code must be exactly 6 digits.")
+        return REDEEM_CODE
+
+    d = context.user_data
+    c = connect()
+    x = c.cursor()
+    try:
+        # The UNIQUE/PK constraint is the final authority; do not rely only
+        # on a pre-check because two owner sessions can submit the same code.
+        x.execute(
+            "INSERT INTO redeem_codes_v2(code,reward_type,reward_value,created_at,active) VALUES(?,?,?,?,1)",
+            (code, d["redeem_type"], d["redeem_reward"], timestamp()),
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback()
+        await update.message.reply_text("❌ Redeem code already exists.")
+        return REDEEM_CODE
+    except Exception as e:
+        c.rollback()
+        print("Redeem creation error:", e)
+        await update.message.reply_text("❌ Could not create redeem code. Please try again.")
+        return REDEEM_CODE
+    finally:
+        c.close()
+
+    reward_type = d["redeem_type"]
+    reward_value = d["redeem_reward"]
+    context.user_data.clear()
+    await update.message.reply_text(
+        f"✅ Redeem created!\n🎟️ {code}\n🎁 {format_reward(reward_type, reward_value)}"
+    )
+    return ConversationHandler.END
+
+
+async def redeem(update, context):
+    save_user(update.effective_user)
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /redeem CODE")
+        return
+    code = context.args[0].strip()
+    if not (code.isdigit() and len(code) == 6):
+        await update.message.reply_text("❌ Redeem code must be exactly 6 digits.")
+        return
+    code = code.upper()
+    user_id = update.effective_user.id
+    c = connect()
+    x = c.cursor()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        x.execute("SELECT reward_type,reward_value,active FROM redeem_codes_v2 WHERE code=? COLLATE NOCASE", (code,))
+        row = x.fetchone()
+        if not row or not row[2]:
+            c.rollback()
+            await update.message.reply_text("❌ Invalid or inactive redeem code.")
+            return
+        x.execute("SELECT 1 FROM redeem_claims_v2 WHERE code=? COLLATE NOCASE AND user_id=?", (code, user_id))
+        if x.fetchone():
+            c.rollback()
+            await update.message.reply_text("⚠️ You have already redeemed this code.")
+            return
+        reward_type, reward_value, _ = row
+        if reward_type == "coins":
+            x.execute("UPDATE users_v2 SET coins=coins+? WHERE user_id=?", (int(reward_value), user_id))
+        else:
+            x.execute("SELECT name FROM characters_v2 WHERE code=? LIMIT 1", (str(reward_value),))
+            if not x.fetchone():
+                c.rollback()
+                await update.message.reply_text("❌ This redeem reward is no longer available.")
+                return
+            x.execute("INSERT INTO collections_v2(user_id,character_code,caught_at) VALUES(?,?,?)", (user_id, reward_value, timestamp()))
+        x.execute("INSERT INTO redeem_claims_v2(code,user_id,claimed_at) VALUES(?,?,?)", (code, user_id, timestamp()))
+        c.commit()
+    except Exception as e:
+        c.rollback()
+        print("Redeem error:", e)
+        await update.message.reply_text("❌ Redeem failed. Please try again.")
+        return
+    finally:
+        c.close()
+    await update.message.reply_text(f"🎉 Redeemed successfully!\n🎁 {format_reward(reward_type, reward_value)}")
+
+
+async def delete_redeem(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /deleteredeem CODE")
+        return
+    code = context.args[0].upper()
+    c = connect(); x = c.cursor()
+    x.execute("UPDATE redeem_codes_v2 SET active=0 WHERE code=? COLLATE NOCASE", (code,))
+    changed = x.rowcount
+    c.commit(); c.close()
+    await update.message.reply_text("✅ Redeem code disabled." if changed else "❌ Redeem code not found.")
+
+
+async def list_redeems(update, context):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("⚠️ You need to be the owner to use this command.")
+        return
+    c = connect(); x = c.cursor()
+    x.execute("SELECT code,reward_type,reward_value FROM redeem_codes_v2 WHERE active=1 ORDER BY created_at DESC")
+    rows = x.fetchall(); c.close()
+    if not rows:
+        await update.message.reply_text("🎟️ No active redeem codes.")
+        return
+    lines = ["🎟️ Active Redeem Codes:"]
+    for code, reward_type, reward_value in rows:
+        lines.append(f"• {code} → {format_reward(reward_type, reward_value)}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------- AUTO SPAWN ----------
+async def _auto_spawn_one_chat(app, chat_id):
+    """Process one registered group without allowing a stuck Telegram call
+    to stop automatic spawning for every other group."""
+    active_spawns = app.bot_data.setdefault("active_spawns", {})
+    now_dt = datetime.now()
+
+    spawn = active_spawns.get(chat_id)
+    if spawn:
+        if now_dt >= spawn["expires_at"]:
+            # Remove the expired spawn before doing network I/O so this chat
+            # cannot remain permanently stuck if Telegram is slow/unavailable.
+            active_spawns.pop(chat_id, None)
+            # The spawn reserved a global rarity quota. Expiry is not a successful
+            # catch, so release that reservation before the next spawn.
+            try:
+                rollback_rarity_reservation(spawn.get("rarity"))
+            except Exception as e:
+                print(f"Rarity rollback error for expired spawn {chat_id}:", e)
+            try:
+                await asyncio.wait_for(
+                    app.bot.send_message(
+                        chat_id=chat_id,
+                        text="⏰ The character is gone! No one added them.",
+                    ),
+                    timeout=15,
+                )
+            except Exception as e:
+                print(f"Expiry notification error for {chat_id}:", e)
+        else:
+            return
+
+    character = choose_character()
+    if not character:
+        return
+
+    try:
+        # A broken/slow group must not block the whole auto-spawn loop.
+        success, reason = await asyncio.wait_for(
+            spawn_reserved(chat_id, app, character, "auto_spawn"),
+            timeout=45,
+        )
+        if not success and reason:
+            return
+    except asyncio.TimeoutError:
+        print(f"Auto spawn timeout for {chat_id}; continuing with other groups.")
+    except Exception as e:
+        print(f"Auto spawn error for {chat_id}:", e)
+
+
+async def auto_spawn_loop(app):
+    # A character lasts 10 minutes. Auto-spawn checks every 15 minutes.
+    # This loop is intentionally self-recovering: one bad group or Telegram
+    # request can never terminate the background task for all groups.
+    while True:
+        try:
+            active_chats = app.bot_data.setdefault("active_chats", set())
+
+            # Process groups concurrently. A slow Telegram request in one group
+            # must never make every other group's auto-spawn wait behind it.
+            async def safe_one(chat_id):
+                try:
+                    await _auto_spawn_one_chat(app, chat_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"Auto spawn group loop error for {chat_id}:", e)
+
+            await asyncio.gather(
+                *(safe_one(chat_id) for chat_id in list(active_chats)),
+                return_exceptions=True,
+            )
+
+        except asyncio.CancelledError:
+            # Normal application shutdown. Never restart a deliberately
+            # cancelled task.
+            raise
+        except Exception as e:
+            # Recover from unexpected loop-level errors and continue.
+            print("Auto spawn loop error; recovering:", e)
+
+        try:
+            await asyncio.sleep(900)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("Auto spawn sleep error; recovering:", e)
+
+
+# ---------- CONVERSATION CANCEL ----------
+async def cancel_conversation(update, context):
+    # Only clear conversation-related temporary data.
+    for key in (
+        "name",
+        "anime",
+        "rarity",
+        "worth",
+        "code",
+        "issue_text",
+        "issue_photo",
+        "idea_text",
+        "idea_photo",
+        "appeal_text",
+        "appeal_photo",
+        "auction_code",
+        "auction_start_bid",
+        "auction_duration",
+        "photo_code",
+        "event_name",
+        "event_reward_type",
+        "event_reward_value",
+        "event_trigger",
+        "event_end",
+        "redeem_type",
+        "redeem_reward",
+        "edit_code_original",
+        "edit_character",
+        "edit_name",
+        "edit_anime",
+        "edit_rarity",
+        "edit_worth",
+    ):
+        context.user_data.pop(key, None)
+
+    await update.message.reply_text("❌ Cancelled.")
+    return ConversationHandler.END
+
+
+COMMANDS = {
+    "start": "Start the bot",
+    "help": "Show help",
+    "spawn": "Spawn a character (group only)",
+    "add": "Catch the spawned character (group only)",
+    "mycollection": "View your collection",
+    "myfav": "Set favourite character",
+    "mystats": "View your stats",
+    "daily": "Claim daily reward",
+    "characters": "List characters",
+    "view": "View a character",
+    "check": "Check character details and owners",
+    "sell": "Sell a character",
+    "transfer": "Transfer a character to the replied user",
+    "issue": "Report an issue",
+    "idea": "Submit an idea",
+    "appeal": "Submit an appeal",
+    "cancel": "Cancel current action",
+    "event": "View active event",
+    "redeem": "Redeem a code",
+    "auction": "View active auctions",
+    "aucton": "View active auctions (alias)",
+    "bid": "Place a bid: /bid <auction_id> <amount>",
+    "addauction": "Submit a character to auction",
+    "endauction": "Seller: end your auction",
+    "callchar": "Owner: spawn by code (group only)",
+    "gift": "Owner only: gift by reply + 4-digit code (15 min cooldown)",
+    "delete": "Owner: delete a character",
+    "addphoto": "Add character photo",
+    "addcharacter": "Add a character",
+    "editcharacter": "Edit a character",
+    "executives": "View Executive staff",
+    "addexec": "Owner: add executive",
+    "setexec": "Owner: set Executive",
+    "removeexec": "Owner: remove executive",
+    "scouts": "Owner/Executive: View Scout staff",
+    "addscout": "Owner/Executive: add scout",
+    "removescout": "Owner: remove scout",
+    "addevent": "Owner: create an event",
+    "endevent": "Owner: end the event",
+    "addredeem": "Owner: create a redeem code",
+    "deleteredeem": "Owner: disable a redeem code",
+    "redeems": "Owner: list redeem codes",
+    "history": "📜 Spawn History",
+    "approved": "Owner: approve a group",
+    "spawnstats": "Owner: spawn history and rarity counts",
+    "activity": "Owner: recent bot activity",
+    "status": "Owner: bot status and active spawns",
+}
+
+PUBLIC_COMMANDS = {
+    "start", "help", "spawn", "add", "mycollection", "myfav", "mystats",
+    "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
+    "appeal", "cancel", "event", "redeem", "auction", "aucton", "bid", "addauction", "endauction",
+}
+EXECUTIVE_COMMANDS = {"addcharacter", "addphoto", "editcharacter"}
+SCOUT_COMMANDS = {"addcharacter", "addphoto", "editcharacter"}
+OWNER_COMMANDS = {
+    "history", "callchar", "gift", "delete", "executives", "addexec", "setexec", "removeexec",
+    "scouts", "addscout", "removescout",
+    "addevent", "endevent", "addredeem", "deleteredeem", "redeems",
+    "spawnstats", "activity", "status", "approvegroup", "approved", "revokegroup",
+}
+
+
+def make_bot_commands(names):
+    return [BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS]
+
+
+async def refresh_command_menu(bot, user_id):
+    from telegram import BotCommandScopeChat
+    # Refresh persisted Scout role into the runtime cache before building the menu.
+    is_scout(user_id)
+    if is_owner(user_id):
+        names = PUBLIC_COMMANDS | EXECUTIVE_COMMANDS | OWNER_COMMANDS
+    elif is_executive(user_id):
+        names = PUBLIC_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS | {"scouts", "addscout"}
+    elif is_scout(user_id):
+        names = PUBLIC_COMMANDS | SCOUT_COMMANDS
+    else:
+        names = PUBLIC_COMMANDS
+    try:
+        await bot.set_my_commands(
+            make_bot_commands(sorted(names)),
+            scope=BotCommandScopeChat(chat_id=user_id),
+        )
+    except Exception as e:
+        print(f"Command menu refresh error for {user_id}:", e)
+
+
+# ---------- MAIN ----------
+async def post_init(app):
+    setup_database()
+
+    app.bot_data["active_spawns"] = {}
+    app.bot_data["last_calls"] = {}
+    app.bot_data["chat_spawn_cooldowns"] = {}
+    app.bot_data["unapproved_notified"] = set()
+    # Only explicitly owner-approved groups may remain active.
+    approved = load_approved_groups()
+    app.bot_data["active_chats"] = load_auto_spawn_groups() & approved
+    for chat_id in list(load_auto_spawn_groups() - approved):
+        unregister_auto_spawn_group(chat_id)
+    app.bot_data["spawn_lock"] = asyncio.Lock()
+
+    try:
+        await app.bot.delete_my_commands()
+        # Global menu = normal user commands only.
+        await app.bot.set_my_commands(make_bot_commands(sorted(PUBLIC_COMMANDS)))
+
+        # Per-user menus: staff commands are hidden from everyone else.
+        for user_id in set(ADMIN_IDS):
+            await refresh_command_menu(app.bot, user_id)
+        for user_id in set(EXECUTIVE_IDS):
+            if user_id not in ADMIN_IDS:
+                await refresh_command_menu(app.bot, user_id)
+        for user_id in set(SCOUT_IDS):
+            if user_id not in ADMIN_IDS and user_id not in EXECUTIVE_IDS:
+                await refresh_command_menu(app.bot, user_id)
+    except Exception as e:
+        print("Command menu error:", e)
+
+    task = asyncio.create_task(auto_spawn_loop(app))
+    app.bot_data["auto_spawn_task"] = task
+    auction_task = asyncio.create_task(auction_expiry_loop(app))
+    app.bot_data["auction_task"] = auction_task
+
+
+async def post_shutdown(app):
+    auction_task = app.bot_data.get("auction_task")
+    if auction_task:
+        auction_task.cancel()
+        try:
+            await auction_task
+        except asyncio.CancelledError:
+            pass
+
+    task = app.bot_data.get("auto_spawn_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+def main():
+    setup_database()
+
+    if not BOT_TOKEN:
+        raise ValueError(
+            "BOT_TOKEN is empty. Put your NEW BotFather token in config.py."
+        )
+
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(10)
+        .read_timeout(20)
+        .write_timeout(20)
+        .pool_timeout(10)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    # Track groups for automatic spawning. The registry is stored in a
+    # separate JSON file, so the existing database is never modified.
+    app.add_handler(ChatMemberHandler(track_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER), group=-2)
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_chat, block=False), group=-2)
+
+    # Basic commands
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("spawn", spawn))
+    app.add_handler(CommandHandler("callchar", callchar))
+    app.add_handler(CommandHandler("add", add))
+    app.add_handler(CommandHandler("mycollection", mycollection))
+    app.add_handler(CommandHandler("myfav", myfav))
+    app.add_handler(CommandHandler("mystats", mystats))
+    app.add_handler(CommandHandler("daily", daily))
+    app.add_handler(CommandHandler("characters", characters))
+    app.add_handler(CommandHandler("view", view))
+    app.add_handler(CommandHandler("check", check))
+    app.add_handler(CommandHandler("sell", sell))
+    app.add_handler(CommandHandler("transfer", transfer))
+    app.add_handler(CommandHandler("gift", gift))
+    app.add_handler(CommandHandler("addphoto", addphoto))
+    app.add_handler(CommandHandler("delete", delete))
+    app.add_handler(CommandHandler("executives", executives))
+    app.add_handler(CommandHandler("addexec", addexec))
+    app.add_handler(CommandHandler("setexec", addexec))
+    app.add_handler(CommandHandler("removeexec", removeexec))
+    app.add_handler(CommandHandler("scouts", scouts))
+    app.add_handler(CommandHandler("addscout", addscout))
+    app.add_handler(CommandHandler("removescout", removescout))
+    app.add_handler(CommandHandler("event", event))
+    app.add_handler(CommandHandler("redeem", redeem))
+    app.add_handler(CommandHandler(["auction", "aucton"], auction))
+    app.add_handler(CommandHandler("bid", bid))
+    app.add_handler(CommandHandler("endauction", end_auction))
+    app.add_handler(CommandHandler(["approvegroup", "approved"], approve_group))
+    app.add_handler(CommandHandler("revokegroup", revoke_group))
+    app.add_handler(CommandHandler("endevent", end_event))
+    app.add_handler(CommandHandler("deleteredeem", delete_redeem))
+    app.add_handler(CommandHandler("redeems", list_redeems))
+    app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("spawnstats", spawnstats))
+    app.add_handler(CommandHandler("activity", activity))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.COMMAND, log_command_activity, block=False), group=-1)
+
+    # Prevent unhandled Telegram/API exceptions from producing noisy
+    # "No error handlers are registered" tracebacks.
+    async def global_error_handler(update, context):
+        print(f"Telegram handler error: {context.error!r}")
+
+    app.add_error_handler(global_error_handler)
+
+    # Character editing conversation
+    edit_conv = ConversationHandler(
+        entry_points=[CommandHandler("editcharacter", editcharacter)],
+        states={
+            EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_name), CommandHandler("skip", edit_name)],
+            EDIT_ANIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_anime), CommandHandler("skip", edit_anime)],
+            EDIT_RARITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_rarity), CommandHandler("skip", edit_rarity)],
+            EDIT_WORTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_worth), CommandHandler("skip", edit_worth)],
+            EDIT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_code), CommandHandler("skip", edit_code)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+    )
+    app.add_handler(edit_conv)
+
+    # Admin character creation
+    add_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("addcharacter", addcharacter_start)
+        ],
+        states={
+            ADD_NAME: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    addcharacter_name,
+                )
+            ],
+            ADD_RECRUIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addcharacter_recruit),
+                CommandHandler("skip", addcharacter_recruit),
+            ],
+            ADD_ANIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addcharacter_anime),
+                CommandHandler("skip", addcharacter_anime),
+            ],
+            ADD_RARITY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, addcharacter_rarity),
+                CommandHandler("skip", addcharacter_rarity),
+            ],
+            ADD_WORTH: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    addcharacter_worth,
+                )
+            ],
+            ADD_CODE: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    addcharacter_code,
+                )
+            ],
+            ADD_PHOTO: [
+                MessageHandler(filters.PHOTO, addcharacter_photo),
+                MessageHandler(filters.Regex(r"^⏭ Skip$"), addcharacter_photo),
+                CommandHandler("skip", addcharacter_photo),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation)
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(add_conv)
+
+    auction_conv = ConversationHandler(
+        entry_points=[CommandHandler("addauction", auction_add_start)],
+        states={
+            AUCTION_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, auction_add_code)],
+            AUCTION_START_BID: [MessageHandler(filters.TEXT & ~filters.COMMAND, auction_add_start_bid)],
+            AUCTION_DURATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, auction_add_duration)],
+            AUCTION_CONFIRM: [CallbackQueryHandler(auction_confirm_callback, pattern=r"^auction_confirm:(yes|no)$")],
+        },
+        fallbacks=[CommandHandler("cancel", cancel_conversation)],
+        allow_reentry=True,
+        per_message=False,
+    )
+    app.add_handler(auction_conv)
+
+    redeem_conv = ConversationHandler(entry_points=[CommandHandler("addredeem", add_redeem_start)], states={REDEEM_TYPE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_type)], REDEEM_REWARD:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_reward)], REDEEM_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_code)]}, fallbacks=[CommandHandler("cancel", cancel_conversation)], allow_reentry=True)
+    app.add_handler(redeem_conv)
+
+    event_conv = ConversationHandler(entry_points=[CommandHandler("addevent", add_event_start)], states={EVENT_NAME:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_name)], EVENT_REWARD_TYPE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_reward_type)], EVENT_REWARD_VALUE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_reward_value)], EVENT_TRIGGER:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_trigger)], EVENT_END:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end), CommandHandler("skip", add_event_end)]}, fallbacks=[CommandHandler("cancel", cancel_conversation)], allow_reentry=True)
+    app.add_handler(event_conv)
+
+    # Issue / idea / appeal conversations are registered before the
+    # generic /addphoto photo receiver so their optional screenshots
+    # are handled correctly.
+    issue_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("issue", issue_start)
+        ],
+        states={
+            ISSUE_TEXT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    issue_text,
+                )
+            ],
+            ISSUE_ATTACHMENT: [
+                MessageHandler(
+                    filters.PHOTO | filters.Document.IMAGE,
+                    issue_attachment,
+                ),
+                MessageHandler(filters.Regex(r"^⏭ Skip$"), issue_skip),
+                CommandHandler("skip", issue_skip),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation)
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(issue_conv)
+
+    idea_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("idea", idea_start)
+        ],
+        states={
+            IDEA_TEXT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    idea_text,
+                )
+            ],
+            IDEA_ATTACHMENT: [
+                MessageHandler(
+                    filters.PHOTO | filters.Document.IMAGE,
+                    idea_attachment,
+                ),
+                MessageHandler(filters.Regex(r"^⏭ Skip$"), idea_skip),
+                CommandHandler("skip", idea_skip),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation)
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(idea_conv)
+
+    appeal_conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("appeal", appeal_start)
+        ],
+        states={
+            APPEAL_TEXT: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    appeal_text,
+                )
+            ],
+            APPEAL_ATTACHMENT: [
+                MessageHandler(
+                    filters.PHOTO | filters.Document.IMAGE,
+                    appeal_attachment,
+                ),
+                MessageHandler(filters.Regex(r"^⏭ Skip$"), appeal_skip),
+                CommandHandler("skip", appeal_skip),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel_conversation)
+        ],
+        allow_reentry=True,
+    )
+    app.add_handler(appeal_conv)
+
+    # This handler receives photos only when /addphoto is waiting.
+    app.add_handler(
+        MessageHandler(filters.PHOTO, receive_photo)
+    )
+
+    # Help role panels.
+    app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
+    app.add_handler(CallbackQueryHandler(event_claim_callback, pattern=r"^event:"))
+    app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r"^tr_(accept|decline):"))
+    app.add_handler(CallbackQueryHandler(auction_end_callback, pattern=r"^auction_end:\d+$"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, event_trigger_message))
+
+    # /cancel outside a conversation is also handled cleanly.
+    app.add_handler(CommandHandler("cancel", cancel_conversation))
+
+    # Collection pagination/sorting buttons.
+    app.add_handler(CallbackQueryHandler(collection_callback, pattern=r"^coll:"))
+
+    print("✅ Anime Character Bot is running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()

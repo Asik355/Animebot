@@ -1,0 +1,21 @@
+# Secrets
+.env
+env
+
+# Runtime data (contains user data - do not publish)
+*.db
+*.db-wal
+*.db-shm
+approved_groups.json
+auto_spawn_groups.json
+bot_groups.json
+bot_group_state.json
+gstats_hidden_groups.json
+notification_settings.json
+restrictions.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
