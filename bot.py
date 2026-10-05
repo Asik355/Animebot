@@ -68,6 +68,29 @@ from telegram.ext import (
     ChatMemberHandler,
     filters,
 )
+from telegram import InlineKeyboardMarkup as _TGInlineKeyboardMarkup
+
+INLINE_MAX_PER_ROW = 3
+
+
+def _wrap_inline_rows(rows, per_row=INLINE_MAX_PER_ROW):
+    """Any row with more than `per_row` buttons is wrapped onto the next row (1-2 button rows are untouched)."""
+    out = []
+    for row in rows or []:
+        row = list(row)
+        if len(row) <= per_row:
+            out.append(row)
+        else:
+            out.extend(row[i:i + per_row] for i in range(0, len(row), per_row))
+    return out
+
+
+class InlineKeyboardMarkup(_TGInlineKeyboardMarkup):
+    """Drop-in replacement: guarantees the project-wide rule 'maximum 3 inline buttons per row'."""
+    __slots__ = ()
+
+    def __init__(self, inline_keyboard, *args, **kwargs):
+        super().__init__(_wrap_inline_rows(inline_keyboard), *args, **kwargs)
 
 # ---------------------------------------------------------------------------
 # Settings (formerly config.py). Secrets are NOT stored here: the bot token and
@@ -1158,7 +1181,25 @@ def spawn_name_matches(spawn_name, entered_parts):
         return True
     return ''.join(parts) == ''.join(name_parts) or sorted(parts) == sorted(name_parts)
 
+def _number_commands(text):
+    """'/cmd — desc' lines become '1. /cmd - desc' (one per line); numbering restarts under every heading."""
+    out, n = [], 0
+    for line in text.split("\n"):
+        if line.startswith("/"):
+            n += 1
+            out.append(f"{n}. " + line.replace(" — ", " - ", 1))
+        else:
+            if not line.strip() or not line.startswith(" "):
+                n = 0
+            out.append(line)
+    return "\n".join(out)
+
+
 def build_help_text():
+    return _number_commands(_build_help_text_raw())
+
+
+def _build_help_text_raw():
     return (
         "🎮 Anime Character Catcher — Command List\n\n"
         "👤 Profile & Collection\n"
@@ -1209,8 +1250,8 @@ def build_help_text():
 # ==========================================================================
 def _help_page(title, overview, entries, note=None):
     lines = [title, "", "📌 Overview", overview, "", "⌨️ Commands & usage"]
-    for syntax, desc in entries:
-        lines.append(f"{syntax}\n    {desc}")
+    for number, (syntax, desc) in enumerate(entries, 1):
+        lines.append(f"{number}. {syntax} - {desc}")
     if note:
         lines.extend(["", note])
     return "\n".join(lines)
@@ -1224,11 +1265,12 @@ HELP_MODULES = {
             "📡 Log Channel (Owner only)",
             "Posts bot activity to a private Telegram channel.\nSetup: 1) add me to the channel as Administrator  "
             "2) send /setlog in the channel  3) forward that message to me in private chat.",
-            [("/setlog", "Link the log channel (follow the setup steps above)"),
+            [("/setlog", "Link a log channel (follow the setup steps above). Repeat it to link more channels (max 10); the first one is the default"),
              ("/setlog <chat_id>", "Alternative if forwarding is blocked, e.g. /setlog -1001234567890"),
-             ("/unsetlog", "Unlink the log channel"),
-             ("/logchannel", "Show the linked log channel")],
-            "🔀 Routing: Member, Scout and Executive commands are posted automatically. "
+             ("/unsetlog [chat_id|all]", "Unlink one log channel (no id is enough when only one is linked) or all of them"),
+             ("/logchannel", "Show every linked log channel, the default (⭐) and how many routes each has"),
+             ("/logdefault <chat_id>", "Choose the default channel (gets everything that has no route)")],
+            "🔀 Routing: Member, Scout and Executive commands are posted automatically after they succeed. "
             "Your character commands (/spawn, /addcharacter, /gift ...) are posted automatically; "
             "/callcharacter is never logged. Your other commands ask you in PM "
             "\"Do you want to upload this action log to the log channel?\" with Yes / No.")),
@@ -1240,6 +1282,15 @@ HELP_MODULES = {
              ("/nolog <category|all>", "Disable a category"),
              ("/addcategory <name> <description>", "Add a custom category (lowercase letters, digits, _ ; e.g. guild, shop_v2). Enabled by default"),
              ("/removecategory <name>", "Delete a custom category; its command mappings are removed too")])),
+        ("logroute", "🧭 Log Routing", _help_page(
+            "🧭 Log Routing (Owner only)",
+            "Send different logs to different channels. Order: command route > category route > default channel.",
+            [("/logroute <category> <chat_id>", "Whole category to a channel, e.g. /logroute economy -1001234567890"),
+             ("/logroute /<command> <chat_id>", "One command to a channel, e.g. /logroute /daily -1001234567890"),
+             ("/logroute <category|/command> default", "Back to the default channel"),
+             ("/unlogroute <category|/command>", "Remove a route"),
+             ("/logroutes", "Show the default channel and all routes")],
+            "Extra category: security (unauthorized attempts). A leading / means a command, no slash means a category.")),
         ("logmap", "🗺 Log Mapping", _help_page(
             "🗺 Log Mapping (Owner only)",
             "Decide which log category a command is logged under, without editing code. A mapping beats the built-in default.",
@@ -1367,6 +1418,13 @@ def _module_button(label, callback_data):
 
 
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Please run /help to open your own menu."
+# Executive and Scout modules stay in their own menus AND are copied (same text) into the Owner menu.
+_owner_keys = {k for k, _l, _t in HELP_MODULES["owner"]}
+for _role in ("executive", "scout"):
+    for _module in HELP_MODULES[_role]:
+        if _module[0] not in _owner_keys:
+            HELP_MODULES["owner"].append(_module)
+            _owner_keys.add(_module[0])
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -1675,6 +1733,82 @@ def get_recent_global_spawn_codes(exclude_chat_id=None, minutes=None):
     cutoff = (datetime.now(INDIA_TZ) - timedelta(minutes=minutes)).isoformat()
     return mongo_db.sh_recent_codes(cutoff)
 
+# ---------------------------------------------------------------------------------------------------------------
+# Characters without an uploaded photo cannot spawn.
+#   * The first time such a character is picked, that spawn attempt fails with SPAWN_PHOTO_MISSING_TEXT (manual
+#     /spawn only) and the character is restricted.
+#   * A restricted character is silently skipped by every picker (manual and automatic), so spawning simply
+#     continues with other characters. Only that character is affected.
+#   * As soon as its photo exists (/addphoto, /editcharacter, ...) the restriction disappears by itself.
+# The restricted codes are kept in MongoDB (collection spawn_photo_restricted_v1) so a restart does not repeat the notice.
+# ---------------------------------------------------------------------------------------------------------------
+import threading as _threading
+SPAWN_PHOTO_MISSING_TEXT = ("Character spawn failed because the character photo has not been uploaded. "
+                            "Please try again.")
+_PHOTO_RESTRICTED = {"codes": None}
+_PHOTO_RESTRICTED_LOCK = _threading.RLock()      # re-entrant: restrict/clear call the lazy loader while holding it
+
+
+def _photo_restricted_codes():
+    codes = _PHOTO_RESTRICTED["codes"]
+    if codes is not None:
+        return codes
+    with _PHOTO_RESTRICTED_LOCK:
+        if _PHOTO_RESTRICTED["codes"] is None:
+            loaded = set()
+            try:
+                doc = _mc("spawn_photo_restricted_v1").find_one({"_id": 1}) or {}
+                loaded = {str(c) for c in (doc.get("codes") or [])}
+            except Exception as e:
+                print("Photo restriction load error:", e)
+            _PHOTO_RESTRICTED["codes"] = loaded
+        return _PHOTO_RESTRICTED["codes"]
+
+
+def _persist_photo_restricted():
+    try:
+        _mc("spawn_photo_restricted_v1").update_one(
+            {"_id": 1}, {"$set": {"codes": sorted(_photo_restricted_codes())}}, upsert=True)
+    except Exception as e:
+        print("Photo restriction save error:", e)
+
+
+def spawn_photo_ok(row):
+    """May this character row be picked for a spawn? True when it has a photo, or has not been restricted yet."""
+    code = str(row[0])
+    codes = _photo_restricted_codes()
+    if row[5]:
+        if codes and code in codes:                      # photo uploaded since: lift the restriction automatically
+            with _PHOTO_RESTRICTED_LOCK:
+                codes.discard(code)
+            _persist_photo_restricted()
+        return True
+    return code not in codes
+
+
+def restrict_character_photo(code):
+    """Restrict a photo-less character. Returns True only the FIRST time (that is when the notice is shown)."""
+    code = str(code)
+    with _PHOTO_RESTRICTED_LOCK:
+        codes = _photo_restricted_codes()
+        if code in codes:
+            return False
+        codes.add(code)
+    _persist_photo_restricted()
+    return True
+
+
+def clear_photo_restriction(code):
+    code = str(code)
+    with _PHOTO_RESTRICTED_LOCK:
+        codes = _photo_restricted_codes()
+        if code not in codes:
+            return False
+        codes.discard(code)
+    _persist_photo_restricted()
+    return True
+
+
 def _choose_unlimited_fallback_character(excluded_codes=None, chat_id=None, allow_recent=False, require_photo=False):
     """Emergency picker: always prefer an unused Common/Rare/Epic character."""
     excluded = {str(code) for code in (excluded_codes or set())}
@@ -1685,7 +1819,7 @@ def _choose_unlimited_fallback_character(excluded_codes=None, chat_id=None, allo
             print("Fallback recent-spawn lookup error:", e)
     rows = [row for rarity in ("Common", "Rare", "Epic")
             for row in get_characters_by_rarity(rarity)
-            if str(row[0]) not in excluded and (not require_photo or row[5])]
+            if str(row[0]) not in excluded and (not require_photo or spawn_photo_ok(row))]
     if not rows and not allow_recent:
         return _choose_unlimited_fallback_character(excluded_codes, chat_id, True, require_photo)
     if not rows:
@@ -1708,7 +1842,7 @@ def choose_character(chat_id, excluded_codes=None, app=None, respect_daily_limit
     excluded.update(get_recent_global_spawn_codes(chat_id))
 
     def available_rows(rarity):
-        return [row for row in get_characters_by_rarity(rarity) if str(row[0]) not in excluded and (not require_photo or row[5])]
+        return [row for row in get_characters_by_rarity(rarity) if str(row[0]) not in excluded and (not require_photo or spawn_photo_ok(row))]
 
     available = [(r, w) for r, w in CHANCES if available_rows(r)]
 
@@ -1835,6 +1969,14 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
 
         if random_spawn:
             excluded_for_random = (await asyncio.to_thread(get_daily_random_spawn_limited_codes, chat_id, app))
+            # A photo-less character was handed in: restrict it. Manual /spawn fails this attempt (the caller sends
+            # the one-time notice); automatic spawns silently continue with another character below.
+            if character is not None and not character[5] and str(character[0]) not in excluded_for_random:
+                newly_restricted = await asyncio.to_thread(restrict_character_photo, character[0])
+                if spawned_by == "manual_spawn":
+                    return False, (SPAWN_PHOTO_MISSING_TEXT if newly_restricted else "")
+                excluded_for_random.add(str(character[0]))
+                character = None
             # Both /spawn and auto-spawn use the same picker. This enforces
             # recent-character protection and the high-rarity spacing rule.
             if character is None or str(character[0]) in excluded_for_random or not character[5]:
@@ -1864,6 +2006,18 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
 
             if character is None:
                 character = (await asyncio.to_thread(_choose_unlimited_fallback_character, excluded_for_random, chat_id, require_photo=True))
+            # The re-pick above may itself land on a photo-less character: restrict it and pick again.
+            for _photo_guard in range(25):
+                if character is None or character[5]:
+                    break
+                newly_restricted = await asyncio.to_thread(restrict_character_photo, character[0])
+                if spawned_by == "manual_spawn":
+                    return False, (SPAWN_PHOTO_MISSING_TEXT if newly_restricted else "")
+                excluded_for_random.add(str(character[0]))
+                character = (await asyncio.to_thread(choose_character,
+                    chat_id, excluded_codes=excluded_for_random, app=app, require_photo=True))
+                if character is None:
+                    character = (await asyncio.to_thread(_choose_unlimited_fallback_character, excluded_for_random, chat_id, require_photo=True))
             if character is None:
                 return False, "❌ No eligible character is available in the character list."
 
@@ -1983,10 +2137,59 @@ def add_display_name_header(message, text):
     display_name = " ".join(part for part in (first, last) if part) or "Unknown"
     return f"👤 {html_escape(display_name)}\n\n{text}"
 
+# (chat_id, message_id) of COMMAND messages -> monotonic time. command_outcome_hook reads and clears them.
+#   _CMD_FAILED : the command answered with an error (or crashed)       -> never logged
+#   _CMD_OK     : the handler called mark_success(update)               -> required for EXPLICIT_SUCCESS_COMMANDS
+_CMD_FAILED = {}
+_CMD_OK = {}
+_FAIL_PREFIXES = ("❌", "⚠️", "⚠", "🚫", "⛔", "ℹ️", "ℹ", "🔴", "⏳", "usage:")
+_CMD_STATE_TTL = 600.0
+
+
+def _purge_cmd_state():
+    now = time.monotonic()
+    for d in (_CMD_FAILED, _CMD_OK):
+        if len(d) > 50:
+            for key in [k for k, t in d.items() if now - t > _CMD_STATE_TTL]:
+                d.pop(key, None)
+        if len(d) > 2000:                                   # hard cap under a flood
+            for key in sorted(d, key=d.get)[:len(d) - 1000]:
+                d.pop(key, None)
+
+
+def _command_key(message):
+    try:
+        if message is None or not str(getattr(message, "text", "") or "").startswith("/"):
+            return None
+        return (message.chat_id, message.message_id)
+    except Exception:
+        return None
+
+
+def _mark_command_failed(message):
+    key = _command_key(message)
+    if key is not None:
+        _purge_cmd_state()
+        _CMD_FAILED[key] = time.monotonic()
+
+
+def mark_success(update):
+    """Handlers call this when a command really did its job (used by the log pipeline)."""
+    try:
+        key = _command_key(update.effective_message)
+        if key is not None:
+            _purge_cmd_state()
+            _CMD_OK[key] = time.monotonic()
+    except Exception:
+        pass
+
+
 async def safe_reply_text(message, text, **kwargs):
     if message is None:
         return None
     text = str(text or "")
+    if text.lstrip().lower().startswith(_FAIL_PREFIXES):
+        _mark_command_failed(message)
     if text == UNAUTHORIZED_TEXT:
         _security_log_from_message(message)      # every unauthorized command attempt is logged centrally
     if not text.strip():
@@ -2250,14 +2453,20 @@ async def spawn(update, context):
     if character is None:
         character = (await asyncio.to_thread(_choose_unlimited_fallback_character, chat_id=chat_id, require_photo=True))
     if character is None:
+        await safe_reply_text(update.message, "❌ No character with a photo is available to spawn right now.")
         return
 
     success = False
+    photo_failed = False
     excluded = set()
     for _ in range(5):
         try:
-            success, _ = await spawn_reserved(chat_id, context, character, "manual_spawn")
+            success, spawn_msg = await spawn_reserved(chat_id, context, character, "manual_spawn")
             if success:
+                break
+            if spawn_msg == SPAWN_PHOTO_MISSING_TEXT:      # first failure for this character: tell the user once
+                photo_failed = True
+                await safe_reply_text(update.message, SPAWN_PHOTO_MISSING_TEXT)
                 break
         except Exception as e:
             print("Manual spawn error:", e)
@@ -2271,8 +2480,12 @@ async def spawn(update, context):
     else:
         success = False
 
+    if photo_failed:
+        return                                              # nothing else is sent; no cooldown is consumed
     if not success:
+        await safe_reply_text(update.message, "❌ The spawn could not be completed. Please try again.")
         return
+    mark_success(update)
 
     last_calls = context.application.bot_data.setdefault("last_calls", {})
     last_calls[user_id] = datetime.now()
@@ -2697,6 +2910,7 @@ async def add(update, context):
     context.application.bot_data.setdefault("next_auto_spawn_at", {})[chat_id] = (
         datetime.now() + timedelta(seconds=AUTO_SPAWN_INTERVAL)
     )
+    mark_success(update)
     caught_rarity = caught_spawn["rarity"]
     caught_symbol = SYMBOL.get(caught_rarity, "⭐")
     await safe_reply_text(
@@ -4395,6 +4609,7 @@ async def addcharacter_photo(update, context):
     except Exception as e:
         print("Character add notification error:", e)
 
+    await release_conv_log(context, update.effective_user.id, "addcharacter")
     return ConversationHandler.END
 
 async def addlist(update, context):
@@ -4481,6 +4696,7 @@ async def receive_photo(update, context):
         return
 
     context.user_data.pop("photo_code", None)
+    await asyncio.to_thread(clear_photo_restriction, code)       # photo exists now: the character may spawn again
     await safe_reply_text(update.message, "✅ Photo saved.", reply_markup=ReplyKeyboardRemove())
     character = (await asyncio.to_thread(get_character_by_code, code))
     await notify_staff_action(
@@ -4663,6 +4879,7 @@ async def edit_code(update, context):
         actor_id=update.effective_user.id,
     )
     context.user_data.clear()
+    await release_conv_log(context, update.effective_user.id, "editcharacter")
     return ConversationHandler.END
 
 async def discontinue_command(update, context):
@@ -4761,6 +4978,37 @@ async def delete(update, context):
 DEFAULT_GSTATS_GROUP_ID = -1003379716050
 DEFAULT_GSTATS_GROUP_TITLE = "Wonderland Anime gc"
 
+
+def build_group_open_link(chat_id, username=None, invite_link=None):
+    """
+    A URL that really opens the group (tg://openmessage?chat_id=... does NOT work for groups).
+      1. public group  -> https://t.me/<username>
+      2. the group's own invite link, when the bot is an admin and Telegram returns it (works for non-members)
+      3. supergroup    -> https://t.me/c/<id without -100>/1 (opens for members of the group)
+      4. basic group without any link -> None (Telegram offers no way to link to it)
+    """
+    username = (username or "").lstrip("@").strip()
+    if username:
+        return f"https://t.me/{username}"
+    if invite_link and str(invite_link).startswith(("https://t.me/", "http://t.me/", "https://telegram.me/")):
+        return str(invite_link)
+    cid = str(int(chat_id))
+    if cid.startswith("-100") and len(cid) > 4:
+        return f"https://t.me/c/{cid[4:]}/1"
+    return None
+
+async def _safe_edit_text(message, text, **kwargs):
+    """edit_text that survives 'message is not modified' and texts over the 4096 limit (sends chunks instead)."""
+    try:
+        if len(text) > 4000:
+            await safe_reply_text(message, text, **{k: v for k, v in kwargs.items() if k != "reply_markup"})
+            return
+        await message.edit_text(text, **kwargs)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
 async def gstats(update, context):
     if not (is_owner(update.effective_user.id) or is_executive(update.effective_user.id)):
         await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
@@ -4789,6 +5037,7 @@ async def gstats(update, context):
         return
 
     refreshed = {}
+    invite_links = {}                      # raw_id -> invite link returned by Telegram (not persisted)
     for raw_id in sorted(known_ids, key=lambda v: int(v)):
         chat_id = int(raw_id)
         info = groups.get(raw_id, {})
@@ -4812,9 +5061,21 @@ async def gstats(update, context):
                 "type": getattr(chat, "type", info.get("type", "group")),
                 "username": getattr(chat, "username", info.get("username")),
             }
-        except Exception as e:
-            print(f"/gstats membership refresh error for {chat_id}:", e)
-            await cleanup_left_group(chat_id, context)
+            invite_links[raw_id] = getattr(chat, "invite_link", None)
+        except (Forbidden, BadRequest) as e:
+            reason = str(e).lower()
+            if isinstance(e, Forbidden) or any(w in reason for w in (
+                    "chat not found", "kicked", "not a member", "bot was kicked", "bot is not a member", "group chat was deleted")):
+                print(f"/gstats: bot is no longer in {chat_id} ({e}); removing it")
+                await cleanup_left_group(chat_id, context)
+            else:                                     # unknown API refusal: keep the group, do not wipe it
+                print(f"/gstats refresh error for {chat_id} (kept):", e)
+                if info:
+                    refreshed[raw_id] = dict(info)
+        except Exception as e:                        # network / flood control / timeout: NEVER clean up
+            print(f"/gstats membership refresh error for {chat_id} (kept):", e)
+            if info:
+                refreshed[raw_id] = dict(info)
 
     groups = refreshed
     (await asyncio.to_thread(save_bot_groups, groups))
@@ -4826,7 +5087,7 @@ async def gstats(update, context):
             first = (getattr(requester, "first_name", None) or "").strip()
             last = (getattr(requester, "last_name", None) or "").strip()
             display_name = " ".join(part for part in (first, last) if part) or "Unknown"
-            await update.callback_query.message.edit_text(
+            await _safe_edit_text(update.callback_query.message, 
                 f"👤 {html_escape(display_name)}\n\n{text}",
                 parse_mode="HTML",
             )
@@ -4847,27 +5108,27 @@ async def gstats(update, context):
         title = info.get("title") or "Unknown"
         status = "🟢 ON" if (await asyncio.to_thread(is_bot_enabled, int(chat_id))) else "🔴 OFF"
         approved = "✅ Approved" if await is_group_approved(int(chat_id)) else "❌ Not Approved"
-        lines.append(f"{i}. 🏠 {title}")
+        lines.append(f"{i}. 🏠 {html_escape(title)}")
         lines.append(f"🆔 Group ID: <code>{chat_id}</code>")      # tap to copy
-        group_link = f"tg://openmessage?chat_id={chat_id}"
-        lines.append(f'🔗 <a href="{group_link}">Open Group</a>')
+        group_link = build_group_open_link(chat_id, info.get("username"), invite_links.get(chat_id))
         lines.append(f"🤖 Bot: {status}")
         lines.append(f"🔐 Approval: {approved}")
         lines.append("")
-        keyboard.append([
-            InlineKeyboardButton(
-                f"🗑 Remove from GStats: {title[:32]}",
-                callback_data=f"gstats:delete:{chat_id}",
-            )
-        ])
+        row = []
+        if group_link:
+            row.append(InlineKeyboardButton("🔗 Open Link", url=group_link))
+        row.append(InlineKeyboardButton(
+            f"🗑 Remove: {title[:24]}",
+            callback_data=f"gstats:delete:{chat_id}",
+        ))
+        keyboard.append(row)
 
     default_info = groups.get(str(DEFAULT_GSTATS_GROUP_ID))
     if default_info:
-        default_username = (default_info.get("username") or "").lstrip("@").strip()
-        if default_username:
-            lines.append(f"<a href=\"https://t.me/{default_username}\">Telegram Wonderland</a>")
-        else:
-            lines.append(f'<a href="tg://openmessage?chat_id={DEFAULT_GSTATS_GROUP_ID}">Telegram Wonderland</a>')
+        default_link = build_group_open_link(
+            DEFAULT_GSTATS_GROUP_ID, default_info.get("username"), invite_links.get(str(DEFAULT_GSTATS_GROUP_ID)))
+        if default_link:
+            lines.append(f'<a href="{html_escape(default_link)}">Telegram Wonderland</a>')
 
     markup = InlineKeyboardMarkup(keyboard)
     text = "\n".join(lines).rstrip()
@@ -4878,7 +5139,7 @@ async def gstats(update, context):
         last = (getattr(requester, "last_name", None) or "").strip()
         display_name = " ".join(part for part in (first, last) if part) or "Unknown"
         text = f"👤 {html_escape(display_name)}\n\n{text}"
-        await update.callback_query.message.edit_text(
+        await _safe_edit_text(update.callback_query.message, 
             text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=False
         )
     else:
@@ -4904,10 +5165,13 @@ async def gstats_callback(update, context):
         return
 
     chat_id = int(parts[2])
+    try:
+        await query.answer("🗑 Removing group from GStats…")        # answer first (Telegram expires it after ~15 s)
+    except Exception:
+        pass
     if not (await asyncio.to_thread(hide_gstats_group, chat_id)):
-        await query.answer("❌ Could not remove this group from GStats.", show_alert=True)
+        await safe_reply_text(query.message, "❌ Could not remove this group from GStats.")
         return
-    await query.answer("🗑 Group removed from GStats.")
     await gstats(update, context)
 
 def _staff_rows(ids):
@@ -5428,6 +5692,8 @@ async def notify_admins(context, text, photo_file_id=None):
 
 async def notify_staff_action(context, action_text, actor_id=None, owner_choice=False):
     try:
+        if actor_id is not None and is_owner(actor_id):
+            return          # Owner actions: no notification, no Yes/No prompt (the 3 allowed ones use the log prompt)
         choice_id = int(actor_id) if actor_id is not None and is_owner(actor_id) else (int(ADMIN_IDS[0]) if owner_choice and ADMIN_IDS else None)
         if choice_id is not None:
             pending = context.application.bot_data.setdefault("pending_owner_notifications", {})
@@ -5877,6 +6143,7 @@ async def add_event_end_minute(update, context):
     context.user_data.clear()
     await safe_reply_text(update.message, f"✅ Event created!\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 {(await asyncio.to_thread(format_reward, d['event_reward_type'],d['event_reward_value']))}\n💬 Trigger: {d['event_trigger']}\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}", reply_markup=ReplyKeyboardRemove())
     await notify_staff_action(context, f"🎉 EVENT ADDED\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 Reward: {(await asyncio.to_thread(format_reward, d['event_reward_type'],d['event_reward_value']))}\n💬 Trigger: {d['event_trigger']}\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}\n👤 By: {display_user(update.effective_user)}", actor_id=update.effective_user.id)
+    await release_conv_log(context, update.effective_user.id, "addevent")      # Yes/No prompt only after success
     return ConversationHandler.END
 
 async def event_trigger_message(update, context):
@@ -5970,6 +6237,7 @@ async def end_event_confirm(update, context):
     _EVENT_CACHE["val"] = None
     await safe_reply_text(update.message, f"✅ Event ended successfully!\n🎉 {name} [{code}]")
     await notify_staff_action(context, f"🛑 EVENT ENDED MANUALLY\n🎉 {name} [{code}]\n👤 By: {display_user(update.effective_user)}", actor_id=update.effective_user.id)
+    await release_conv_log(context, update.effective_user.id, "endevent")
     return ConversationHandler.END
 
 async def event_claim_callback(update, context):
@@ -6117,6 +6385,7 @@ async def add_redeem_code(update, context):
         f"👥 Limit: {max_claims} users\n"
         f"⏳ Expiry: {expiry_text}"
     )
+    await release_conv_log(context, update.effective_user.id, "addredeem")
     return ConversationHandler.END
 
 async def redeem(update, context):
@@ -6629,6 +6898,8 @@ async def skip_conversation(update, context):
     return None
 
 async def cancel_conversation(update, context):
+    if update.effective_user:
+        drop_conv_log(context, update.effective_user.id)           # a cancelled command never gets a log prompt
     for key in (
         "name", "recruit_names", "anime", "rarity", "worth", "code",
         "photo_code",
@@ -6685,15 +6956,30 @@ OWNER_AUTO_LOG_CATEGORIES = {"character"}
 SILENT_LOG_COMMANDS = {"callcharacter"}
 # When the OWNER runs one of these, the log is held and the Owner is asked Yes/No first (whatever the category).
 OWNER_CONFIRM_LOG_COMMANDS = {"addredeem", "redeem"}
+# Multi-step (ConversationHandler) commands: the Owner's Yes/No prompt is held back until the LAST step succeeds
+# (the final step calls release_conv_log). Cancelling or failing a step never produces a prompt.
+import importlib.util as _ilu
+# Multi-step flows: the log entry is held until the LAST step succeeds. A flow that is cancelled, abandoned or
+# times out never produces a log (pending entries are purged after CONV_LOG_TTL).
+CONVERSATION_LOG_COMMANDS = {"addevent", "endevent", "addredeem", "addcharacter", "editcharacter"}
+CONV_TIMEOUT = 900 if _ilu.find_spec("apscheduler") else None        # idle seconds before a flow is dropped
+CONV_LOG_TTL = 1000.0
+# The ONLY Owner actions that reach the log pipeline (Yes/No prompt). Everything else the Owner does is silent.
+OWNER_LOG_ALLOWED = {"addcharacter", "editcharacter", "spawn", "add"}
+# Commands that are logged only when the handler explicitly calls mark_success(update).
+EXPLICIT_SUCCESS_COMMANDS = {"spawn", "add"}
+LOG_MAX_CHANNELS = 10
+# Extra routable "category": unauthorized-attempt (security) entries can go to their own channel.
+ROUTABLE_EXTRA_CATEGORIES = {"security": "Unauthorized command / button attempts"}
 # Never logged: the log/rules management commands themselves and trivial navigation commands.
 # Commands that are never logged. Extend without editing code: LOG_IGNORED_EXTRA="skip,notifications"
 LOG_IGNORED_COMMANDS = {
     "start", "help", "cancel", "rules",
     "setlog", "unsetlog", "log", "nolog", "logcategories", "logchannel", "addcategory", "removecategory",
-    "logmap", "unlogmap", "logmappings",
+    "logmap", "unlogmap", "logmappings", "logroute", "unlogroute", "logroutes", "logdefault",
 } | {c.strip().lstrip("/").lower() for c in os.getenv("LOG_IGNORED_EXTRA", "").split(",") if c.strip()}
 LOG_COMMANDS = {"setlog", "unsetlog", "log", "nolog", "logcategories", "logchannel", "addcategory", "removecategory",
-                "logmap", "unlogmap", "logmappings"}
+                "logmap", "unlogmap", "logmappings", "logroute", "unlogroute", "logroutes", "logdefault"}
 COMMAND_NAME_RE = re.compile(r"^[a-z0-9_]{1,32}$")   # Telegram command syntax
 RULES_COMMANDS = {"rules", "setrules", "resetrules"}
 # command -> text that replaces its arguments in the log (secrets are never copied into the channel)
@@ -6737,16 +7023,26 @@ async def get_log_config():
     return val                                           # still racing writes: return fresh data, cache nothing
 
 
+_COMMAND_RE = re.compile(r"^/([A-Za-z0-9_]{1,32})(?:@([A-Za-z0-9_]{3,32}))?(?=\s|$)")
+
+
 def _parse_command(text, bot_username=None):
-    """('cmd', 'args') from message text; (None, '') if not a command or addressed to another bot."""
+    """
+    ('cmd', 'args') from message text.
+    (None, '') when the text is not a command OR the command is addressed to another bot
+    ("/cmd@OtherBot"). "/cmd" and "/cmd@MyBotUsername" both belong to this bot.
+    Pass bot_username (context.bot.username) - without it a "@target" cannot be checked and is accepted.
+    """
     if not text or not text.startswith("/"):
         return None, ""
-    head, _, args = text.partition(" ")
-    head = head.split("\n", 1)[0]
-    name, _, target = head[1:].partition("@")
-    if target and bot_username and target.lower() != bot_username.lower():
+    m = _COMMAND_RE.match(text)
+    if not m:
         return None, ""
-    return name.lower(), args.strip()
+    name, target = m.group(1), m.group(2)
+    if target and bot_username and target.lower() != str(bot_username).lstrip("@").lower():
+        return None, ""                                   # /command@OtherBot: not ours - stay completely silent
+    args = text[m.end():].strip()
+    return name.lower(), args
 
 
 async def _role_label(user_id):
@@ -6774,6 +7070,34 @@ def resolve_log_category(command, cfg):
     if mapped and (mapped in LOG_CATEGORIES or mapped in ((cfg or {}).get("custom_categories") or {})):
         return mapped
     return LOG_CATEGORY_OF.get(command, "general")
+
+
+def resolve_log_targets(cfg, command=None, category=None):
+    """
+    Channel ids an entry is posted to (a list, empty when no channel is linked).
+    Order of precedence: the Owner's route for the COMMAND  >  the route for its CATEGORY  >  the default channel.
+    A route that points at a channel that is no longer linked is ignored.
+    """
+    cfg = cfg or {}
+    channels = cfg.get("channels") or {}
+    routes = cfg.get("routes") or {}
+    for kind, key in (("commands", command), ("categories", category)):
+        if not key:
+            continue
+        target = (routes.get(kind) or {}).get(key)
+        if target is not None and str(target) in channels:
+            return [int(target)]
+    default = cfg.get("chat_id")
+    return [int(default)] if default is not None else []
+
+
+def enqueue_log_routed(app, cfg, text, command=None, category=None):
+    """Queue `text` for every channel the routing rules select. Returns how many channels got it."""
+    queued = 0
+    for chat_id in resolve_log_targets(cfg, command, category):
+        if enqueue_log(app, chat_id, text):
+            queued += 1
+    return queued
 
 
 def build_log_text(category, role, user, chat, command, args):
@@ -6883,11 +7207,20 @@ async def flush_log_buffer(app, chat_id):
     if not entries:
         return
     cfg = await get_log_config()
-    if not cfg or cfg.get("chat_id") is None or int(cfg["chat_id"]) != int(chat_id):
-        print(f"Log batch discarded: {chat_id} is no longer the linked log channel")
+    linked = {int(k) for k in ((cfg or {}).get("channels") or {})}
+    if int(chat_id) not in linked:
+        print(f"Log batch discarded: {chat_id} is no longer a linked log channel")
         return
-    for message in _split_batch(entries):
-        await _post_to_log_channel(app, chat_id, message)
+    retries = app.bot_data.setdefault("log_retry", {})
+    for index, message in enumerate(_split_batch(entries)):
+        delivered = await _post_to_log_channel(app, chat_id, message)
+        if not delivered and index == 0 and retries.get(chat_id, 0) < 3:
+            retries[chat_id] = retries.get(chat_id, 0) + 1          # nothing went out: try the whole batch again
+            app.bot_data.setdefault("log_buffer", {}).setdefault(chat_id, [])[0:0] = entries
+            app.bot_data.setdefault("log_deadline", {})[chat_id] = time.time() + 30
+            return
+        if delivered:
+            retries.pop(chat_id, None)
         await asyncio.sleep(LOG_SEND_GAP)
 
 
@@ -6911,66 +7244,143 @@ async def log_channel_worker(app):
             await asyncio.sleep(1.0)
             now = time.time()
             due = [cid for cid, dl in list(app.bot_data["log_deadline"].items()) if dl <= now]
-            for chat_id in due:
+
+            async def _flush_one(chat_id):
                 try:
                     await flush_log_buffer(app, chat_id)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     print(f"Log batch flush error ({chat_id}):", e)
+
+            if due:                       # channels are independent: one slow channel must not delay the others
+                await asyncio.gather(*(_flush_one(cid) for cid in due))
+            _purge_pending_conv(app)
+            _purge_cmd_state()
         except asyncio.CancelledError:
             raise
         except Exception as e:
             print("Log worker error:", e)
 
 
-async def log_event_hook(update, context):
+async def _prepare_log_entry(update, context):
     """
-    Role-based routing of command activity to the log channel.
-      Members / Scouts / Executives -> posted automatically (so a member's /redeem is always logged).
-      /spawn                        -> posted automatically for everyone (Owner included).
-      /callcharacter                -> never logged (Owner-only, fully silent).
-      Owner: /addredeem, /redeem, and every non-character command
-                                     -> Yes/No prompt in the Owner's PM; posted only on Yes, dropped on No.
-      Owner, other character commands -> posted automatically.
+    Decide how a command message is logged. Returns None (nothing to log) or a dict:
+      command, args, category, role, text, needs_confirmation, cfg
+    Commands addressed to another bot ("/cmd@OtherBot") are never logged.
+    """
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if not msg or not user or not chat or chat.type == "channel":
+        return None
+    command, args = _parse_command(msg.text, getattr(context.bot, "username", None))
+    if not command or command in LOG_IGNORED_COMMANDS or command in SILENT_LOG_COMMANDS:
+        return None
+    cfg = await get_log_config()
+    if not cfg or cfg.get("chat_id") is None:
+        return None
+    if command not in COMMANDS and command not in (cfg.get("command_mappings") or {}):
+        return None                                   # unknown commands are only logged once the Owner maps them
+    category = resolve_log_category(command, cfg)
+    if category in set(cfg.get("disabled_categories") or []):
+        return None
+    role = await _role_label(user.id)
+    if role == "Owner" and command not in OWNER_LOG_ALLOWED:
+        return None                                    # Owner is silent: no log, no notification, no prompt
+    text = build_log_text(category, role, user, chat, command, args)
+    needs_confirmation = role == "Owner"                # Owner (3 allowed actions): Yes/No. Everyone else: automatic
+    return {"command": command, "args": args, "category": category, "role": role, "text": text,
+            "needs_confirmation": needs_confirmation, "cfg": cfg, "chat_id": chat.id}
+
+
+async def _send_log_prompt(context, user_id, text, category, command, chat_id):
+    """Send the Owner the Yes/No prompt (pending approval is stored in MongoDB, so it survives restarts)."""
+    token = str(uuid.uuid4())
+    await asyncio.to_thread(
+        mongo_db.create_log_prompt, token, user_id,
+        {"text": text, "category": category, "command": command, "chat_id": chat_id})
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="📝 Do you want to upload this action log to the log channel?\n\n" + text,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Yes", callback_data=f"lg:y:{token}"),
+            InlineKeyboardButton("❌ No", callback_data=f"lg:n:{token}"),
+        ]]),
+    )
+
+
+def _purge_pending_conv(app):
+    pend = app.bot_data.get("pending_conv_logs")
+    if not pend:
+        return
+    now = time.monotonic()
+    for uid in [u for u, it in pend.items() if now - it.get("ts", 0) > CONV_LOG_TTL]:
+        pend.pop(uid, None)
+    if len(pend) > 500:
+        for uid in sorted(pend, key=lambda u: pend[u].get("ts", 0))[:len(pend) - 250]:
+            pend.pop(uid, None)
+
+
+async def _deliver_log(context, user_id, item):
+    """Owner (3 allowed actions) -> Yes/No prompt. Everyone else -> automatic post. Always routed by the rules."""
+    if item.get("needs_confirmation"):
+        await _send_log_prompt(context, user_id, item["text"], item["category"], item["command"], item["chat_id"])
+        return
+    cfg = await get_log_config()
+    if cfg and cfg.get("chat_id") is not None:
+        enqueue_log_routed(context.application, cfg, item["text"], item["command"], item["category"])
+
+
+async def command_outcome_hook(update, context):
+    """
+    POST-command hook (group 60). It runs only after the command's own handler finished, and never when a gate
+    (role / approval / ON-OFF / restriction) blocked the command. THE ONLY PLACE command logs are created:
+      * failed / unauthorized / crashed commands (_CMD_FAILED)              -> nothing
+      * spawn / add without mark_success(update)                            -> nothing
+      * Owner commands other than add/edit character, /add, /spawn          -> nothing (silent)
+      * multi-step commands (addcharacter, editcharacter, addevent, ...)    -> held until the LAST step succeeds
+      * otherwise: Owner -> Yes/No prompt, everyone else -> automatic post.
     """
     try:
-        msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
-        if not msg or not user or not chat or chat.type == "channel":
+        msg, user = update.effective_message, update.effective_user
+        if not msg or not user:
             return
-        command, args = _parse_command(msg.text, getattr(context.bot, "username", None))
-        if not command or command in LOG_IGNORED_COMMANDS or command in SILENT_LOG_COMMANDS:
+        key = (msg.chat_id, msg.message_id)
+        failed = _CMD_FAILED.pop(key, None) is not None
+        ok = _CMD_OK.pop(key, None) is not None
+        entry = await _prepare_log_entry(update, context)
+        if not entry or failed:
             return
-        cfg = await get_log_config()
-        if not cfg or cfg.get("chat_id") is None:
+        if entry["command"] in EXPLICIT_SUCCESS_COMMANDS and not ok:
             return
-        if command not in COMMANDS and command not in (cfg.get("command_mappings") or {}):
-            return                                    # unknown commands are only logged once the Owner maps them
-        category = resolve_log_category(command, cfg)
-        if category in set(cfg.get("disabled_categories") or []):
+        if entry["command"] in CONVERSATION_LOG_COMMANDS:
+            _purge_pending_conv(context.application)
+            context.application.bot_data.setdefault("pending_conv_logs", {})[user.id] = {
+                "command": entry["command"], "text": entry["text"], "category": entry["category"],
+                "chat_id": entry["chat_id"], "needs_confirmation": entry["needs_confirmation"],
+                "ts": time.monotonic()}
             return
-        role = await _role_label(user.id)
-        text = build_log_text(category, role, user, chat, command, args)
-        needs_confirmation = role == "Owner" and (
-            command in OWNER_CONFIRM_LOG_COMMANDS or category not in OWNER_AUTO_LOG_CATEGORIES)
-        if not needs_confirmation:
-            enqueue_log(context.application, cfg["chat_id"], text)
-            return
-        # Pending approvals live in MongoDB (collection pending_log_prompts), so they survive restarts.
-        token = str(uuid.uuid4())
-        await asyncio.to_thread(
-            mongo_db.create_log_prompt, token, user.id,
-            {"text": text, "category": category, "command": command, "chat_id": chat.id})
-        await context.bot.send_message(
-            chat_id=user.id,
-            text="📝 Do you want to upload this action log to the log channel?\n\n" + text,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Yes", callback_data=f"lg:y:{token}"),
-                InlineKeyboardButton("❌ No", callback_data=f"lg:n:{token}"),
-            ]]),
-        )
+        await _deliver_log(context, user.id, entry)
     except Exception as e:
-        print("Log routing error:", e)
+        print("Log outcome error:", e)
+
+
+async def release_conv_log(context, user_id, command):
+    """Called by the LAST step of a multi-step command after it succeeded."""
+    try:
+        item = context.application.bot_data.get("pending_conv_logs", {}).pop(user_id, None)
+        if not item or item.get("command") != command or time.monotonic() - item.get("ts", 0) > CONV_LOG_TTL:
+            return
+        await _deliver_log(context, user_id, item)
+    except Exception as e:
+        print("Conversation log release error:", e)
+
+
+def drop_conv_log(context, user_id):
+    """Cancelled / abandoned multi-step command: forget its pending log."""
+    try:
+        context.application.bot_data.get("pending_conv_logs", {}).pop(user_id, None)
+    except Exception:
+        pass
 
 
 PROMPT_EXPIRED = "⚠️ This prompt has expired or was already handled."
@@ -7026,6 +7436,7 @@ async def log_prompt_callback(update, context):
     except Exception as e:
         print("Log prompt receipt save error:", e)
     cfg = await get_log_config()
+    data = doc.get("action_data") or {}
     if not cfg or cfg.get("chat_id") is None:
         await query.answer("⚠️ No log channel is set.", show_alert=True)
         try:
@@ -7033,7 +7444,7 @@ async def log_prompt_callback(update, context):
         except Exception:
             pass
         return
-    enqueue_log(context.application, cfg["chat_id"], text)
+    enqueue_log_routed(context.application, cfg, text, data.get("command"), data.get("category"))
     await query.answer("Logged.")
     try:
         await query.edit_message_text("✅ Confirmed — action log queued for the log channel.\n\n" + text)
@@ -7054,7 +7465,7 @@ async def log_category_event(app, category, text):
         return False
     if category in set(cfg.get("disabled_categories") or []):
         return False
-    return enqueue_log(app, cfg["chat_id"], f"📝 {category}\n{text}")
+    return enqueue_log_routed(app, cfg, f"📝 {category}\n{text}", category=category) > 0
 
 
 # ---- security logging: unauthorized command attempts and restricted button taps ------------------------
@@ -7085,7 +7496,7 @@ async def log_security_denial(app, user, chat, kind, detail=""):
                 f"💬 {where}\n"
                 f"⌨️ {detail}\n"
                 f"🕒 {log_time_text()}")
-        enqueue_log(app, cfg["chat_id"], text)
+        enqueue_log_routed(app, cfg, text, category="security")
     except Exception as e:
         print("Security log error:", e)
 
@@ -7219,7 +7630,9 @@ async def setlog_command(update, context):
             "2. Send /setlog inside that channel.\n"
             "3. Forward that /setlog message here.\n\n"
             "If forwarding is blocked, send: /setlog <chat_id>  (e.g. /setlog -1001234567890)\n"
-            "For a supergroup you can also just send /setlog inside that group.")
+            "For a supergroup you can also just send /setlog inside that group.\n\n"
+            "You can link several log channels (max " + str(LOG_MAX_CHANNELS) + "): repeat the steps for each one. "
+            "The first becomes the default; send other categories/commands to them with /logroute.")
         return
     # Diagnostics only. The only hard refusals from this lookup are "left" / "kicked": the bot is not in the chat.
     status, can_post = "unknown", None
@@ -7233,10 +7646,17 @@ async def setlog_command(update, context):
             msg, f"❌ I'm not a member of that chat (my status: {status}). "
                  "Add me as an Administrator with permission to post, then try again.")
         return
+    _invalidate_log_cfg()
+    cfg_now = await get_log_config() or {}
+    linked_now = cfg_now.get("channels") or {}
+    if str(channel.id) not in linked_now and len(linked_now) >= LOG_MAX_CHANNELS:
+        await safe_reply_text(msg, f"❌ You already have {len(linked_now)} log channels (maximum {LOG_MAX_CHANNELS}). "
+                                   "Remove one with /unsetlog <chat_id> first.")
+        return
     # The real test: actually post a confirmation message. Success = linked ("restricted" is judged by this too).
     try:
         await context.bot.send_message(
-            chat_id=channel.id, text="✅ Log channel linked. Bot activity will be posted here "
+            chat_id=channel.id, text="✅ Log channel linked. Bot activity routed to this chat will be posted here "
                                      "(batched once every minute).")
     except Exception as e:
         await safe_reply_text(
@@ -7245,21 +7665,83 @@ async def setlog_command(update, context):
                  f"My status there: {status}; can post messages: {can_post if can_post is not None else 'not reported'}.\n"
                  "Make sure I am an Administrator with the 'Post messages' permission.")
         return
-    await asyncio.to_thread(
-        mongo_db.set_log_channel, channel.id, getattr(channel, "title", "") or "",
+    res = await asyncio.to_thread(
+        mongo_db.add_log_channel, channel.id, getattr(channel, "title", "") or "",
         getattr(channel, "username", "") or "", update.effective_user.id, timestamp())
     _invalidate_log_cfg()
-    await safe_reply_text(msg, f"✅ Log channel set: {getattr(channel, 'title', None) or channel.id} ({channel.id})\n"
-                               "Use /logcategories to see which categories are enabled.")
+    name = getattr(channel, "title", None) or channel.id
+    lines = [f"✅ Log channel {'updated' if res['already'] else 'added'}: {name} ({channel.id})"]
+    if res["is_default"]:
+        lines.append("⭐ It is the DEFAULT channel: everything without a route is posted here.")
+    else:
+        lines.append("ℹ️ The default channel is unchanged. Send logs here with /logroute <category|/command> "
+                     f"{channel.id}, or make it the default with /logdefault {channel.id}.")
+    lines.append(f"📡 Linked channels: {res['count']} (see /logchannel, /logroutes, /logcategories).")
+    await safe_reply_text(msg, "\n".join(lines))
+
+
+def _chan_label(cfg, chat_id):
+    info = ((cfg or {}).get("channels") or {}).get(str(chat_id)) or {}
+    return f"{info.get('title') or 'Unnamed'} ({chat_id})"
+
+
+def _find_log_channel(cfg, raw):
+    """Linked channel id from '-100123...' or '@username' (None when it is not a linked channel)."""
+    raw = (raw or "").strip()
+    channels = (cfg or {}).get("channels") or {}
+    if re.fullmatch(r"-?\d{5,20}", raw):
+        return int(raw) if str(int(raw)) in channels else None
+    if raw.startswith("@"):
+        for cid, info in channels.items():
+            if str((info or {}).get("username") or "").lower() == raw[1:].lower():
+                return int(cid)
+    return None
 
 
 async def unsetlog_command(update, context):
+    """/unsetlog [chat_id|@username|all] - unlink one log channel (or all of them)."""
     if not await _owner_only_log(update):
         return
-    removed = await asyncio.to_thread(mongo_db.clear_log_channel)
+    msg = update.effective_message
     _invalidate_log_cfg()
-    await safe_reply_text(update.effective_message,
-                          "✅ Log channel removed." if removed else "ℹ️ No log channel is configured.")
+    cfg = await get_log_config() or {}
+    channels = cfg.get("channels") or {}
+    if not channels:
+        await safe_reply_text(msg, "ℹ️ No log channel is configured.")
+        return
+    arg = context.args[0].strip() if context.args else ""
+    if arg.lower() == "all":
+        res = await asyncio.to_thread(mongo_db.remove_log_channel, None)
+        _invalidate_log_cfg()
+        await safe_reply_text(msg, f"✅ Removed all {res['removed']} log channel(s) and their routes.")
+        return
+    if not arg:
+        if len(channels) > 1:
+            rows = "\n".join(f"• {_chan_label(cfg, cid)}{' ⭐' if int(cid) == cfg.get('chat_id') else ''}" for cid in channels)
+            await safe_reply_text(msg, "Several log channels are linked. Choose one:\n" + rows +
+                                       "\n\nUsage: /unsetlog <chat_id>   (or /unsetlog all)")
+            return
+        target = int(next(iter(channels)))
+    else:
+        target = _find_log_channel(cfg, arg)
+        if target is None:
+            await safe_reply_text(msg, "❌ That chat is not a linked log channel. See /logchannel.")
+            return
+    label = _chan_label(cfg, target)
+    res = await asyncio.to_thread(mongo_db.remove_log_channel, target)
+    _invalidate_log_cfg()
+    if not res["removed"]:
+        await safe_reply_text(msg, "❌ That chat is not a linked log channel. See /logchannel.")
+        return
+    lines = [f"✅ Log channel removed: {label}"]
+    if res["routes_removed"]:
+        lines.append(f"🧹 {res['routes_removed']} route(s) that pointed to it were removed (they use the default now).")
+    if res["default"] is not None:
+        fresh = await get_log_config() or {}
+        lines.append(f"⭐ Default channel: {_chan_label(fresh, res['default'])}")
+    else:
+        lines.append("ℹ️ No log channel is linked any more.")
+    await safe_reply_text(msg, "\n".join(lines))
 
 
 async def logchannel_command(update, context):
@@ -7267,18 +7749,154 @@ async def logchannel_command(update, context):
         return
     _invalidate_log_cfg()
     cfg = await get_log_config()
-    if not cfg or cfg.get("chat_id") is None:
+    channels = (cfg or {}).get("channels") or {}
+    if not channels:
         await safe_reply_text(update.effective_message,
                               "ℹ️ No log channel is configured.\nUse /setlog (see /help → Owner Commands).")
         return
     off = list(cfg.get("disabled_categories") or [])
-    handle = f"@{cfg['username']}" if cfg.get("username") else "private channel"
-    await safe_reply_text(
-        update.effective_message,
-        "📡 Log Channel\n\n"
-        f"Name: {cfg.get('title') or 'Unknown'}\nID: {cfg['chat_id']}\nType: {handle}\n"
-        f"Linked: {cfg.get('set_at', '?')}\n"
-        f"Disabled categories: {', '.join(off) if off else 'none'}")
+    routes = cfg.get("routes") or {}
+    lines = [f"📡 Log Channels ({len(channels)})\n"]
+    for cid, info in channels.items():
+        info = info or {}
+        handle = f"@{info['username']}" if info.get("username") else "private"
+        n_cat = sum(1 for v in (routes.get("categories") or {}).values() if str(v) == str(cid))
+        n_cmd = sum(1 for v in (routes.get("commands") or {}).values() if str(v) == str(cid))
+        star = "⭐ DEFAULT — " if int(cid) == cfg.get("chat_id") else ""
+        lines.append(f"{star}{info.get('title') or 'Unnamed'}\n    ID: {cid} · {handle}\n"
+                     f"    Linked: {info.get('set_at', '?')}\n    Routes: {n_cat} categor{'y' if n_cat == 1 else 'ies'}, "
+                     f"{n_cmd} command{'' if n_cmd == 1 else 's'}")
+    lines.append(f"\nDisabled categories: {', '.join(off) if off else 'none'}")
+    lines.append("Manage: /setlog (add) · /unsetlog <chat_id> · /logdefault <chat_id> · /logroute · /logroutes")
+    await safe_reply_text(update.effective_message, "\n".join(lines))
+
+
+async def logdefault_command(update, context):
+    if not await _owner_only_log(update):
+        return
+    msg = update.effective_message
+    _invalidate_log_cfg()
+    cfg = await get_log_config() or {}
+    target = _find_log_channel(cfg, context.args[0]) if len(context.args) == 1 else None
+    if target is None:
+        await safe_reply_text(msg, "Usage: /logdefault <chat_id>\nThe channel must already be linked (see /logchannel).")
+        return
+    if not await asyncio.to_thread(mongo_db.set_log_default, target):
+        await safe_reply_text(msg, "❌ That chat is not a linked log channel.")
+        return
+    _invalidate_log_cfg()
+    await safe_reply_text(msg, f"⭐ Default log channel is now {_chan_label(cfg, target)}.\n"
+                               "Entries without a command/category route are posted there.")
+
+
+def _route_key(raw, cfg):
+    """('commands'|'categories', key, None) or (None, None, error text). '/craft' = a command, 'shop' = a category."""
+    raw = (raw or "").strip()
+    if raw.startswith("/"):
+        key = _clean_command_arg(raw)
+        if not COMMAND_NAME_RE.match(key):
+            return None, None, "❌ Invalid command name. Use letters, digits and underscore only (e.g. /craft)."
+        if key in LOG_IGNORED_COMMANDS:
+            return None, None, f"❌ /{key} is on the never-log list and cannot be routed."
+        return "commands", key, None
+    key = raw.lower()
+    valid = {n for n, _d, _c in _all_categories(cfg)} | set(ROUTABLE_EXTRA_CATEGORIES)
+    if key in valid:
+        return "categories", key, None
+    hint = f" Did you mean the command? Use /logroute /{key} <chat_id>." if COMMAND_NAME_RE.match(key) else ""
+    return None, None, (f"❌ '{raw}' is not a log category.{hint}\nCategories: {', '.join(sorted(valid))}")
+
+
+async def logroute_command(update, context):
+    """/logroute <category|/command> <chat_id|default>"""
+    if not await _owner_only_log(update):
+        return
+    msg = update.effective_message
+    if len(context.args) != 2:
+        await safe_reply_text(msg, "Usage: /logroute <category|/command> <chat_id|default>\n"
+                                   "Examples:\n/logroute economy -1001234567890   (a whole category)\n"
+                                   "/logroute /daily -1001234567890   (one command; wins over its category)\n"
+                                   "/logroute economy default   (back to the default channel)\n"
+                                   "See /logroutes and /logchannel.")
+        return
+    _invalidate_log_cfg()
+    cfg = await get_log_config() or {}
+    if not (cfg.get("channels") or {}):
+        await safe_reply_text(msg, "⚠️ No log channel is linked yet. Use /setlog first.")
+        return
+    kind, key, err = _route_key(context.args[0], cfg)
+    if err:
+        await safe_reply_text(msg, err)
+        return
+    shown = f"/{key}" if kind == "commands" else key
+    if context.args[1].strip().lower() == "default":
+        removed = await asyncio.to_thread(mongo_db.clear_log_route, kind, key)
+        _invalidate_log_cfg()
+        await safe_reply_text(msg, f"✅ {shown} now uses the default channel." if removed
+                              else f"ℹ️ {shown} had no route (it already uses the default channel).")
+        return
+    target = _find_log_channel(cfg, context.args[1])
+    if target is None:
+        await safe_reply_text(msg, "❌ That chat is not a linked log channel. Link it with /setlog first (see /logchannel).")
+        return
+    try:
+        previous = await asyncio.to_thread(mongo_db.set_log_route, kind, key, target)
+    except ValueError:
+        await safe_reply_text(msg, "❌ That chat is not a linked log channel.")
+        return
+    _invalidate_log_cfg()
+    lines = []
+    if previous is not None and str(previous) == str(target):
+        lines.append(f"ℹ️ {shown} was already routed to {_chan_label(cfg, target)}.")
+    elif previous is not None:
+        lines.append(f"🔁 {shown}: {_chan_label(cfg, previous)} → {_chan_label(cfg, target)}")
+    else:
+        lines.append(f"✅ {shown} is now posted to {_chan_label(cfg, target)}.")
+    if kind == "commands" and key not in known_commands(context.application) and key not in (cfg.get("command_mappings") or {}):
+        lines.append(f"⚠️ /{key} is not a registered bot command; the route applies as soon as it exists (and is mapped with /logmap).")
+    await safe_reply_text(msg, "\n".join(lines))
+
+
+async def unlogroute_command(update, context):
+    """/unlogroute <category|/command>"""
+    if not await _owner_only_log(update):
+        return
+    msg = update.effective_message
+    if len(context.args) != 1:
+        await safe_reply_text(msg, "Usage: /unlogroute <category|/command>   (e.g. /unlogroute economy, /unlogroute /daily)")
+        return
+    _invalidate_log_cfg()
+    cfg = await get_log_config() or {}
+    kind, key, err = _route_key(context.args[0], cfg)
+    if err:
+        await safe_reply_text(msg, err)
+        return
+    removed = await asyncio.to_thread(mongo_db.clear_log_route, kind, key)
+    _invalidate_log_cfg()
+    shown = f"/{key}" if kind == "commands" else key
+    await safe_reply_text(msg, f"✅ Route for {shown} removed. It uses the default channel again." if removed
+                          else f"❌ No route exists for {shown}.")
+
+
+async def logroutes_command(update, context):
+    if not await _owner_only_log(update):
+        return
+    _invalidate_log_cfg()
+    cfg = await get_log_config() or {}
+    channels = cfg.get("channels") or {}
+    if not channels:
+        await safe_reply_text(update.effective_message, "ℹ️ No log channel is configured. Use /setlog.")
+        return
+    routes = cfg.get("routes") or {}
+    lines = ["🧭 Log Routing\n", f"⭐ Default: {_chan_label(cfg, cfg.get('chat_id'))}"]
+    cats = routes.get("categories") or {}
+    cmds = routes.get("commands") or {}
+    lines.append("\n📂 Category routes")
+    lines.extend([f"• {c} → {_chan_label(cfg, t)}" for c, t in sorted(cats.items())] or ["• none"])
+    lines.append("\n⌨️ Command routes (win over category routes)")
+    lines.extend([f"• /{c} → {_chan_label(cfg, t)}" for c, t in sorted(cmds.items())] or ["• none"])
+    lines.append("\nSet: /logroute <category|/command> <chat_id>   Remove: /unlogroute <category|/command>")
+    await safe_reply_text(update.effective_message, "\n".join(lines))
 
 
 def _all_categories(cfg):
@@ -7650,6 +8268,8 @@ def register_log_and_rules_commands(app):
         ("log", log_enable_command), ("nolog", log_disable_command), ("logcategories", logcategories_command),
         ("addcategory", addcategory_command), ("removecategory", removecategory_command),
         ("logmap", logmap_command), ("unlogmap", unlogmap_command), ("logmappings", logmappings_command),
+        ("logroute", logroute_command), ("unlogroute", unlogroute_command), ("logroutes", logroutes_command),
+        ("logdefault", logdefault_command),
     ):
         app.add_handler(CommandHandler(name, callback))
     # /setlog sent inside a channel arrives as a channel post
@@ -7657,7 +8277,9 @@ def register_log_and_rules_commands(app):
         filters.UpdateType.CHANNEL_POSTS & filters.Regex(r"^/setlog(@\w+)?(\s|$)"), setlog_command))
     app.add_handler(CallbackQueryHandler(log_prompt_callback, pattern=r"^lg:[yn]:"))
     # group -4: own group (only the first matching handler of a group runs); block=False never delays commands
-    app.add_handler(MessageHandler(filters.COMMAND, log_event_hook, block=False), group=-4)
+    # group 60: runs only AFTER the command's own handler finished (gates that block a command skip it), so the
+    # Owner's Yes/No log prompt is sent only for commands that completed successfully.
+    app.add_handler(MessageHandler(filters.COMMAND, command_outcome_hook), group=60)
 
 
 COMMANDS = {
@@ -7734,9 +8356,13 @@ COMMANDS = {
     "unbtransfer": "Owner/Executive: remove transfer block between two user IDs",
     "setrules": "Owner/Executive: set the bot usage rules (PM only)",
     "resetrules": "Owner: clear all bot usage rules (PM only)",
-    "setlog": "Owner: link a log channel (send in the channel, then forward it here)",
-    "unsetlog": "Owner: unlink the log channel",
-    "logchannel": "Owner: show the linked log channel",
+    "setlog": "Owner: link a log channel - repeat to add more (send in the channel, then forward it here)",
+    "unsetlog": "Owner: unlink a log channel (/unsetlog <chat_id> or all)",
+    "logchannel": "Owner: show all linked log channels",
+    "logdefault": "Owner: choose the default log channel (/logdefault <chat_id>)",
+    "logroute": "Owner: send a category or command to a channel (/logroute <category|/command> <chat_id>)",
+    "unlogroute": "Owner: remove a log route (/unlogroute <category|/command>)",
+    "logroutes": "Owner: show the default channel and all log routes",
     "log": "Owner: enable a log category",
     "nolog": "Owner: disable a log category",
     "logcategories": "Owner: list log categories (built-in + custom) and their status",
@@ -7941,75 +8567,107 @@ UNAPPROVED_GROUP_WARNING = (
     "\n🔴 After approval, Owner can use /boton or /botoff to control the bot."
 )
 
-def _warning_allowed(app, chat_id, interval=5):
+GATE_WARNING_COOLDOWN = float(os.getenv("GATE_WARNING_COOLDOWN", "60"))   # seconds between notices in one chat
+
+
+def _known_command_names(app):
+    """Every command name this bot really handles (documented lists + registered handlers). Cached."""
+    cached = app.bot_data.get("_known_command_names")
+    if cached is None:
+        cached = {str(c).lower() for c in known_commands(app)}
+        cached |= set(PUBLIC_COMMANDS) | set(OWNER_COMMANDS) | set(EXECUTIVE_COMMANDS) | set(SCOUT_COMMANDS)
+        app.bot_data["_known_command_names"] = cached
+    return cached
+
+
+def _warning_allowed(app, chat_id, interval=None, message_id=None):
+    """
+    May a "Bot is OFF" / "Not approved" notice be sent now?
+      * at most ONE notice per triggering message (message_id is remembered, so a duplicated/redelivered update
+        or a second gate cannot answer the same message twice);
+      * at most one notice per chat every GATE_WARNING_COOLDOWN seconds (a burst of commands = one notice).
+    """
     now = time.monotonic()
+    if message_id is not None:
+        seen = app.bot_data.setdefault("warning_msg_ids", {})
+        key = (str(chat_id), int(message_id))
+        if key in seen:
+            return False
+        if len(seen) > 200:
+            for old in [k for k, t in seen.items() if now - t > 600]:
+                seen.pop(old, None)
+        if len(seen) > 2000:
+            seen.clear()
+        seen[key] = now
     sent = app.bot_data.setdefault("warning_last_sent", {})
+    if len(sent) > 500:
+        for old in [k for k, t in sent.items() if now - t > 3600]:
+            sent.pop(old, None)
     previous = sent.get(str(chat_id), 0.0)
-    if now - previous < interval:
+    limit = GATE_WARNING_COOLDOWN if interval is None else interval
+    if previous and now - previous < limit:
         return False
     sent[str(chat_id)] = now
     return True
 
+
 async def block_unapproved_group(update, context):
+    """
+    Group/approval/ON-OFF gate (runs before every other handler).
+    It only reacts to commands that are meant for THIS bot ("/cmd" or "/cmd@MyBotUsername"):
+      * plain text, media, and commands for other bots ("/cmd@OtherBot")  -> ignored, never answered, never blocked
+      * a command in a not-approved / OFF group -> the command is blocked, and the notice is sent only when the
+        command is one of ours, at most once per message and once per cooldown window.
+    """
+    msg = update.effective_message
     chat = update.effective_chat
+    text = (msg.text or "") if msg else ""
+    command_name, _args = _parse_command(text, getattr(context.bot, "username", None))
+
     if not chat or chat.type not in ("group", "supergroup"):
-        msg = await get_restricted_message(update)
-        if msg and update.effective_message and update.effective_message.text and update.effective_message.text.startswith("/"):
-            await safe_reply_text(update.effective_message, msg)
-            from telegram.ext import ApplicationHandlerStop
-            raise ApplicationHandlerStop
+        if command_name:
+            restricted = await get_restricted_message(update)
+            if restricted:
+                await safe_reply_text(msg, restricted)
+                raise ApplicationHandlerStop
         return
 
-    text = (update.effective_message.text or "") if update.effective_message else ""
-    command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+    if not command_name:
+        return                                   # not a command for us: stay silent
+
+    user = update.effective_user
     approved, enabled = await group_gate(chat)
+    known = _known_command_names(context.application)
+
     if not approved:
-        if command == "/approve" and (await asyncio.to_thread(has_group_approval_permission, update.effective_user.id)):
+        if command_name == "approve" and user and (await asyncio.to_thread(has_group_approval_permission, user.id)):
             return
-        if not command:
-            return
-        try:
-            if update.effective_message and _warning_allowed(context.application, chat.id):
-                await safe_reply_text(update.effective_message, UNAPPROVED_GROUP_WARNING)
-        except Exception as e:
-            print("Unapproved warning error:", e)
-        from telegram.ext import ApplicationHandlerStop
+        if command_name in known and msg is not None and _warning_allowed(
+                context.application, chat.id, message_id=msg.message_id):
+            try:
+                await safe_reply_text(msg, UNAPPROVED_GROUP_WARNING)
+            except Exception as e:
+                print("Unapproved warning error:", e)
         raise ApplicationHandlerStop
 
-    if not enabled and command not in ("/boton", "/approve", "/removeapprove"):
-        if not command:
+    if not enabled and command_name not in ("boton", "approve", "removeapprove"):
+        if command_name not in known:
             return
-
-        command_name = command.lstrip("/").split("@")[0].lower()
-        bot_commands = (
-            set(COMMANDS)
-            | set(PUBLIC_COMMANDS)
-            | set(OWNER_COMMANDS)
-            | set(EXECUTIVE_COMMANDS)
-            | set(SCOUT_COMMANDS)
-        )
-        if command_name not in bot_commands:
-            return
-
-        try:
-            if update.effective_message and _warning_allowed(context.application, chat.id):
-                await safe_reply_text(
-                    update.effective_message,
-                    "🔴 Bot is OFF in this group.\n👑 Owner/Executive can turn it ON with /boton."
-                )
-        except Exception as e:
-            print("Bot OFF warning error:", e)
-        from telegram.ext import ApplicationHandlerStop
+        if msg is not None and _warning_allowed(context.application, chat.id, message_id=msg.message_id):
+            try:
+                await safe_reply_text(msg, "🔴 Bot is OFF in this group.\n👑 Owner/Executive can turn it ON with /boton.")
+            except Exception as e:
+                print("Bot OFF warning error:", e)
         raise ApplicationHandlerStop
 
-    msg = await get_restricted_message(update)
-    if msg and command:
+    restricted = await get_restricted_message(update)
+    if restricted:
         try:
-            await safe_reply_text(update.effective_message, msg)
+            await safe_reply_text(msg, restricted)
         except Exception as e:
             print("Restriction warning error:", e)
-        from telegram.ext import ApplicationHandlerStop
         raise ApplicationHandlerStop
+
 
 async def block_unapproved_callback(update, context):
     query = update.callback_query
@@ -8022,26 +8680,25 @@ async def block_unapproved_callback(update, context):
         except Exception:
             pass
         try:
-            await safe_reply_text(query.message, UNAPPROVED_GROUP_WARNING)
+            if _warning_allowed(context.application, chat.id):          # taps never spam the group
+                await safe_reply_text(query.message, UNAPPROVED_GROUP_WARNING)
         except Exception:
             pass
-        from telegram.ext import ApplicationHandlerStop
         raise ApplicationHandlerStop
     if not (await asyncio.to_thread(is_bot_enabled, chat.id)):
         try:
             await query.answer("Bot is OFF in this group. Owner can use /boton.", show_alert=True)
         except Exception:
             pass
-        from telegram.ext import ApplicationHandlerStop
         raise ApplicationHandlerStop
     msg = await get_restricted_message(update)
     if msg:
         try:
             await query.answer("You are currently restricted.", show_alert=True)
-            await safe_reply_text(query.message, msg)
+            if _warning_allowed(context.application, chat.id, interval=10):
+                await safe_reply_text(query.message, msg)
         except Exception:
             pass
-        from telegram.ext import ApplicationHandlerStop
         raise ApplicationHandlerStop
 
 async def restrict(update, context):
@@ -8322,6 +8979,7 @@ def register_executive_commands(app):
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation), CommandHandler("skip", skip_conversation)],
         allow_reentry=True,
+        conversation_timeout=CONV_TIMEOUT,
     )
     app.add_handler(edit_conv)
 
@@ -8338,6 +8996,7 @@ def register_executive_commands(app):
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation), CommandHandler("skip", skip_conversation)],
         allow_reentry=True,
+        conversation_timeout=CONV_TIMEOUT,
     )
     app.add_handler(add_conv)
 
@@ -8350,7 +9009,9 @@ OWNER_COMMANDS = {
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
+    "logroute", "unlogroute", "logroutes", "logdefault",
 }
+OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
 def register_owner_commands(app):
     app.add_handler(CommandHandler("removechar", removechar))
@@ -8403,6 +9064,7 @@ def register_owner_commands(app):
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation), CommandHandler("skip", skip_conversation)],
         allow_reentry=True,
+        conversation_timeout=CONV_TIMEOUT,
     )
     app.add_handler(event_conv)
 
@@ -8417,6 +9079,7 @@ def register_owner_commands(app):
         },
         fallbacks=[CommandHandler("cancel", cancel_conversation), CommandHandler("skip", skip_conversation)],
         allow_reentry=True,
+        conversation_timeout=CONV_TIMEOUT,
     )
     app.add_handler(redeem_conv)
     app.add_handler(ConversationHandler(
@@ -8424,6 +9087,7 @@ def register_owner_commands(app):
         states={END_EVENT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, end_event_confirm)]},
         fallbacks=[CommandHandler("cancel", cancel_conversation), CommandHandler("skip", skip_conversation)],
         allow_reentry=True,
+        conversation_timeout=CONV_TIMEOUT,
     ))
     app.add_handler(CommandHandler("deleteredeem", delete_redeem))
     app.add_handler(CommandHandler("redeems", list_redeems))
@@ -8587,6 +9251,10 @@ def main():
     async def global_error_handler(update, context):
         # Never raise from here: log the full traceback and keep polling.
         try:
+            _mark_command_failed(getattr(update, "effective_message", None))   # a crashed command is not "successful"
+        except Exception:
+            pass
+        try:
             logger.error("Telegram handler error: %r", context.error, exc_info=context.error)
         except Exception:
             print(f"Telegram handler error: {context.error!r}")
@@ -8702,5 +9370,239 @@ def main():
         bootstrap_retries=-1,
     )
 
+
+# ======================================================================================================
+# CONSOLE BRIDGE (added block - nothing above this line was changed)
+#   1. Telegram event logging : every command a user sends in Telegram is printed with the exact reply
+#        [Telegram] User: /start -> Response: Hello! Welcome.
+#   2. Terminal command execution: type a command in the console; it runs through the REAL handlers and the
+#      reply is printed here instead of being sent to Telegram
+#        [Terminal Input]: /daily -> Response: Here is your daily reward!
+#      Console syntax:  /daily | as <user_id> /daily | in <chat_id> /spawn | as <user_id> in <chat_id> /add naruto
+#      (default user = the Owner, default chat = that user's private chat; text without "/" is sent as a plain
+#       message, e.g. to answer the steps of /addcharacter).
+#   Switches: CONSOLE_BRIDGE_TERMINAL=0 (no console input)  CONSOLE_BRIDGE_LOG=0 (no Telegram logging)
+#             CONSOLE_MULTILINE=1 (replies on several lines instead of one line)
+#   It only wraps outgoing Bot calls and adds one early handler; no existing command or function is touched.
+#   On Render there is no console, so only the [Telegram] log lines appear (in the Render Logs).
+# ======================================================================================================
+import asyncio as _cb_asyncio, contextvars as _cb_contextvars, itertools as _cb_itertools
+import os as _cb_os, re as _cb_re, threading as _cb_threading
+from datetime import datetime as _cb_datetime, timezone as _cb_timezone
+_CB_CTX = _cb_contextvars.ContextVar("console_bridge_ctx", default=None)
+_CB_TERMINAL_IDS = set()
+_CB_RUNS = {}
+_cb_counter = _cb_itertools.count(1)
+_cb_state = {"default_uid": None, "wrapped": False, "terminal": True, "log": True}
+
+
+# ----------------------------------------------------------------------------- output
+def _cb_flat(text):
+    text = "" if text is None else str(text)
+    if _cb_os.getenv("CONSOLE_MULTILINE") == "1":
+        return text
+    return _cb_re.sub(r"\s*\n\s*", " ⏎ ", text).strip()
+
+
+def _cb_emit(ctx, label, text):
+    ctx["n"] += 1
+    response = _cb_flat(((label + " ") if label else "") + ("" if text is None else str(text)))
+    tag = "[Terminal Input]:" if ctx["mode"] == "terminal" else "[Telegram] User:"
+    print(f"{tag} {ctx['input']} -> Response: {response}", flush=True)
+
+
+# ----------------------------------------------------------------------------- real-PTB object builders (replaceable in tests)
+def _cb_make_update(uid, chat_id, text):
+    from telegram import Chat, Message, MessageEntity, Update, User
+    n = next(_cb_counter)
+    chat = Chat(id=chat_id, type="private" if chat_id > 0 else "supergroup", title=None if chat_id > 0 else "Console group")
+    user = User(id=uid, first_name="Console", is_bot=False)
+    entities = None
+    if text.startswith("/"):
+        token = text.split()[0]
+        entities = [MessageEntity(type="bot_command", offset=0, length=len(token))]
+    msg = Message(message_id=10 ** 9 + n, date=_cb_datetime.now(_cb_timezone.utc), chat=chat, from_user=user, text=text, entities=entities)
+    return Update(update_id=10 ** 9 + n, message=msg), msg
+
+
+def _cb_bind_bot(msg, bot):
+    msg.set_bot(bot)
+
+
+def _cb_make_bot_message(bot, chat_id, chat_type, text):
+    from telegram import Chat, Message, User
+    n = next(_cb_counter)
+    return Message(message_id=2 * 10 ** 9 + n, date=_cb_datetime.now(_cb_timezone.utc), chat=Chat(id=chat_id, type=chat_type),
+                   from_user=User(id=bot.id, first_name="Bot", is_bot=True, username=bot.username), text=text or "")
+
+
+# ----------------------------------------------------------------------------- outgoing-message wrapper
+def _cb_pick(args, kwargs, name, idx):
+    if name in kwargs:
+        return kwargs[name]
+    return args[idx] if idx is not None and len(args) > idx else None
+
+
+# method: (label, chat getter, text getter, returns-a-message)
+_CB_METHODS = {
+    "send_message":       ("",           lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "text", 1), True),
+    "send_photo":         ("[photo]",    lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "caption", 2), True),
+    "send_document":      ("[document]", lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "caption", None), True),
+    "send_animation":     ("[animation]", lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "caption", None), True),
+    "send_video":         ("[video]",    lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "caption", None), True),
+    "edit_message_text":  ("[edited]",   lambda a, k: _cb_pick(a, k, "chat_id", 1), lambda a, k: _cb_pick(a, k, "text", 0), False),
+    "edit_message_caption": ("[edited]", lambda a, k: _cb_pick(a, k, "chat_id", 0), lambda a, k: _cb_pick(a, k, "caption", None), False),
+    "edit_message_media": ("[edited]",   lambda a, k: _cb_pick(a, k, "chat_id", 0),
+                           lambda a, k: getattr(_cb_pick(a, k, "media", 1), "caption", None), False),
+}
+
+
+def _cb_is_log_prompt(kwargs):
+    markup = kwargs.get("reply_markup")
+    try:
+        return any(str(getattr(b, "callback_data", "") or "").startswith("lg:")
+                   for row in getattr(markup, "inline_keyboard", ()) for b in row)
+    except Exception:
+        return False
+
+
+def _cb_wrap_method(bot_cls, name, label, chat_get, text_get, returns_message):
+    original = getattr(bot_cls, name, None)
+    if original is None or getattr(original, "_console_bridge", False):
+        return
+
+    async def wrapper(self, *args, **kwargs):
+        ctx = _CB_CTX.get()
+        chat_id = chat_get(args, kwargs)
+        if (not ctx or chat_id is None or str(chat_id) != str(ctx["chat_id"])
+                or (not _cb_state["log"] and ctx["mode"] != "terminal")):
+            return await original(self, *args, **kwargs)
+        text = text_get(args, kwargs)
+        if ctx["mode"] == "terminal" and _cb_is_log_prompt(kwargs):
+            # The Owner's Yes/No log prompt needs real tappable buttons: send it to Telegram, note it here.
+            _cb_emit(ctx, "", "(Yes/No log prompt sent to your Telegram chat - tap a button there)")
+            return await original(self, *args, **kwargs)
+        if ctx["mode"] == "terminal":                       # terminal run: print, do NOT send to Telegram
+            _cb_emit(ctx, label, text)
+            if returns_message:
+                msg = _cb_make_bot_message(self, int(chat_id), ctx["chat_type"], text)
+                _cb_bind_bot(msg, self)
+                return msg
+            return True
+        result = await original(self, *args, **kwargs)      # Telegram run: send for real, then log what was sent
+        _cb_emit(ctx, label, text)
+        return result
+
+    wrapper._console_bridge = True
+    wrapper.__name__ = name
+    setattr(bot_cls, name, wrapper)
+
+
+def _cb_wrap_bot_methods(bot_cls):
+    for name, (label, chat_get, text_get, returns_message) in _CB_METHODS.items():
+        _cb_wrap_method(bot_cls, name, label, chat_get, text_get, returns_message)
+    _cb_state["wrapped"] = True
+
+
+# ----------------------------------------------------------------------------- per-update context
+async def _cb_context_hook(update, context):
+    msg = update.effective_message
+    text = getattr(msg, "text", None) if msg is not None else None
+    chat = update.effective_chat
+    if not text or chat is None:
+        return
+    terminal = update.update_id in _CB_TERMINAL_IDS
+    if not terminal:
+        if not text.startswith("/"):
+            return                                           # only commands are logged
+        _name, _, target = text.split()[0][1:].partition("@")
+        if target and target.lower() != str(getattr(context.bot, "username", "") or "").lower():
+            return                                           # a command for another bot
+    ctx = {"mode": "terminal" if terminal else "telegram", "input": text, "chat_id": chat.id,
+           "chat_type": chat.type, "n": 0}
+    _CB_CTX.set(ctx)
+    _CB_RUNS[update.update_id] = ctx
+
+
+# ----------------------------------------------------------------------------- terminal side
+_CB_LINE = _cb_re.compile(r"^(?:as\s+(-?\d+)\s+)?(?:in\s+(-?\d+)\s+)?(.+)$", _cb_re.S)
+
+
+async def _cb_run_terminal(app, line, default_uid=None):
+    m = _CB_LINE.match(line.strip())
+    if not m:
+        return
+    uid = int(m.group(1)) if m.group(1) else (default_uid or _cb_state["default_uid"])
+    chat_id = int(m.group(2)) if m.group(2) else uid
+    text = m.group(3).strip()
+    if uid is None:
+        print("[Console] No default user known - use:  as <user_id> /command", flush=True)
+        return
+    update, msg = _cb_make_update(uid, chat_id, text)
+    _cb_bind_bot(msg, app.bot)
+    _CB_TERMINAL_IDS.add(update.update_id)
+    try:
+        await app.process_update(update)
+    finally:
+        ctx = _CB_RUNS.pop(update.update_id, None)
+        _CB_TERMINAL_IDS.discard(update.update_id)
+    if ctx is not None and ctx["n"] == 0:
+        print(f"[Terminal Input]: {text} -> Response: (no response)", flush=True)
+
+
+def _cb_reader(app, loop):
+    print("[Console] Type a bot command (e.g. /start, /daily, /help) and press Enter. "
+          "Prefix:  as <user_id>  and/or  in <chat_id>.", flush=True)
+    while True:
+        try:
+            line = input()
+        except (EOFError, OSError):
+            return                                           # no console (e.g. Render): quietly stop
+        if not line.strip():
+            continue
+        try:
+            _cb_asyncio.run_coroutine_threadsafe(_cb_run_terminal(app, line, _cb_state["default_uid"]), loop).result(timeout=180)
+        except Exception as e:
+            print(f"[Console] Error: {type(e).__name__}: {e}", flush=True)
+
+
+# ----------------------------------------------------------------------------- installation
+def _cb_attach(app):
+    from telegram import Update
+    from telegram.ext import TypeHandler
+    app.add_handler(TypeHandler(Update, _cb_context_hook), group=-200)       # runs before every other handler
+    previous = getattr(app, "post_init", None)
+
+    async def chained(application):
+        if previous is not None:
+            await previous(application)
+        if _cb_state["terminal"]:
+            _cb_threading.Thread(target=_cb_reader, args=(application, _cb_asyncio.get_running_loop()),
+                             name="console-bridge", daemon=True).start()
+
+    app.post_init = chained
+
+
+def console_bridge_enable(default_user_id=None):
+    """Call once BEFORE bot.main(). Wraps Application.run_polling so the hook is attached just before polling starts."""
+    from telegram import Bot
+    from telegram.ext import Application
+    _cb_state["default_uid"] = default_user_id
+    _cb_state["terminal"] = _cb_os.getenv("CONSOLE_BRIDGE_TERMINAL", "1") != "0"
+    _cb_state["log"] = _cb_os.getenv("CONSOLE_BRIDGE_LOG", "1") != "0"
+    _cb_wrap_bot_methods(Bot)
+    original = Application.run_polling
+    if getattr(original, "_console_bridge", False):
+        return
+
+    def run_polling(self, *args, **kwargs):
+        _cb_attach(self)
+        return original(self, *args, **kwargs)
+
+    run_polling._console_bridge = True
+    Application.run_polling = run_polling
+
+
 if __name__ == "__main__":
+    console_bridge_enable(default_user_id=ADMIN_IDS[0] if ADMIN_IDS else None)
     main()

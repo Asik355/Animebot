@@ -1099,7 +1099,10 @@ def replace_restrictions(data):
 
 # --------------------------------------------------------------------------
 # Bot settings (collection `bot_settings`, one document per setting)
-#   _id "log_channel":    {chat_id, title, username, set_by, set_at}
+#   _id "log_channel":    LEGACY single channel {chat_id, title, username, set_by, set_at} (read only until the first
+#                         multi-channel write, then migrated into "log_channels")
+#   _id "log_channels":   {channels: {"<chat_id>": {title, username, set_by, set_at}}, default: chat_id|None,
+#                          routes: {commands: {command: chat_id}, categories: {category: chat_id}}}
 #   _id "log_categories": {custom: {name: description}, disabled: [category names]}
 #   _id "command_mappings": {map: {command: category}}   (Owner /logmap: command -> log category)
 #   _id "rules":          {text, updated_by, updated_at}
@@ -1114,42 +1117,175 @@ OP_RECEIPTS = "op_receipts"
 def get_log_config():
     """
     Everything the logger needs in one read (flat dict, never None):
-      chat_id (None when no log channel is linked), title, username, set_by, set_at,
+      chat_id            DEFAULT log channel id (None when no log channel is linked), title, username, set_by, set_at
+      channels           {"<chat_id>": {title, username, set_by, set_at}}  every linked log channel
+      routes             {"commands": {command: chat_id}, "categories": {category: chat_id}}
       custom_categories {name: description}, disabled_categories [names], command_mappings {command: category}
     """
     docs = {d["_id"]: d for d in col(BOT_SETTINGS).find(
-        {"_id": {"$in": ["log_channel", "log_categories", "command_mappings"]}})}
-    ch = docs.get("log_channel") if isinstance(docs.get("log_channel"), dict) else {}
+        {"_id": {"$in": ["log_channel", "log_channels", "log_categories", "command_mappings"]}})}
+    legacy = docs.get("log_channel") if isinstance(docs.get("log_channel"), dict) else {}
+    multi = docs.get("log_channels") if isinstance(docs.get("log_channels"), dict) else None
     cats = docs.get("log_categories") if isinstance(docs.get("log_categories"), dict) else {}
     maps = docs.get("command_mappings") if isinstance(docs.get("command_mappings"), dict) else {}
     disabled = _as_list(cats.get("disabled"))
-    for legacy in _as_list(ch.get("disabled_categories")):      # older versions stored switches on the channel doc
-        if legacy not in disabled:
-            disabled.append(legacy)
+    for old in _as_list(legacy.get("disabled_categories")):      # older versions stored switches on the channel doc
+        if old not in disabled:
+            disabled.append(old)
+
+    channels = {}
+    if multi is not None:
+        for k, v in _as_dict(multi.get("channels")).items():
+            channels[str(k)] = v if isinstance(v, dict) else {}
+        default = multi.get("default")
+        routes = _as_dict(multi.get("routes"))
+    else:                                                          # nothing migrated yet: the legacy channel is the only one
+        default = legacy.get("chat_id")
+        routes = {}
+        if default is not None:
+            channels[str(int(default))] = {k: legacy.get(k) for k in ("title", "username", "set_by", "set_at")}
+    if default is None or str(default) not in channels:
+        default = int(next(iter(channels))) if channels else None
+    info = channels.get(str(default), {}) if default is not None else {}
     return {
-        "chat_id": ch.get("chat_id"), "title": ch.get("title", ""), "username": ch.get("username", ""),
-        "set_by": ch.get("set_by"), "set_at": ch.get("set_at"),
+        "chat_id": default, "title": info.get("title", "") or "", "username": info.get("username", "") or "",
+        "set_by": info.get("set_by"), "set_at": info.get("set_at"),
+        "channels": channels,
+        "routes": {"commands": _as_dict(routes.get("commands")), "categories": _as_dict(routes.get("categories"))},
         "custom_categories": _as_dict(cats.get("custom")),
         "disabled_categories": disabled,
         "command_mappings": _as_dict(maps.get("map")),
     }
 
 
+def _ensure_log_channels_doc():
+    """Return the `log_channels` document, creating it (and migrating the legacy single channel) on first use."""
+    d = col(BOT_SETTINGS).find_one({"_id": "log_channels"})
+    if isinstance(d, dict):
+        return d
+    legacy = col(BOT_SETTINGS).find_one({"_id": "log_channel"}) or {}
+    channels, default = {}, None
+    if legacy.get("chat_id") is not None:
+        default = int(legacy["chat_id"])
+        channels[str(default)] = {k: legacy.get(k) for k in ("title", "username", "set_by", "set_at")}
+    try:
+        col(BOT_SETTINGS).update_one(
+            {"_id": "log_channels"},
+            {"$setOnInsert": {"channels": channels, "default": default,
+                              "routes": {"commands": {}, "categories": {}}}},
+            upsert=True)
+    except DuplicateKeyError:
+        pass                                  # a concurrent writer created it first: just read theirs
+    return col(BOT_SETTINGS).find_one({"_id": "log_channels"}) or {}
+
+
 @retry_write
+def add_log_channel(chat_id, title, username, set_by, set_at):
+    """
+    Link one more log channel (or refresh an already linked one). The first channel becomes the default.
+    Returns {"is_default": bool, "already": bool, "count": total channels after the call}.
+    """
+    cid = int(chat_id)
+    doc = _ensure_log_channels_doc()
+    already = str(cid) in _as_dict(doc.get("channels"))
+    col(BOT_SETTINGS).update_one({"_id": "log_channels"}, {"$set": {
+        f"channels.{cid}": {"title": title or "", "username": username or "",
+                            "set_by": int(set_by), "set_at": set_at}}})
+    # Atomic default election: only succeeds while no default exists, so concurrent /setlog calls cannot disagree.
+    col(BOT_SETTINGS).update_one({"_id": "log_channels", "default": None}, {"$set": {"default": cid}})
+    fresh = col(BOT_SETTINGS).find_one({"_id": "log_channels"}) or {}
+    channels = _as_dict(fresh.get("channels"))
+    default = fresh.get("default")
+    if default is None or str(default) not in channels:       # stale default (should not happen): repair it
+        default = cid
+        col(BOT_SETTINGS).update_one({"_id": "log_channels"}, {"$set": {"default": cid}})
+    return {"is_default": int(default) == cid, "already": already, "count": len(channels)}
+
+
 def set_log_channel(chat_id, title, username, set_by, set_at):
-    """Link (or re-link) the log channel. Category settings are stored separately and are kept."""
-    col(BOT_SETTINGS).update_one(
-        {"_id": "log_channel"},
-        {"$set": {"chat_id": int(chat_id), "title": title or "", "username": username or "",
-                  "set_by": int(set_by), "set_at": set_at}},
-        upsert=True,
-    )
+    """Backwards-compatible alias: links the channel (multi-channel aware)."""
+    return add_log_channel(chat_id, title, username, set_by, set_at)
 
 
 @retry_write
+def remove_log_channel(chat_id=None):
+    """
+    Unlink one log channel (chat_id) or all of them (None). Routes that pointed at it are dropped and, when it
+    was the default, another linked channel takes over. Returns {"removed": count, "default": new default|None,
+    "routes_removed": count}. Category switches and custom categories are kept.
+    """
+    doc = _ensure_log_channels_doc()
+    channels = _as_dict(doc.get("channels"))
+    routes = _as_dict(doc.get("routes"))
+    if chat_id is None:
+        n_routes = sum(len(_as_dict(routes.get(k))) for k in ("commands", "categories"))
+        col(BOT_SETTINGS).update_one(
+            {"_id": "log_channels"},
+            {"$set": {"channels": {}, "default": None, "routes": {"commands": {}, "categories": {}}}})
+        col(BOT_SETTINGS).delete_one({"_id": "log_channel"})
+        return {"removed": len(channels), "default": None, "routes_removed": n_routes}
+    cid = int(chat_id)
+    if str(cid) not in channels:
+        return {"removed": 0, "default": doc.get("default"), "routes_removed": 0}
+    unset, n_routes = {f"channels.{cid}": ""}, 0
+    for kind in ("commands", "categories"):
+        for key, target in _as_dict(routes.get(kind)).items():
+            if str(target) == str(cid):
+                unset[f"routes.{kind}.{key}"] = ""
+                n_routes += 1
+    new_default = doc.get("default")
+    if new_default is None or str(new_default) == str(cid) or str(new_default) not in channels:
+        remaining = [int(c) for c in channels if c != str(cid)]
+        new_default = remaining[0] if remaining else None
+    col(BOT_SETTINGS).update_one({"_id": "log_channels"}, {"$unset": unset, "$set": {"default": new_default}})
+    legacy = col(BOT_SETTINGS).find_one({"_id": "log_channel"}) or {}
+    if legacy.get("chat_id") is not None and int(legacy["chat_id"]) == cid:
+        col(BOT_SETTINGS).delete_one({"_id": "log_channel"})
+    return {"removed": 1, "default": new_default, "routes_removed": n_routes}
+
+
 def clear_log_channel():
-    """Unlink the log channel (custom categories and switches are kept). True if one was linked."""
-    return col(BOT_SETTINGS).delete_one({"_id": "log_channel"}).deleted_count == 1
+    """Backwards-compatible alias: unlink every log channel. True if at least one was linked."""
+    return remove_log_channel(None)["removed"] > 0
+
+
+@retry_write
+def set_log_default(chat_id):
+    """Make an already linked channel the default one. False if it is not linked."""
+    doc = _ensure_log_channels_doc()
+    if str(int(chat_id)) not in _as_dict(doc.get("channels")):
+        return False
+    col(BOT_SETTINGS).update_one({"_id": "log_channels"}, {"$set": {"default": int(chat_id)}})
+    return True
+
+
+@retry_write
+def set_log_route(kind, key, chat_id):
+    """
+    Route a category (kind="categories") or a command (kind="commands") to a linked channel.
+    `key` must already be validated (lowercase letters/digits/underscore). Returns the previous channel id or None;
+    raises ValueError when the channel is not linked.
+    """
+    if kind not in ("commands", "categories"):
+        raise ValueError("kind must be 'commands' or 'categories'")
+    doc = _ensure_log_channels_doc()
+    if str(int(chat_id)) not in _as_dict(doc.get("channels")):
+        raise ValueError("channel is not linked")
+    before = col(BOT_SETTINGS).find_one_and_update(
+        {"_id": "log_channels"}, {"$set": {f"routes.{kind}.{key}": int(chat_id)}},
+        return_document=ReturnDocument.BEFORE) or {}
+    return _as_dict(_as_dict(before.get("routes")).get(kind)).get(key)
+
+
+@retry_write
+def clear_log_route(kind, key):
+    """Remove one route (the entry falls back to the next rule / the default channel). True if it existed."""
+    if kind not in ("commands", "categories"):
+        return False
+    res = col(BOT_SETTINGS).update_one(
+        {"_id": "log_channels", f"routes.{kind}.{key}": {"$exists": True}},
+        {"$unset": {f"routes.{kind}.{key}": ""}})
+    return res.modified_count == 1
 
 
 @retry_write
