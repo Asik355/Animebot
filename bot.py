@@ -841,6 +841,53 @@ async def track_group_chat(update, context):
             await asyncio.to_thread(register_auto_spawn_group, cid)
         context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
 
+OWNER_CONTACT_TTL = 60  # seconds: owner username is re-read from Telegram at most once a minute
+
+
+def group_id_html(chat_id):
+    """Group ID as tap-to-copy text (Telegram <code> entity). Always the real chat id passed in."""
+    return f"<code>{html_escape(str(chat_id))}</code>"
+
+
+async def get_owner_contact_html(bot, app=None):
+    """
+    Bot Owner's CURRENT @username, read live from Telegram for the configured owner (ADMIN_IDS[0]).
+    A changed username is picked up automatically (cached for OWNER_CONTACT_TTL seconds only).
+    Falls back to a clickable name/mention if the owner has no username or Telegram can't be reached.
+    """
+    owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+    if not owner_id:
+        return "Not configured"
+    cache = app.bot_data.setdefault("owner_contact_cache", {}) if app is not None else {}
+    cached = cache.get(owner_id)
+    now = time.monotonic()
+    if cached and now - cached[0] < OWNER_CONTACT_TTL:
+        return cached[1]
+    try:
+        owner_chat = await bot.get_chat(owner_id)
+        username = getattr(owner_chat, "username", None)
+        if username:
+            result = f"@{html_escape(username)}"
+        else:
+            name = " ".join(p for p in ((getattr(owner_chat, "first_name", "") or "").strip(),
+                                        (getattr(owner_chat, "last_name", "") or "").strip()) if p) or "Owner"
+            result = f'<a href="tg://user?id={int(owner_id)}">{html_escape(name)}</a>'
+        cache[owner_id] = (now, result)
+        return result
+    except Exception as e:
+        print("Owner username lookup error:", e)
+        if cached:
+            return cached[1]  # stale value is better than nothing
+        return f'<a href="tg://user?id={int(owner_id)}">Bot Owner</a>'
+
+
+async def build_unapproved_group_text(bot, app, chat_id, header=None):
+    owner = await get_owner_contact_html(bot, app)
+    head = header or ("🚫 This group is not approved yet.\n"
+                      "👑 Contact the bot owner to approve this group.")
+    return f"{head}\n👤 Bot Owner: {owner}\n🆔 Group ID: {group_id_html(chat_id)}"
+
+
 async def track_bot_membership(update, context):
     chat = getattr(update, "effective_chat", None)
     member_update = getattr(update, "my_chat_member", None)
@@ -861,11 +908,8 @@ async def track_bot_membership(update, context):
             try:
                 await context.bot.send_message(
                     chat_id=chat.id,
-                    text=(
-                        "🚫 This group is not approved yet.\n"
-                        "👑 Contact the bot owner to approve this group.\n"
-                        f"🆔 Group ID: {chat.id}"
-                    ),
+                    text=await build_unapproved_group_text(context.bot, context.application, chat.id),
+                    parse_mode="HTML",
                 )
             except Exception as e:
                 print(f"Unapproved group notice error for {chat.id}:", e)
@@ -877,12 +921,13 @@ async def track_bot_membership(update, context):
                     await context.bot.send_message(
                         chat_id=owner_id,
                         text=(
-                            "🚫 New group needs approval.\n\n"
-                            f"🏷️ Group: {chat.title or 'Unknown'}\n"
-                            f"🆔 Chat ID: {chat.id}\n"
-                            f"👤 Added by: {added_by_text}\n\n"
-                            f"Approve with: /approve {chat.id}"
+                            "🔔 New Group Approval Request\n"
+                            f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
+                            f"🆔 Group ID: {group_id_html(chat.id)}\n"
+                            f"👤 Requested by: {html_escape(added_by_text)}\n\n"
+                            f"Approve with: <code>/approve {html_escape(str(chat.id))}</code>"
                         ),
+                        parse_mode="HTML",
                     )
                 except Exception as e:
                     print("Owner group-approval notification error:", e)
@@ -8559,7 +8604,7 @@ async def post_shutdown(app):
             except Exception as e:
                 print(f"{label} shutdown error:", e)
 
-UNAPPROVED_GROUP_WARNING = (
+UNAPPROVED_GROUP_WARNING_HEAD = (
     "🚫 Bot is OFF in this group.\n"
     "⚠️ Owner approval is mandatory before any bot function can work here.\n"
     "❌ Spawn, catch, sell, transfer, daily, callbacks and other bot actions are blocked.\n\n"
@@ -8645,7 +8690,8 @@ async def block_unapproved_group(update, context):
         if command_name in known and msg is not None and _warning_allowed(
                 context.application, chat.id, message_id=msg.message_id):
             try:
-                await safe_reply_text(msg, UNAPPROVED_GROUP_WARNING)
+                await safe_reply_text(msg, await build_unapproved_group_text(
+                    context.bot, context.application, chat.id, UNAPPROVED_GROUP_WARNING_HEAD), parse_mode="HTML")
             except Exception as e:
                 print("Unapproved warning error:", e)
         raise ApplicationHandlerStop
@@ -8681,7 +8727,8 @@ async def block_unapproved_callback(update, context):
             pass
         try:
             if _warning_allowed(context.application, chat.id):          # taps never spam the group
-                await safe_reply_text(query.message, UNAPPROVED_GROUP_WARNING)
+                await safe_reply_text(query.message, await build_unapproved_group_text(
+                    context.bot, context.application, chat.id, UNAPPROVED_GROUP_WARNING_HEAD), parse_mode="HTML")
         except Exception:
             pass
         raise ApplicationHandlerStop
