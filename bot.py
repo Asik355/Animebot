@@ -586,6 +586,24 @@ async def remove_group_approval_permission(update, context):
     else:
         await safe_reply_text(update.effective_message, "❌ That Executive does not have group approval permission.")
 
+GROUP_APPROVED_TEXT = (
+    "✅ Group Approved\n\n"
+    "This group has been approved successfully.\n\n"
+    "🤖 The bot is now fully active in this group.\n"
+    "All commands and features are now available and will work normally."
+)
+
+
+async def send_group_approved_confirmation(context, chat_id):
+    """Post the approval confirmation into the approved group. Never raises: approval stays valid if this fails."""
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=GROUP_APPROVED_TEXT)
+        return True
+    except Exception as e:
+        print(f"Group approval confirmation error for {chat_id}:", e)
+        return False
+
+
 async def approve_group(update, context):
     uid = update.effective_user.id
     if not (await asyncio.to_thread(has_group_approval_permission, uid)):
@@ -605,15 +623,21 @@ async def approve_group(update, context):
 
     groups = (await asyncio.to_thread(load_approved_groups))
     groups.add(chat_id)
-    (await asyncio.to_thread(save_approved_groups, groups))
+    saved = (await asyncio.to_thread(save_approved_groups, groups))
     (await asyncio.to_thread(set_bot_enabled, chat_id, True))
     (await asyncio.to_thread(register_auto_spawn_group, chat_id))
     context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
     context.application.bot_data.setdefault("unapproved_notified", set()).discard(chat_id)
+    # Confirmation goes to the exact group that was just approved, only after the approval was saved.
+    group_notified = (saved is not False) and (await send_group_approved_confirmation(context, chat_id))
     if chat.type in ("group", "supergroup"):
-        await safe_reply_text(update.message, "✅ Group successfully approved by the Owner.\n🤖 The bot is now active in this group.")
+        if not group_notified:  # the confirmation above already answers in the group; fall back to the old reply
+            await safe_reply_text(update.message, "✅ Group successfully approved by the Owner.\n🤖 The bot is now active in this group.")
     else:
-        await safe_reply_text(update.message, f"✅ Group {chat_id} successfully approved.\n🤖 The bot is now active in that group.")
+        dm_text = f"✅ Group {chat_id} successfully approved.\n🤖 The bot is now active in that group."
+        if not group_notified:
+            dm_text += "\n⚠️ Could not post the confirmation in that group (the bot may no longer be a member). The approval itself is saved."
+        await safe_reply_text(update.message, dm_text)
 
     await notify_staff_action(
         context,
@@ -925,7 +949,7 @@ async def track_bot_membership(update, context):
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
                             f"🆔 Group ID: {group_id_html(chat.id)}\n"
                             f"👤 Requested by: {html_escape(added_by_text)}\n\n"
-                            f"Approve with: <code>/approve {html_escape(str(chat.id))}</code>"
+                            f"Approve with: /approve {html_escape(str(chat.id))}"
                         ),
                         parse_mode="HTML",
                     )
