@@ -8772,6 +8772,69 @@ async def block_unapproved_callback(update, context):
             pass
         raise ApplicationHandlerStop
 
+# ---------------------------------------------------------------------------------------------------
+# HUMAN-ONLY USAGE RULE: bot accounts and channels can never use this bot.
+# One central gate (handler group -300, runs before every other handler); humans (private chats and
+# groups, including anonymous group admins) pass through untouched.
+# ---------------------------------------------------------------------------------------------------
+HUMAN_ONLY_TEXT = "\u274c Bots and channels are not allowed to access this bot."
+
+
+def _human_only_sender_kind(update):
+    """'bot' / 'channel' when the actual requester is a bot account or a channel, else None (human)."""
+    if update.channel_post is not None or update.edited_channel_post is not None:
+        return "channel"
+    msg = update.message or update.edited_message
+    if msg is not None:
+        sender_chat = getattr(msg, "sender_chat", None)
+        if sender_chat is not None:
+            chat = getattr(msg, "chat", None)
+            if getattr(sender_chat, "type", None) in ("group", "supergroup") and chat is not None \
+                    and sender_chat.id == chat.id:
+                return None            # anonymous group admin: a human posting as the group itself
+            return "channel"           # "send as channel" posts in groups
+        if getattr(msg, "is_automatic_forward", None):
+            return "channel"           # linked-channel post auto-forwarded into the discussion group
+        user = getattr(msg, "from_user", None)
+        return "bot" if user is not None and getattr(user, "is_bot", False) else None
+    query = update.callback_query or update.inline_query
+    user = getattr(query, "from_user", None) if query is not None else None
+    return "bot" if user is not None and getattr(user, "is_bot", False) else None
+
+
+async def human_only_gate(update, context):
+    kind = _human_only_sender_kind(update)
+    if kind is None:
+        return
+    # Existing logging system exemption: any log command (/setlog, /logroute, /logmap, ... = LOG_COMMANDS) is
+    # passed on untouched to the existing handlers and their own Owner/permission checks (e.g. /setlog posted
+    # inside a channel). The text is parsed WITHOUT the bot username on purpose: the existing channel
+    # /setlog handler accepts "/setlog@AnyName", so this must too.
+    _msg = update.effective_message
+    if _msg is not None and update.callback_query is None and update.inline_query is None:
+        _cmd, _args = _parse_command(_msg.text)
+        if _cmd in LOG_COMMANDS:
+            return
+    # Notify only when it is really an attempt to USE the bot (a command for this bot, a button/inline
+    # request, or any message in a private chat). Other bot/channel chatter is dropped silently so
+    # groups are never spammed and two bots can never answer each other in a loop.
+    try:
+        if update.callback_query is not None:
+            await update.callback_query.answer(HUMAN_ONLY_TEXT, show_alert=True)
+        elif update.inline_query is not None:
+            await update.inline_query.answer([], cache_time=0)
+        else:
+            msg = update.effective_message
+            chat = update.effective_chat
+            if msg is not None and chat is not None:
+                command, _args = _parse_command(msg.text or msg.caption, getattr(context.bot, "username", None))
+                if command or chat.type == "private":
+                    await context.bot.send_message(chat_id=chat.id, text=HUMAN_ONLY_TEXT)
+    except Exception as e:
+        print("Human-only gate reply error:", e)
+    raise ApplicationHandlerStop
+
+
 async def restrict(update, context):
     uid = update.effective_user.id
     if not (is_owner(uid) or is_executive(uid)):
@@ -9277,6 +9340,8 @@ def main():
         .build()
     )
 
+    from telegram.ext import TypeHandler as _HumanOnlyTypeHandler
+    app.add_handler(_HumanOnlyTypeHandler(Update, human_only_gate), group=-300)   # Human-only rule: runs before everything
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_chat, block=False), group=-101)
 
     app.add_handler(MessageHandler(filters.ALL, block_unapproved_group), group=-100)
