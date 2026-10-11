@@ -961,6 +961,28 @@ async def track_bot_membership(update, context):
         (await asyncio.to_thread(unregister_bot_group, chat.id))
         (await asyncio.to_thread(unregister_auto_spawn_group, chat.id))
         context.application.bot_data.setdefault("active_chats", set()).discard(chat.id)
+        # Bot removed/kicked by someone: tell the owner (PM) and the linked log channel who did it.
+        try:
+            remover = getattr(member_update, "from_user", None)
+            if remover and remover.id != context.bot.id:
+                notice = (
+                    "🚪 Bot removed from a group\n"
+                    f"🏷 Group: {chat.title or 'Unknown'}\n"
+                    f"🆔 Group ID: {chat.id}\n"
+                    f"👤 Removed by: {display_user(remover)}\n"
+                    f"🕒 {log_time_text()}"
+                )
+                owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+                if owner_id:
+                    try:
+                        await context.bot.send_message(chat_id=owner_id, text=notice)
+                    except Exception as e:
+                        print("Owner bot-removed notification error:", e)
+                cfg = await get_log_config()
+                if cfg and cfg.get("chat_id") is not None:
+                    enqueue_log_routed(context.application, cfg, notice)
+        except Exception as e:
+            print("Bot-removed notification error:", e)
 
 SPAWN_LIFETIME = 20 * 60  # 20 minutes
 AUTO_SPAWN_INTERVAL = 30 * 60  # 30 minutes
