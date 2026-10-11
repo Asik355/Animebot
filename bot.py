@@ -964,7 +964,10 @@ async def track_bot_membership(update, context):
         # Bot removed/kicked by someone: tell the owner (PM) and the linked log channel who did it.
         try:
             remover = getattr(member_update, "from_user", None)
-            if remover and remover.id != context.bot.id:
+            recent = context.application.bot_data.setdefault("bot_removed_notified", {})
+            now_mono = time.monotonic()
+            if remover and remover.id != context.bot.id and now_mono - recent.get(chat.id, -999.0) > 30:
+                recent[chat.id] = now_mono
                 notice = (
                     "🚪 Bot removed from a group\n"
                     f"🏷 Group: {chat.title or 'Unknown'}\n"
