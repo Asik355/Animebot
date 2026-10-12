@@ -3376,6 +3376,22 @@ async def mystats(update, context):
 SHOP_RARITIES = ("Common", "Rare", "Legendary", "Mythical")
 SHOP_REFRESH_COST = 100
 SHOP_PRICE_MULTIPLIER = 5
+# Buying one of these rarities from the shop earns 1 FREE refresh (0 ⦵). Credits stack and never expire.
+SHOP_FREE_REFRESH_RARITIES = ("Legendary", "Mythical")
+
+def get_free_refresh_credits(user_id):
+    doc = _mc("shop_free_refresh_v1").find_one({"_id": int(user_id)}, {"credits": 1})
+    return int((doc or {}).get("credits", 0) or 0)
+
+def grant_free_refresh(user_id, amount=1, session=None):
+    _mc("shop_free_refresh_v1").update_one(
+        {"_id": int(user_id)}, {"$inc": {"credits": int(amount)}}, upsert=True, session=session)
+
+def consume_free_refresh(user_id):
+    """Atomically use 1 credit. True only if a credit was really available."""
+    res = _mc("shop_free_refresh_v1").update_one(
+        {"_id": int(user_id), "credits": {"$gt": 0}}, {"$inc": {"credits": -1}})
+    return res.modified_count == 1
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def shop_rotation_key(dt=None):
@@ -3441,21 +3457,23 @@ def get_shop_rows(user_id):
             rows.append((d["slot"], ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], d.get("rotation_key")))
     return rows
 
-def shop_keyboard(user_id, page, price, bought=False, total=4):
+def shop_keyboard(user_id, page, price, bought=False, total=4, free_credits=0):
     prev_page = (page - 1) % total
     next_page = (page + 1) % total
     buy_label = "✅ BOUGHT" if bought else f"🛒 BUY FOR {price} ⦵"
     buy_action = "bought" if bought else "buy"
+    refresh_label = (f"🎁 FREE REFRESH — 0 ⦵ (x{free_credits})" if free_credits > 0
+                     else f"🔄 REFRESH — {SHOP_REFRESH_COST} ⦵")
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton("◀️ BACK", callback_data=f"shop:page:{user_id}:{prev_page}"),
             InlineKeyboardButton("▶️ NEXT", callback_data=f"shop:page:{user_id}:{next_page}"),
         ],
-        [InlineKeyboardButton("🔄 REFRESH — 100 ⦵", callback_data=f"shop:refresh:{user_id}:0")],
+        [InlineKeyboardButton(refresh_label, callback_data=f"shop:refresh:{user_id}:0")],
         [InlineKeyboardButton(buy_label, callback_data=f"shop:{buy_action}:{user_id}:{page}")],
     ])
 
-def build_shop_caption(row, page, total=4):
+def build_shop_caption(row, page, total=4, free_credits=0):
     _, code, name, anime, rarity, worth, photo, _rotation_key = row
     price = int(worth) * SHOP_PRICE_MULTIPLIER
     return (
@@ -3467,7 +3485,8 @@ def build_shop_caption(row, page, total=4):
         f"🪙 Buy Price: {price} ⦵\n\n"
         f"📦 Shop: {page + 1}/{total}\n"
         "🕓 Daily reset: 4:00 AM IST\n"
-        "🔄 Manual refresh: 100 ⦵"
+        + (f"🎁 Free refreshes: {free_credits} (earned from Legendary/Mythical buys)" if free_credits > 0
+           else f"🔄 Manual refresh: {SHOP_REFRESH_COST} ⦵")
     )
 
 async def render_shop(target, context, user_id, page=0, edit=False):
@@ -3491,10 +3510,11 @@ async def render_shop(target, context, user_id, page=0, edit=False):
 
         page = int(page) % 4
         row = rows[page]
-        caption = add_display_name_header(target.message, build_shop_caption(row, page, 4))
+        free_credits = (await asyncio.to_thread(get_free_refresh_credits, user_id))
+        caption = add_display_name_header(target.message, build_shop_caption(row, page, 4, free_credits))
         price = int(row[5]) * SHOP_PRICE_MULTIPLIER
         bought = (await asyncio.to_thread(_mc("shop_purchases_v2").find_one, {"user_id": int(user_id), "rotation_key": row[7], "slot": row[0]})) is not None
-        keyboard = shop_keyboard(user_id, page, price, bought=bought)
+        keyboard = shop_keyboard(user_id, page, price, bought=bought, free_credits=free_credits)
         photo = row[6]
 
         if edit:
@@ -3582,12 +3602,14 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "refresh":
         spent = False
+        used_free = False
         try:
             balance = (await asyncio.to_thread(mongo_db.get_coins, owner_id))
             if balance is None:
                 await query.answer("❌ Your account could not be found.", show_alert=True)
                 return
-            if int(balance or 0) < SHOP_REFRESH_COST:
+            has_free = (await asyncio.to_thread(get_free_refresh_credits, owner_id)) > 0
+            if not has_free and int(balance or 0) < SHOP_REFRESH_COST:
                 await query.answer("❌ You need 100 ⦵ to refresh the shop.", show_alert=True)
                 return
 
@@ -3601,7 +3623,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_rows = (await asyncio.to_thread(choose_shop_characters, exclude_codes=current_codes | other_user_codes))
             if not new_rows or len(new_rows) != len(SHOP_RARITIES):
                 await query.answer(
-                    "❌ I couldn't find 4 unused characters for your new shop. Your 100 ⦵ were not deducted.",
+                    "❌ I couldn't find 4 unused characters for your new shop. Nothing was deducted.",
                     show_alert=True,
                 )
                 return
@@ -3609,13 +3631,16 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_codes = {str(row[0]) for row in new_rows}
             if current_codes & new_codes:
                 await query.answer(
-                    "❌ New shop still contains an old character. Your 100 ⦵ were not deducted.",
+                    "❌ New shop still contains an old character. Nothing was deducted.",
                     show_alert=True,
                 )
                 return
 
             # atomic conditional deduct, then swap the 4 shop rows in one transaction
-            if not (await asyncio.to_thread(mongo_db.spend_coins, owner_id, SHOP_REFRESH_COST)):
+            # a free-refresh credit is used first (0 ⦵); otherwise pay the normal cost
+            if (await asyncio.to_thread(consume_free_refresh, owner_id)):
+                used_free = True
+            elif not (await asyncio.to_thread(mongo_db.spend_coins, owner_id, SHOP_REFRESH_COST)):
                 await query.answer("❌ You need 100 ⦵ to refresh the shop.", show_alert=True)
                 return
             spent = True
@@ -3629,14 +3654,17 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             if spent:
                 try:
-                    (await asyncio.to_thread(mongo_db.add_coins, owner_id, SHOP_REFRESH_COST))
+                    if used_free:
+                        (await asyncio.to_thread(grant_free_refresh, owner_id, 1))
+                    else:
+                        (await asyncio.to_thread(mongo_db.add_coins, owner_id, SHOP_REFRESH_COST))
                 except Exception as undo_err:
                     print("Shop refresh refund error:", undo_err)
             print("Shop refresh error:", e)
-            await query.answer("❌ Refresh failed. Your 100 ⦵ were not deducted.", show_alert=True)
+            await query.answer("❌ Refresh failed. Nothing was deducted.", show_alert=True)
             return
 
-        await query.answer("✅ Shop refreshed! -100 ⦵")
+        await query.answer("✅ Free refresh used! -0 ⦵" if used_free else "✅ Shop refreshed! -100 ⦵")
         await render_shop(query, context, owner_id, 0, edit=True)
         return
 
@@ -3663,6 +3691,8 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not mongo_db.spend_coins(owner_id, price, session=session):
                     return False
                 mongo_db.add_collection(owner_id, code, india_timestamp(), session=session)
+                if rarity in SHOP_FREE_REFRESH_RARITIES:
+                    grant_free_refresh(owner_id, 1, session=session)
                 mongo_db.insert_with_id("shop_purchases_v2", {
                     "user_id": owner_id, "rotation_key": key, "slot": page, "character_code": code,
                     "price": price, "purchased_at": india_timestamp(),
@@ -3677,8 +3707,11 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Purchase failed. Your ⦵ were not deducted.", show_alert=True)
             return
 
-        await query.answer(f"✅ {name} bought for {price} ⦵")
-        keyboard = shop_keyboard(owner_id, page, price, bought=True)
+        got_free = rarity in SHOP_FREE_REFRESH_RARITIES
+        await query.answer(f"✅ {name} bought for {price} ⦵" + ("\n🎁 You earned a FREE shop refresh!" if got_free else ""),
+                           show_alert=got_free)
+        free_credits = (await asyncio.to_thread(get_free_refresh_credits, owner_id))
+        keyboard = shop_keyboard(owner_id, page, price, bought=True, free_credits=free_credits)
         try:
             await query.message.edit_reply_markup(reply_markup=keyboard)
         except Exception as e:
