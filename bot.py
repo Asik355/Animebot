@@ -1327,7 +1327,6 @@ def _build_help_text_raw():
         "/addlist — View character add/edit ranking\n\n"
         "🎯 Catching & Rewards\n"
         "/spawn — Spawn a character in the group\n"
-        "/cooldown — View character cooldowns for this group\n"
         "/add — Catch the spawned character\n"
         "/daily — Claim your daily reward\n"
         "/sell <code/name> [quantity] — Sell a character\n"
@@ -1420,19 +1419,24 @@ HELP_MODULES = {
              ("/resetrules", "Clear all rules (Owner only, private chat only)")])),
         ("staff", "👔 Staff Roles", _help_page(
             "👔 Staff Roles (Owner only)",
-            "Manage Executives and who may approve groups.",
+            "Manage Executives, Scouts and who may approve groups.",
             [("/addexec <user_id>", "Add an Executive"),
              ("/removeexec <user_id>", "Remove an Executive"),
+             ("/addscout <user_id>", "Add a Scout"),
+             ("/removescout <user_id>", "Remove a Scout"),
+             ("/scouts", "View the Scout list (public: every user can run it)"),
              ("/addgroupapprove <executive_user_id>", "Let an Executive approve/remove groups"),
              ("/removegroupapprove <executive_user_id>", "Take that permission away")],
-            "The Executive and Scout lists are public: /executives and /scouts. Scouts are added with /addscout.")),
+            "The Executive and Scout lists are public: /executives and /scouts.")),
         ("groups", "🏘 Groups", _help_page(
             "🏘 Groups",
             "Approve groups, remove them, and check the bot's state.",
             [("/approve", "In a group: approve it. In PM: /approve <group_chat_id> (Owner, or an Executive with permission)"),
              ("/removeapprove", "In PM: /removeapprove <group_chat_id>"),
              ("/leavegroup", "In PM: /leavegroup <group_chat_id> — remove the group and leave it"),
-             ("/status", "Bot status and active spawns")])),
+             ("/status", "Bot status and active spawns"),
+             ("/gstats", "View bot group statistics"),
+             ("/cooldown", "View character cooldowns for this group (group only)")])),
         ("characters", "🎴 Characters", _help_page(
             "🎴 Characters (Owner only)",
             "Spawn, gift, discontinue and delete characters.",
@@ -1469,23 +1473,20 @@ HELP_MODULES = {
     "executive": [
         ("restrict", "🚫 Restrictions", _help_page(
             "🚫 Restrictions (Owner & Executive)",
-            "Temporarily block a user from the bot. Durations: 1h, 10h, 1d up to 365d; they expire automatically.",
+            "Temporarily block a user from the bot (durations: 1h, 10h, 1d up to 365d; they expire automatically), or stop character transfers between two specific users.",
             [("/restrict <duration> [reason]", "Reply to the user"),
              ("/restrict <user_id> <duration> [reason]", "By user ID"),
              ("/unrestrict", "Reply to the user to lift the restriction"),
              ("/unrestrict <user_id>", "Lift by user ID"),
-             ("/restrictions", "View all active restrictions")])),
-        ("transfers", "🔁 Transfer Blocks", _help_page(
-            "🔁 Transfer Blocks (Owner & Executive)",
-            "Stop character transfers between two specific users.",
-            [("/btransfer <user_id_1> <user_id_2>", "Block transfers between the pair"),
-             ("/unbtransfer <user_id_1> <user_id_2>", "Remove the block")])),
+             ("/restrictions", "View all active restrictions"),
+             ("/btransfer <user_id_1> <user_id_2>", "Block character transfers between the pair"),
+             ("/unbtransfer <user_id_1> <user_id_2>", "Remove the transfer block")])),
         ("groupctl", "🤖 Group Control", _help_page(
             "🤖 Group Control (Owner & Executive)",
-            "Switch the bot on or off per group and view group statistics.",
+            "Switch the bot on or off per group and fix spawns that got stuck.",
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
-             ("/gstats", "View bot group statistics")])),
+             ("/clearspawn", "Clear a stuck active spawn (group only)")])),
         ("broadcast", "📣 Broadcast", _help_page(
             "📣 Broadcast (Owner & Executive)",
             "Send one announcement to every linked group.",
@@ -1556,9 +1557,24 @@ HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private cha
 #   action = open | back | owner | executive | scout        (menu_owner_id = the user who ran /help or /start)
 
 
+def _help_module_visible(key, user_id):
+    """Spawn Tools is for Scouts only (Owner/Executive use /clearspawn from Group Control);
+    Scout Mgmt is hidden from the Owner (who has the commands in Staff Roles)."""
+    try:
+        uid = int(user_id)
+    except (TypeError, ValueError):
+        return True
+    if key == "spawntools" and (is_owner(uid) or is_executive(uid)):
+        return False
+    if key == "scouts" and is_owner(uid):
+        return False
+    return True
+
+
 def help_grid_keyboard(role, owner_id):
     """LAYER 2: module buttons in a strict 3-column grid + « Back to Layer 1 (main help)."""
-    buttons = [_module_button(label, f"help:{owner_id}:{role}:{key}") for key, label, _text in HELP_MODULES[role]]
+    buttons = [_module_button(label, f"help:{owner_id}:{role}:{key}") for key, label, _text in HELP_MODULES[role]
+               if _help_module_visible(key, owner_id)]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:back")])
     return InlineKeyboardMarkup(rows)
@@ -1571,7 +1587,7 @@ def help_grid_text(role):
 def help_detail(role, key, owner_id):
     """LAYER 3: (text, keyboard) for one module, or None for an unknown key. « Back returns to Layer 2."""
     for k, _label, text in HELP_MODULES[role]:
-        if k == key:
+        if k == key and _help_module_visible(k, owner_id):
             return text, InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
     return None
@@ -2674,7 +2690,10 @@ async def spawn(update, context):
     )
 
 async def cooldown(update, context):
-    """Show this group's auto-spawn/life state and up to 10 character cooldowns."""
+    """Show this group's auto-spawn/life state and up to 10 character cooldowns (Owner only)."""
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
+        return
     if not await require_group_spawn(update):
         return
     chat_id = update.effective_chat.id
@@ -6059,7 +6078,7 @@ async def _safe_edit_text(message, text, **kwargs):
 
 
 async def gstats(update, context):
-    if not (is_owner(update.effective_user.id) or is_executive(update.effective_user.id)):
+    if not is_owner(update.effective_user.id):
         await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
         return
 
@@ -6203,7 +6222,7 @@ async def gstats(update, context):
 async def gstats_callback(update, context):
     query = update.callback_query
     user_id = query.from_user.id
-    if not (is_owner(user_id) or is_executive(user_id)):
+    if not is_owner(user_id):
         await deny_callback(query)
         return
 
@@ -9428,7 +9447,7 @@ PUBLIC_COMMANDS = {
     "start", "help", "spawn", "add", "mycollection", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
-    "shop", "exchange", "guess_num", "nguess", "cooldown", "rules"
+    "shop", "exchange", "guess_num", "nguess", "rules"
 }
 
 def make_bot_commands(names):
@@ -10064,7 +10083,7 @@ async def scout_list_command(update, context):
 EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editcharacter", "restrict", "unrestrict", "restrictions",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory", "addmessage",
-    "btransfer", "unbtransfer", "gstats", "setrules",
+    "btransfer", "unbtransfer", "setrules",
 }
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editcharacter", "clearspawn", "notifications", "notificationoff", "notificationon",
@@ -10126,7 +10145,7 @@ OWNER_COMMANDS = {
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
     "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "removechar", "boton",
-    "status", "gstats", "notifications", "notificationoff", "notificationon",
+    "status", "gstats", "cooldown", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
