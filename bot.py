@@ -1435,6 +1435,17 @@ HELP_MODULES = {
             "📊 History (Owner only)",
             "Look back at what the bot has been doing.",
             [("/history [1-50]", "Recent spawn history")])),
+        ("data", "🗂 Data", _help_page(
+            "🗂 Data (Owner only)",
+            "Delete, back up, restore and transfer a user's game data. Use the commands in private chat.",
+            [("/deleteuser <user_id>", "Preview what would be deleted for that user"),
+             ("/deleteuser <user_id> confirm", "Permanently delete that user's data (no backup is made)"),
+             ("/restoreuser <user_id>", "Show the latest backup of a deleted user, then press ✅ Confirm Restore (private chat). Refused if the user already has data or the backup was already transferred"),
+             ("/moveuser <old_id> <new_id>", "Show a preview of copying a deleted account's data to the same person's NEW account (it must have pressed /start first), then press ✅ Confirm Transfer. The old data or backup is kept and cannot be transferred twice"),
+             ("/removechar <user_id> <code/name> [quantity]", "Remove characters from a user's collection (also listed under Characters)")],
+            "🔔 Deleted-account notices: when the bot thinks an account may be deleted it sends you a notice with "
+            "🗑️ Delete Data and ❌ Keep Data. Delete Data asks for a second confirmation and saves a backup first; "
+            "nothing is ever deleted automatically.")),
     ],
     "executive": [
         ("restrict", "🚫 Restrictions", _help_page(
@@ -5102,6 +5113,841 @@ async def delete(update, context):
         actor_id=update.effective_user.id,
     )
 
+def purge_user_data(user_id):
+    """Remove a user completely: characters, coins/profile, favorites, shop rows, free-refresh credits."""
+    uid = int(user_id)
+    def _work(session):
+        copies = _mc(mongo_db.COLLECTIONS).delete_many({"user_id": uid}, session=session).deleted_count
+        _mc(mongo_db.FAVORITES).delete_one({"_id": uid}, session=session)
+        _mc(mongo_db.NOTIFICATIONS).delete_one({"_id": uid}, session=session)
+        _mc("shop_v3").delete_many({"user_id": uid}, session=session)
+        _mc("shop_purchases_v2").delete_many({"user_id": uid}, session=session)
+        _mc("shop_free_refresh_v1").delete_one({"_id": uid}, session=session)
+        removed = _mc(mongo_db.USERS).delete_one({"_id": uid}, session=session).deleted_count
+        return copies, removed
+    return mongo_db.run_transaction(_work)
+
+DELETED_SWEEP_HOURS = float(os.getenv("DELETED_ACCOUNT_SWEEP_HOURS", "6"))
+DELETED_SWEEP_STRIKES = 2          # consecutive sweeps that must flag an account before the owner is asked about it
+DELETED_KEEP_DAYS = float(os.getenv("DELETED_ACCOUNT_KEEP_DAYS", "30"))   # after "Keep Data", don't ask again for this long
+DELETED_MAX_NOTIFY_PER_SWEEP = 10  # never flood the owner; the rest are picked up by later sweeps
+DELETED_CONFIRM_SECONDS = 600      # how long the "Yes, delete permanently" screen stays valid after Delete Data
+
+# Review state is stored on the existing users document (no new collection; mongo_db only ever $set/$inc's
+# users documents, so these extra fields are never wiped and never break existing code):
+#   deleted_review       = "pending"  -> owner was notified and has not answered yet (no repeat notifications)
+#                          "kept"     -> owner chose Keep Data (suppressed for DELETED_KEEP_DAYS)
+#                          "deleting" -> a confirmed deletion is running right now (blocks double taps)
+#   deleted_review_token = random id of ONE notification; every button carries it, so buttons from an
+#                          old/cancelled/answered notification can never act on a newer review
+#   deleted_review_at    = unix time of the last state change
+#   deleted_review_confirm_at = unix time the owner pressed Delete Data (opened the confirmation screen);
+#                          the final "Yes" is only accepted for DELETED_CONFIRM_SECONDS after this
+_DELETED_REVIEW_FIELDS = {"deleted_review": "", "deleted_review_at": "", "deleted_review_reason": "",
+                          "deleted_review_token": "", "deleted_review_confirm_at": ""}
+_DELETED_CB_RE = re.compile(r"^delacct:(ask|keep|yes|no):(-?\d+):([0-9a-f]{10})$")
+
+def _deleted_review_protected(uid):
+    """Owner IDs (and anything that is not a normal positive user id) never enter this workflow."""
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        return True
+    return uid <= 0 or is_owner(uid) or uid in ADMIN_IDS
+
+async def _telegram_account_deleted(bot, uid):
+    """
+    Classify what Telegram says about a user. NOTHING here ever deletes data.
+      "deleted"     = Telegram returned a profile named "Deleted Account" with no username and no last name
+                      (strong signal, but still only a signal: the owner always decides)
+      "unreachable" = Telegram said "chat not found"/"user not found" (WEAK signal: this also happens for users
+                      who never started the bot, blocked it, or during a temporary API problem - never proof)
+      False         = the account exists
+      None          = could not tell (network error, timeout, rate limit, anything uncertain)
+    """
+    try:
+        chat = await bot.get_chat(uid)
+    except RetryAfter as e:
+        await asyncio.sleep(float(e.retry_after) + 1)
+        return None
+    except BadRequest as e:
+        reason = str(e).lower()
+        return "unreachable" if ("chat not found" in reason or "user not found" in reason) else None
+    except Exception:
+        return None
+    if (getattr(chat, "first_name", None) or "").strip().lower() != "deleted account":
+        return False
+    if getattr(chat, "username", None) or (getattr(chat, "last_name", None) or "").strip():
+        return False                                   # a live account that merely uses that name
+    return "deleted"
+
+def _deleted_review_keyboard(uid, token):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🗑️ Delete Data", callback_data=f"delacct:ask:{uid}:{token}"),
+        InlineKeyboardButton("❌ Keep Data", callback_data=f"delacct:keep:{uid}:{token}"),
+    ]])
+
+async def _notify_owner_possible_deleted(app, uid, signal, strikes, token):
+    """Send the owner a review message. Returns True only if Telegram accepted it (really delivered)."""
+    owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+    if owner_id is None or _deleted_review_protected(uid):
+        return False
+    try:
+        names = await asyncio.to_thread(mongo_db.get_user_names, uid)
+        owned = await asyncio.to_thread(lambda: _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid}))
+    except Exception as e:
+        print(f"Possible-deleted-account lookup error for {uid}:", e)
+        names, owned = None, "unknown"
+    first, last, username = names if names else ("Unknown", "", "")
+    display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
+    if signal == "deleted":
+        why = "STRONG signal: Telegram shows this profile as \"Deleted Account\"."
+    else:
+        why = ("UNCERTAIN result: Telegram reports the chat/user as not found. This can also mean the user never "
+               "started the bot, blocked it, or a temporary Telegram problem.")
+    text = (
+        "⚠️ POSSIBLE DELETED ACCOUNT\n\n"
+        f"🆔 ID: {uid}\n"
+        f"👤 Name: {display}\n"
+        f"🔗 Username: {('@' + username) if username else 'none'}\n"
+        f"🎴 Characters: {owned}\n"
+        f"🔎 Why flagged: {why}\n"
+        f"📊 Flagged in {strikes} checks.\n\n"
+        "Nothing has been deleted. Choose what to do with this user's data:"
+    )
+    try:
+        await app.bot.send_message(chat_id=owner_id, text=text, reply_markup=_deleted_review_keyboard(uid, token))
+        return True
+    except Exception as e:
+        print(f"Possible-deleted-account notification error for {uid}:", e)
+        return False
+
+async def sweep_deleted_accounts(app):
+    """
+    Look for users whose Telegram account MAY be deleted and ask the bot owner what to do.
+    This sweep NEVER deletes any data. Deletion only happens after the owner presses Delete Data
+    and then explicitly confirms (see deleted_account_review_callback), or via /deleteuser.
+    """
+    users = _mc(mongo_db.USERS)
+    rows = await asyncio.to_thread(lambda: list(users.find(
+        {}, {"_id": 1, "missing_strikes": 1, "deleted_review": 1, "deleted_review_at": 1})))
+    checked = 0
+    found = []                                         # (uid, state, strikes_if_recorded)
+    now = time.time()
+    for row in rows:
+        try:
+            uid = int(row["_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if _deleted_review_protected(uid):
+            continue
+        review = row.get("deleted_review")
+        if review == "kept" and (now - float(row.get("deleted_review_at") or 0)) < max(0.0, DELETED_KEEP_DAYS) * 86400:
+            continue                                   # owner said Keep Data recently
+        state = await _telegram_account_deleted(app.bot, uid)
+        checked += 1
+        await asyncio.sleep(0.06)                      # stay far below Telegram's rate limits
+        if state is None:
+            continue                                   # uncertain: no strike, no notice, nothing
+        if state is False:
+            unset = {}
+            if row.get("missing_strikes"):
+                unset["missing_strikes"] = ""
+            if review in ("pending", "kept"):
+                unset.update(_DELETED_REVIEW_FIELDS)   # the account is alive again: drop any stale review state
+            if unset:
+                try:
+                    await asyncio.to_thread(users.update_one, {"_id": uid}, {"$unset": unset})
+                except Exception as e:
+                    print(f"Deleted-account review reset error for {uid}:", e)
+            continue
+        if review in ("pending", "deleting"):
+            continue                                   # owner already notified: never notify twice
+        found.append((uid, state, int(row.get("missing_strikes") or 0) + 1))
+    # Safety brake, applied BEFORE any strike is written: many weak "not found" results at once means a
+    # Telegram/API problem or users who never started the bot, so those results are discarded entirely.
+    weak_count = sum(1 for _u, s, _n in found if s != "deleted")
+    if weak_count > max(10, int(checked * 0.2)):
+        print(f"⚠️ Deleted-account sweep: {weak_count} of {checked} weak 'not found' results ignored (looks like an API problem).")
+        found = [f for f in found if f[1] == "deleted"]
+    candidates = []
+    for uid, state, strikes in found:
+        try:
+            await asyncio.to_thread(users.update_one, {"_id": uid}, {"$set": {"missing_strikes": strikes}})
+        except Exception as e:
+            print(f"Deleted-account strike save error for {uid}:", e)
+            continue
+        if strikes >= DELETED_SWEEP_STRIKES:
+            candidates.append((uid, state, strikes))
+    candidates.sort(key=lambda c: c[1] != "deleted")   # strong signals first
+    notified = 0
+    for uid, state, strikes in candidates[:DELETED_MAX_NOTIFY_PER_SWEEP]:
+        token = uuid.uuid4().hex[:10]
+        if not await _notify_owner_possible_deleted(app, uid, state, strikes, token):
+            continue                                   # not delivered: do NOT mark pending, retry next sweep
+        try:
+            res = await asyncio.to_thread(
+                users.update_one, {"_id": uid, "deleted_review": {"$nin": ["pending", "deleting"]}},
+                {"$set": {"deleted_review": "pending", "deleted_review_at": time.time(),
+                          "deleted_review_reason": state, "deleted_review_token": token},
+                 "$unset": {"deleted_review_confirm_at": ""}})
+            if res.matched_count:
+                notified += 1
+        except Exception as e:
+            # The notice was delivered but could not be recorded: its buttons will simply report "no longer active".
+            print(f"Deleted-account pending-state save error for {uid}:", e)
+        await asyncio.sleep(0.2)
+    print(f"🔎 Deleted-account sweep done: checked {checked}, owner notified about {notified} (no data deleted).")
+    return notified
+
+DELETED_BACKUP_COLLECTION = "deleted_user_backups"   # durable backup of owner-confirmed deletions (survives Render redeploys)
+DELETED_ARCHIVE_DIR = os.getenv("DELETED_ARCHIVE_DIR",
+                                os.path.join(os.path.dirname(os.path.abspath(__file__)), "deleted_user_archives"))
+
+def _archive_user_data(uid):
+    """
+    READ-ONLY. Collect exactly the data purge_user_data() would remove for this user and return
+    (json_bytes, filename, counts, raw_data). Used only by the owner-confirmed Delete Data button, so a backup
+    exists before anything is deleted. Nothing is written to the database here.
+    """
+    import json as _json
+    spec = [(mongo_db.USERS, {"_id": uid}), (mongo_db.COLLECTIONS, {"user_id": uid}),
+            (mongo_db.FAVORITES, {"_id": uid}), (mongo_db.NOTIFICATIONS, {"_id": uid}),
+            ("shop_v3", {"user_id": uid}), ("shop_purchases_v2", {"user_id": uid}),
+            ("shop_free_refresh_v1", {"_id": uid})]
+    data = {name: list(_mc(name).find(flt)) for name, flt in spec}
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    doc = {"archived_at": stamp, "user_id": uid,
+           "note": "Backup made right before an owner-confirmed deletion. Contains personal data: keep it private.",
+           "data": data}
+    payload = _json.dumps(doc, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    return payload, f"deleted_user_{uid}_{stamp}.json", {k: len(v) for k, v in data.items()}, data
+
+def _save_archive_locally(filename, payload):
+    """Best-effort extra copy on the bot server (owner-only permissions). Returns the path or None."""
+    try:
+        os.makedirs(DELETED_ARCHIVE_DIR, exist_ok=True)
+        path = os.path.join(DELETED_ARCHIVE_DIR, filename)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        return path
+    except Exception as e:
+        print("Deleted-account local archive save error:", e)
+        return None
+
+async def deleted_account_review_callback(update, context):
+    """Owner-only buttons for a possible-deleted-account notice. Data: delacct:<ask|keep|yes|no>:<user_id>:<token>"""
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    if not is_owner(q.from_user.id):
+        await deny_callback(q)
+        return
+    chat = q.message.chat if q.message else None
+    if chat is None or chat.type != "private" or int(chat.id) != int(q.from_user.id):
+        await _dacct_answer(q, "Use these buttons in your private chat with the bot.", True)
+        return
+    m = _DELETED_CB_RE.match(q.data or "")
+    if not m:
+        await _dacct_answer(q, "Invalid button.", True)
+        return
+    action, uid, token = m.group(1), int(m.group(2)), m.group(3)
+    if _deleted_review_protected(uid):
+        await _dacct_answer(q, "❌ An owner account can never be deleted here.", True)
+        return
+    users = _mc(mongo_db.USERS)
+    review_filter = {"_id": uid, "deleted_review": "pending", "deleted_review_token": token}
+
+    async def _edit(text, markup=None):
+        try:
+            await q.edit_message_text(text, reply_markup=markup)
+        except Exception as e:
+            print("Deleted-account review edit error:", e)
+
+    try:
+        row = await asyncio.to_thread(users.find_one, {"_id": uid}, {"deleted_review": 1, "deleted_review_token": 1, "deleted_review_confirm_at": 1,
+                                                                 "deleted_review_reason": 1})
+    except Exception as e:
+        print(f"Deleted-account review lookup error for {uid}:", e)
+        await _dacct_answer(q, "Database error. Nothing was changed or deleted.", True)
+        return
+    if row is None:
+        await _dacct_answer(q, "No data found for that user (already removed?).", True)
+        await _edit(f"ℹ️ No data found for user {uid}. Nothing to do.")
+        return
+    if row.get("deleted_review") != "pending" or row.get("deleted_review_token") != token:
+        await _dacct_answer(q, "This request is no longer active.", True)
+        await _edit(f"ℹ️ This request for user {uid} is no longer active. Nothing was deleted.\n"
+                    f"You can still use /deleteuser {uid} manually.")
+        return
+
+    if action == "keep":
+        try:
+            res = await asyncio.to_thread(
+                users.update_one, review_filter,
+                {"$set": {"deleted_review": "kept", "deleted_review_at": time.time()},
+                 "$unset": {"missing_strikes": "", "deleted_review_confirm_at": ""}})
+        except Exception as e:
+            print(f"Deleted-account keep save error for {uid}:", e)
+            await _dacct_answer(q, "Database error: your decision was NOT saved. Nothing was deleted.", True)
+            return
+        if not res.matched_count:
+            await _dacct_answer(q, "This request is no longer active.", True)
+            return
+        await _dacct_answer(q, "Data kept.")
+        await _edit(f"❌ Kept. User {uid}'s data was NOT deleted.")
+        return
+
+    if action == "ask":
+        try:                                           # the confirmation step is recorded server-side and expires
+            res = await asyncio.to_thread(users.update_one, review_filter,
+                                          {"$set": {"deleted_review_confirm_at": time.time()}})
+        except Exception as e:
+            print(f"Deleted-account confirm-step save error for {uid}:", e)
+            await _dacct_answer(q, "Database error. Nothing was deleted.", True)
+            return
+        if not res.matched_count:
+            await _dacct_answer(q, "This request is no longer active.", True)
+            return
+        await _dacct_answer(q)
+        warn = ""
+        if row.get("deleted_review_reason") != "deleted":
+            warn = ("⚠️ UNCERTAIN RESULT: Telegram only said this user was \"not found\". The user may still be "
+                    "ACTIVE (or may simply have never started / blocked the bot). Delete only if you are sure "
+                    "the account is really gone.\n\n")
+        await _edit(
+            f"⚠️ CONFIRM DELETION\n\n{warn}This will permanently delete user {uid}: all characters, coins, profile, "
+            "favorites and shop data. This cannot be undone.\n\nPress Confirm Delete only if you are sure.",
+            InlineKeyboardMarkup([                     # safe option first, destructive option alone on its own row
+                [InlineKeyboardButton("↩️ Cancel (keep data)", callback_data=f"delacct:no:{uid}:{token}")],
+                [InlineKeyboardButton("✅ Confirm Delete — permanent", callback_data=f"delacct:yes:{uid}:{token}")],
+            ]))
+        return
+
+    if action == "no":
+        try:
+            await asyncio.to_thread(users.update_one, review_filter, {"$unset": {"deleted_review_confirm_at": ""}})
+        except Exception as e:                         # harmless: the confirmation expires on its own
+            print(f"Deleted-account cancel save error for {uid}:", e)
+        await _dacct_answer(q, "Cancelled. Nothing was deleted.")
+        await _edit(f"⚠️ POSSIBLE DELETED ACCOUNT\n\n🆔 ID: {uid}\n\nNothing has been deleted. Choose what to do with this user's data:",
+                    _deleted_review_keyboard(uid, token))
+        return
+
+    # action == "yes": explicit confirmation. Re-check authorization and target safety right before deleting.
+    if not is_owner(q.from_user.id) or _deleted_review_protected(uid):
+        await _dacct_answer(q, "❌ Not allowed.", True)
+        return
+    confirm_at = row.get("deleted_review_confirm_at")
+    now = time.time()
+    if not isinstance(confirm_at, (int, float)) or confirm_at > now + 60 or now - confirm_at > DELETED_CONFIRM_SECONDS:
+        await _dacct_answer(q, "Confirmation missing or expired. Press Delete Data again.", True)
+        await _edit(f"⚠️ POSSIBLE DELETED ACCOUNT\n\n🆔 ID: {uid}\n\nNothing has been deleted. Choose what to do with this user's data:",
+                    _deleted_review_keyboard(uid, token))
+        return
+    state = await _telegram_account_deleted(context.bot, uid)
+    if state is False:
+        try:
+            await asyncio.to_thread(users.update_one, review_filter, {"$unset": _DELETED_REVIEW_FIELDS})
+        except Exception as e:
+            print(f"Deleted-account review reset error for {uid}:", e)
+        await _dacct_answer(q, "Telegram shows this account still exists.", True)
+        await _edit(f"ℹ️ User {uid}'s Telegram account appears to exist, so nothing was deleted.\n"
+                    f"If you still want to remove the data, use /deleteuser {uid}.")
+        return
+    try:                                               # atomic claim: only ONE tap can ever pass this point
+        claimed = await asyncio.to_thread(
+            users.update_one,
+            dict(review_filter, deleted_review_confirm_at={"$gte": time.time() - DELETED_CONFIRM_SECONDS}),
+            {"$set": {"deleted_review": "deleting", "deleted_review_at": time.time()},
+             "$unset": {"deleted_review_confirm_at": ""}})
+    except Exception as e:
+        print(f"Deleted-account claim error for {uid}:", e)
+        await _dacct_answer(q, "Database error. Nothing was deleted.", True)
+        return
+    if not claimed.matched_count:
+        await _dacct_answer(q, "This request is no longer active.", True)
+        return
+    # Backup first. The durable backup is a document in the DELETED_BACKUP_COLLECTION collection (raw documents, so
+    # the data can be restored later). If it cannot be written, NOTHING is deleted and the review goes back to
+    # pending. A JSON file sent to the owner's chat and a copy on the server are extra, best-effort copies.
+    backup_ok = False
+    try:
+        payload, fname, counts, raw = await asyncio.to_thread(_archive_user_data, uid)
+        await asyncio.to_thread(
+            lambda: _mc(DELETED_BACKUP_COLLECTION).insert_one(
+                {"user_id": uid, "deleted_at": time.time(), "deleted_by": q.from_user.id,
+                 "filename": fname, "counts": counts, "data": raw}))
+        backup_ok = True
+    except Exception as e:
+        print(f"Deleted-account backup error for {uid}:", e)
+    if not backup_ok:
+        reverted = False
+        try:
+            back = await asyncio.to_thread(users.update_one, {"_id": uid, "deleted_review": "deleting"},
+                                           {"$set": {"deleted_review": "pending"},
+                                            "$unset": {"deleted_review_confirm_at": ""}})
+            reverted = bool(back.matched_count)
+        except Exception as e2:
+            print(f"Deleted-account review revert error for {uid}:", e2)
+        await _dacct_answer(q, "Backup failed. Nothing was deleted.", True)
+        await _edit(f"❌ Could not save the backup for user {uid}, so NOTHING was deleted.",
+                    _deleted_review_keyboard(uid, token) if reverted else None)
+        return
+    file_sent = False
+    try:
+        import io as _io
+        bio = _io.BytesIO(payload)
+        bio.name = fname
+        await context.bot.send_document(chat_id=q.from_user.id, document=bio, filename=fname,
+                                        caption=f"Backup of user {uid}, made before deletion. Keep this file private.")
+        file_sent = True
+    except Exception as e:
+        print(f"Deleted-account backup file send error for {uid}:", e)
+    local_path = await asyncio.to_thread(_save_archive_locally, fname, payload)
+    try:
+        copies, _removed = await asyncio.to_thread(purge_user_data, uid)
+    except Exception as e:
+        print(f"Deleted-account purge error for {uid}:", e)
+        reverted = False
+        try:
+            back = await asyncio.to_thread(users.update_one, {"_id": uid, "deleted_review": "deleting"},
+                                           {"$set": {"deleted_review": "pending"},
+                                            "$unset": {"deleted_review_confirm_at": ""}})
+            reverted = bool(back.matched_count)
+        except Exception as e2:
+            print(f"Deleted-account review revert error for {uid}:", e2)
+        await _dacct_answer(q, "Deletion failed.", True)
+        await _edit(f"❌ Deletion of user {uid} failed. Some of this user's data MAY ALREADY HAVE BEEN DELETED "
+                    f"(this bot cannot tell, and nothing was restored). /deleteuser {uid} shows whether any "
+                    f"data is still found for this ID.",
+                    _deleted_review_keyboard(uid, token) if reverted else None)
+        return
+    await _dacct_answer(q, "Deleted.")
+    await _edit(f"🗑 Deleted user {uid}.\n🧹 Removed {copies} character copy(ies).\n"
+                f"📦 The data was removed from the main database and saved in the \"{DELETED_BACKUP_COLLECTION}\" backup collection.\n"
+                + ("📁 A backup file was also sent to this chat." if file_sent else "⚠️ The backup file could not be sent to this chat (the database backup is safe).")
+                + (" A copy was also saved on the bot server." if local_path else ""))
+    print(f"🧹 Owner-confirmed deletion of {uid}: removed {copies} character copy(ies) and profile.")
+
+async def _dacct_answer(q, text=None, alert=False):
+    try:
+        await q.answer(text, show_alert=alert)
+    except Exception as e:
+        print("Deleted-account review answer error:", e)
+
+# ---- /restoreuser: owner-only restore of a user saved by the Delete Data button (see deleted_user_backups) ----
+# Same collections (and the same ownership keys) that purge_user_data removes / _archive_user_data saves.
+_RESTORE_SPEC = ((mongo_db.USERS, "_id"), (mongo_db.COLLECTIONS, "user_id"), (mongo_db.FAVORITES, "_id"),
+                 (mongo_db.NOTIFICATIONS, "_id"), ("shop_v3", "user_id"), ("shop_purchases_v2", "user_id"),
+                 ("shop_free_refresh_v1", "_id"))
+# Review bookkeeping that must never come back with a restored profile (it would leave the user stuck in "deleting").
+_RESTORE_STRIP_USER_FIELDS = ("deleted_review", "deleted_review_at", "deleted_review_reason",
+                              "deleted_review_token", "deleted_review_confirm_at", "missing_strikes")
+
+def _restore_plan(uid):
+    """READ-ONLY. Returns (latest_backup_doc, None) or (None, reason_text)."""
+    backups = list(_mc(DELETED_BACKUP_COLLECTION).find({"user_id": uid}))
+    if not backups:
+        return None, "❌ No backup found for that user ID."
+    backup = max(backups, key=lambda b: float(b.get("deleted_at") or 0))
+    prof = ((backup.get("data") or {}).get(mongo_db.USERS) or [{}])[0] if isinstance(backup.get("data"), dict) else {}
+    moved_to = backup.get("moved_to") if backup.get("moved_to") is not None else prof.get("moved_to")
+    if moved_to is not None:
+        return None, (f"❌ This user's data was already transferred to account {moved_to}, so restoring it would "
+                      f"create duplicates. Nothing was restored.")
+    if _mc(mongo_db.USERS).find_one({"_id": uid}, {"_id": 1}) is not None \
+            or _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid}) > 0:
+        return None, (f"❌ User {uid} already has data in the main database, so restoring could overwrite or duplicate it. "
+                      f"Nothing was restored. If you really want to replace it, remove that data first with /deleteuser {uid}.")
+    return backup, None
+
+def _restore_docs(backup, uid):
+    """Validate a backup and return {collection: [documents]}. Raises ValueError if anything looks wrong."""
+    data = backup.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("the backup has no data section")
+    out = {}
+    for name, key in _RESTORE_SPEC:
+        docs = data.get(name, [])
+        if not isinstance(docs, list):
+            raise ValueError(f"the {name} section is damaged")
+        clean = []
+        for d in docs:
+            if not isinstance(d, dict) or d.get(key) != uid or "_id" not in d:
+                raise ValueError(f"a record in {name} does not belong to user {uid}")
+            d = dict(d)
+            if name == mongo_db.USERS:
+                for f in _RESTORE_STRIP_USER_FIELDS:
+                    d.pop(f, None)
+            clean.append(d)
+        out[name] = clean
+    if not out[mongo_db.USERS]:
+        raise ValueError("the backup has no profile record")
+    return out
+
+def _restore_user_data(uid, docs_by_collection):
+    """
+    Put a validated backup back, all-or-nothing. With transactions the database rolls everything back on failure.
+    Without them, only the records THIS attempt inserted are removed again (each id is remembered after its own
+    successful insert, so a record that someone else created in the meantime is never touched).
+    """
+    def _work(session):
+        inserted = []
+        try:
+            for name, docs in docs_by_collection.items():
+                for d in docs:
+                    _mc(name).insert_one(d, session=session)      # duplicate _id -> error, nothing is overwritten
+                    inserted.append((name, d["_id"]))
+        except Exception:
+            if session is None:
+                for name, _id in inserted:
+                    _mc(name).delete_one({"_id": _id})
+            raise
+        return {name: len(docs) for name, docs in docs_by_collection.items()}
+    return mongo_db.run_transaction(_work)
+
+_DATA_CONFIRM_SECONDS = 600
+_DATA_CONFIRM_RE = re.compile(r"^dconf:(go|no):([0-9a-f]{10})$")
+
+def _data_confirm_keyboard(token, label):
+    """Safe option first; the confirm button sits alone on its own row."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("↩️ Cancel", callback_data=f"dconf:no:{token}")],
+        [InlineKeyboardButton(label, callback_data=f"dconf:go:{token}")],
+    ])
+
+def _data_pending(context):
+    """In-memory, single-use confirmations (lost on restart = buttons simply expire, which is the safe side)."""
+    store = context.application.bot_data.setdefault("pending_data_confirms", {})
+    now = time.monotonic()
+    for t in [t for t, r in store.items() if r["exp"] < now]:
+        store.pop(t, None)
+    while len(store) > 50:
+        store.pop(next(iter(store)))
+    return store
+
+async def _run_restore(uid, expected_backup_id):
+    """Re-validate everything and restore. Returns (ok, text). Used only by the owner's confirm button."""
+    if _deleted_review_protected(uid):
+        return False, "❌ That ID cannot be restored with this command."
+    try:
+        backup, problem = await asyncio.to_thread(_restore_plan, uid)
+        docs = _restore_docs(backup, uid) if backup else None
+    except ValueError as e:
+        return False, f"❌ The backup cannot be used ({e}). Nothing was restored."
+    except Exception as e:
+        print("restore lookup error:", e)
+        return False, "❌ Database error. Nothing was restored."
+    if problem:
+        return False, problem
+    if backup["_id"] != expected_backup_id:
+        return False, "❌ The backup changed since the preview. Nothing was restored. Run /restoreuser again."
+    try:
+        counts = await asyncio.to_thread(_restore_user_data, uid, docs)
+    except Exception as e:
+        print(f"restore error for {uid}:", e)
+        return False, (f"❌ Restore failed. The bot only removes the records it had just added, and the backup itself is "
+                       f"unchanged. Check with /deleteuser {uid} whether any data is present, then try again.")
+    try:                                               # record keeping only; the backup is never deleted
+        await asyncio.to_thread(_mc(DELETED_BACKUP_COLLECTION).update_one, {"_id": backup["_id"]},
+                                {"$set": {"restored_at": time.time()}})
+    except Exception as e:
+        print(f"restore backup-mark error for {uid}:", e)
+    return True, (f"✅ Restored user {uid}: {counts.get(mongo_db.COLLECTIONS, 0)} character copy(ies) and their profile. "
+                  f"The backup was kept.")
+
+async def restoreuser(update, context):
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await safe_reply_text(update.message, "❌ Use /restoreuser in your private chat with the bot.")
+        return
+    args = context.args or []
+    if not args or not re.fullmatch(r"[0-9]+", args[0]):
+        await safe_reply_text(update.message, "Usage: /restoreuser <user_id>")
+        return
+    uid = int(args[0])
+    if _deleted_review_protected(uid):
+        await safe_reply_text(update.message, "❌ That ID cannot be restored with this command.")
+        return
+    try:
+        backup, problem = await asyncio.to_thread(_restore_plan, uid)
+        docs = _restore_docs(backup, uid) if backup else None
+    except ValueError as e:
+        await safe_reply_text(update.message, f"❌ The backup cannot be used ({e}). Nothing was restored.")
+        return
+    except Exception as e:
+        print("restoreuser lookup error:", e)
+        await safe_reply_text(update.message, "❌ Database error. Nothing was restored.")
+        return
+    if problem:
+        await safe_reply_text(update.message, problem)
+        return
+    when = datetime.fromtimestamp(float(backup.get("deleted_at") or 0)).strftime("%Y-%m-%d %H:%M")
+    chars = len(docs.get(mongo_db.COLLECTIONS, []))
+    token = uuid.uuid4().hex[:10]
+    _data_pending(context)[token] = {"kind": "restore", "owner": update.effective_user.id, "uid": uid,
+                                     "ref": backup["_id"], "exp": time.monotonic() + _DATA_CONFIRM_SECONDS}
+    await safe_reply_text(update.message,
+        f"♻️ Backup found for user {uid} (deleted {when}): {chars} character copy(ies).\n\n"
+        f"Press Confirm Restore to restore it (valid for 10 minutes). Nothing has been changed yet.",
+        reply_markup=_data_confirm_keyboard(token, "✅ Confirm Restore"))
+
+# ---- /moveuser: copy an old (deleted) account's game data onto the same person's NEW Telegram account ----
+_MOVE_KEEP_NEW_PROFILE = ("_id", "username", "first_name", "last_name")   # identity always stays the new account's
+
+def _move_plan(old, new):
+    """
+    READ-ONLY. Returns (plan, None) or (None, reason). The source is the old user's live data if it is still in
+    the main database, otherwise the latest backup in DELETED_BACKUP_COLLECTION.
+    """
+    users = _mc(mongo_db.USERS)
+    new_doc = users.find_one({"_id": new})
+    if new_doc is None:
+        return None, (f"❌ Account {new} is not in the bot's database yet. Ask the person to open the bot and press "
+                      f"/start with the new account first.")
+    if _mc(mongo_db.COLLECTIONS).count_documents({"user_id": new}) > 0:
+        return None, (f"❌ Account {new} already owns characters. To avoid mixing data, nothing was moved.")
+    old_doc = users.find_one({"_id": old})
+    if old_doc is not None:
+        if old_doc.get("moved_to") is not None:
+            return None, f"❌ User {old}'s data was already transferred to account {old_doc.get('moved_to')}."
+        _p, _f, _c, raw = _archive_user_data(old)
+        kind, src_col, src_filter, when = "live data", mongo_db.USERS, {"_id": old}, None
+        data = _restore_docs({"data": raw}, old)
+    else:
+        backups = list(_mc(DELETED_BACKUP_COLLECTION).find({"user_id": old}))
+        if not backups:
+            return None, f"❌ No data or backup found for user {old}."
+        backup = max(backups, key=lambda b: float(b.get("deleted_at") or 0))
+        prof = ((backup.get("data") or {}).get(mongo_db.USERS) or [{}])[0] if isinstance(backup.get("data"), dict) else {}
+        moved_to = backup.get("moved_to") if backup.get("moved_to") is not None else prof.get("moved_to")
+        if moved_to is not None:
+            return None, f"❌ User {old}'s data was already transferred to account {moved_to}."
+        kind, src_col, src_filter, when = "backup", DELETED_BACKUP_COLLECTION, {"_id": backup["_id"]}, backup.get("deleted_at")
+        data = _restore_docs(backup, old)
+    return {"kind": kind, "src_col": src_col, "src_filter": src_filter, "when": when, "data": data,
+            "old_profile": data[mongo_db.USERS][0], "new_profile": new_doc}, None
+
+def _move_user_data(plan, old, new):
+    """
+    Copy-only, all-or-nothing transfer. The source data is never deleted or changed except for a marker
+    (moved_to) that blocks a second transfer. With transactions the database rolls everything back on failure;
+    without them, only what THIS attempt created is removed again and the marker is cleared.
+    """
+    data = plan["data"]
+    carry = {k: v for k, v in plan["old_profile"].items() if k not in _MOVE_KEEP_NEW_PROFILE}
+    carry["transferred_from"] = old
+    carry["transferred_at"] = time.time()
+
+    def _work(session):
+        src = _mc(plan["src_col"])
+        claimed = src.update_one(dict(plan["src_filter"], moved_to={"$exists": False}),
+                                 {"$set": {"moved_to": new, "moved_at": time.time()}}, session=session)
+        if not claimed.matched_count:
+            raise ValueError("already transferred or source changed")
+        inserted = []
+        try:
+            for d in data[mongo_db.COLLECTIONS]:
+                nd = {k: v for k, v in d.items() if k != "_id"}
+                nd["user_id"] = new
+                res = _mc(mongo_db.COLLECTIONS).insert_one(nd, session=session)
+                inserted.append((mongo_db.COLLECTIONS, res.inserted_id))
+            for name in (mongo_db.FAVORITES, mongo_db.NOTIFICATIONS):
+                for d in data[name]:
+                    if _mc(name).find_one({"_id": new}, {"_id": 1}, session=session) is None:   # never overwrite
+                        nd = {k: v for k, v in d.items() if k != "_id"}
+                        nd["_id"] = new
+                        _mc(name).insert_one(nd, session=session)
+                        inserted.append((name, new))
+            res = _mc(mongo_db.USERS).update_one({"_id": new}, {"$set": carry}, session=session)
+            if not res.matched_count:
+                raise ValueError("the new account disappeared")
+        except Exception:
+            if session is None:
+                for name, _id in inserted:
+                    _mc(name).delete_one({"_id": _id})
+                src.update_one(plan["src_filter"], {"$unset": {"moved_to": "", "moved_at": ""}})
+            raise
+        return {"characters": len(data[mongo_db.COLLECTIONS])}
+    return mongo_db.run_transaction(_work)
+
+def _who(doc):
+    name = " ".join(v for v in [doc.get("first_name"), doc.get("last_name")] if v).strip() or "no name"
+    return f"{name} ({'@' + doc['username'] if doc.get('username') else 'no username'})"
+
+async def _run_move(old, new, expected):
+    """Re-validate everything and transfer. Returns (ok, text). Used only by the owner's confirm button."""
+    if old == new or _deleted_review_protected(old) or _deleted_review_protected(new):
+        return False, "❌ These IDs cannot be used with this command."
+    try:
+        plan, problem = await asyncio.to_thread(_move_plan, old, new)
+    except ValueError as e:
+        return False, f"❌ The source data cannot be used ({e}). Nothing was moved."
+    except Exception as e:
+        print("move lookup error:", e)
+        return False, "❌ Database error. Nothing was moved."
+    if problem:
+        return False, problem
+    if plan["kind"] != expected["kind"] or plan["src_filter"] != expected["src_filter"]:
+        return False, "❌ The source data changed since the preview. Nothing was moved. Run /moveuser again."
+    try:
+        result = await asyncio.to_thread(_move_user_data, plan, old, new)
+    except Exception as e:
+        print(f"move error {old}->{new}:", e)
+        return False, ("❌ Transfer failed. The bot only removes what it had just copied and the original data is "
+                       "untouched. Nothing was lost; check the new account and try again.")
+    tail = (f"The old account's data is still in the main database: once you have checked the new account, remove the "
+            f"old data with /deleteuser {old} confirm." if plan["kind"] == "live data" else "The backup was kept.")
+    return True, f"✅ Transferred {result['characters']} character copy(ies) and the profile from {old} to {new}.\n{tail}"
+
+async def moveuser(update, context):
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await safe_reply_text(update.message, "❌ Use /moveuser in your private chat with the bot.")
+        return
+    args = context.args or []
+    if len(args) < 2 or not all(re.fullmatch(r"[0-9]+", a) for a in args[:2]):
+        await safe_reply_text(update.message, "Usage: /moveuser <old_user_id> <new_user_id>")
+        return
+    old, new = int(args[0]), int(args[1])
+    if old == new or _deleted_review_protected(old) or _deleted_review_protected(new):
+        await safe_reply_text(update.message, "❌ These IDs cannot be used with this command.")
+        return
+    try:
+        plan, problem = await asyncio.to_thread(_move_plan, old, new)
+    except ValueError as e:
+        await safe_reply_text(update.message, f"❌ The source data cannot be used ({e}). Nothing was moved.")
+        return
+    except Exception as e:
+        print("moveuser lookup error:", e)
+        await safe_reply_text(update.message, "❌ Database error. Nothing was moved.")
+        return
+    if problem:
+        await safe_reply_text(update.message, problem)
+        return
+    d = plan["data"]
+    chars = len(d[mongo_db.COLLECTIONS])
+    src = plan["kind"] if plan["when"] is None else \
+        f"backup from {datetime.fromtimestamp(float(plan['when'] or 0)).strftime('%Y-%m-%d %H:%M')}"
+    summary = (f"OLD {old}: {_who(plan['old_profile'])}\nNEW {new}: {_who(plan['new_profile'])}\n"
+               f"Source: {src}\nWill be copied: {chars} character copy(ies), "
+               f"coins {plan['new_profile'].get('coins', 0)} → {plan['old_profile'].get('coins', 0)} (replaced), "
+               f"favorite and notification settings (only if the new account has none).\n"
+               f"Not moved: shop and purchase history, restrictions, event/redeem claims.")
+    token = uuid.uuid4().hex[:10]
+    _data_pending(context)[token] = {"kind": "move", "owner": update.effective_user.id, "old": old, "new": new,
+                                     "ref": {"kind": plan["kind"], "src_filter": plan["src_filter"]},
+                                     "exp": time.monotonic() + _DATA_CONFIRM_SECONDS}
+    await safe_reply_text(update.message,
+        f"🔁 Transfer preview\n\n{summary}\n\nCheck that both accounts are the same person, then press Confirm Transfer "
+        f"(valid for 10 minutes). Nothing has been changed yet.",
+        reply_markup=_data_confirm_keyboard(token, "✅ Confirm Transfer"))
+
+async def data_confirm_callback(update, context):
+    """Owner-only buttons of /restoreuser and /moveuser. Data: dconf:<go|no>:<token>. Each token works once."""
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    if not is_owner(q.from_user.id):
+        await deny_callback(q)
+        return
+    chat = q.message.chat if q.message else None
+    if chat is None or chat.type != "private" or int(chat.id) != int(q.from_user.id):
+        await _dacct_answer(q, "Use these buttons in your private chat with the bot.", True)
+        return
+    m = _DATA_CONFIRM_RE.match(q.data or "")
+    if not m:
+        await _dacct_answer(q, "Invalid button.", True)
+        return
+    action, token = m.group(1), m.group(2)
+
+    async def _edit(text):
+        try:
+            await q.edit_message_text(text)
+        except Exception as e:
+            print("Data confirm edit error:", e)
+
+    rec = _data_pending(context).pop(token, None)      # single use: a second tap or an old button finds nothing
+    if rec is None or rec.get("owner") != q.from_user.id:
+        await _dacct_answer(q, "This confirmation has expired. Run the command again.", True)
+        await _edit("ℹ️ This confirmation has expired or was already used. Nothing was changed. "
+                    "Run the command again if you still want it.")
+        return
+    if action == "no":
+        await _dacct_answer(q, "Cancelled.")
+        await _edit("↩️ Cancelled. Nothing was changed.")
+        return
+    await _dacct_answer(q, "Working…")
+    try:
+        if rec["kind"] == "restore":
+            _ok, text = await _run_restore(rec["uid"], rec["ref"])
+        else:
+            _ok, text = await _run_move(rec["old"], rec["new"], rec["ref"])
+    except Exception as e:                              # never leave the owner without an answer
+        print("Data confirm error:", e)
+        text = "❌ Something went wrong. Please check the data before trying again."
+    await _edit(text)
+
+async def deleted_account_sweep_loop(app):
+    await asyncio.sleep(300)                           # let the bot finish starting first
+    while True:
+        try:
+            await sweep_deleted_accounts(app)
+            await asyncio.sleep(max(1.0, DELETED_SWEEP_HOURS) * 3600)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("Deleted-account sweep error; recovering:", e)
+            await asyncio.sleep(600)
+
+async def deleteuser(update, context):
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+    args = context.args or []
+    if not args or not args[0].lstrip("-").isdigit():
+        await safe_reply_text(update.message,
+            "Usage: /deleteuser <user_id>\nThen confirm with: /deleteuser <user_id> confirm")
+        return
+    uid = int(args[0])
+    if is_owner(uid):
+        await safe_reply_text(update.message, "❌ You can't delete an owner account.")
+        return
+    names = (await asyncio.to_thread(mongo_db.get_user_names, uid))
+    owned = (await asyncio.to_thread(
+        lambda: _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid})))
+    if not names and not owned:
+        await safe_reply_text(update.message, "❌ No data found for that user ID.")
+        return
+    first, last, username = names if names else ("Unknown", "", "")
+    display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
+    if len(args) < 2 or args[1].lower() != "confirm":
+        await safe_reply_text(update.message,
+            f"⚠️ This will permanently delete {display} [{uid}]: {owned} character(s), coins and profile.\n\n"
+            f"Confirm with: /deleteuser {uid} confirm")
+        return
+    try:
+        copies, removed = (await asyncio.to_thread(purge_user_data, uid))
+    except Exception as e:
+        print("deleteuser error:", e)
+        await safe_reply_text(update.message, "❌ Could not delete that user. Nothing was changed.")
+        return
+    await safe_reply_text(update.message,
+        f"🗑 Deleted {display} [{uid}].\n🧹 Removed {copies} character copy(ies).")
+    await notify_staff_action(
+        context,
+        f"🗑 USER DELETED\n👤 {display} [{uid}]\n🧹 {copies} character copy(ies)\n👤 By: {display_user(update.effective_user)}",
+        actor_id=update.effective_user.id,
+    )
+
 DEFAULT_GSTATS_GROUP_ID = -1003379716050
 DEFAULT_GSTATS_GROUP_TITLE = "Wonderland Anime gc"
 
@@ -8593,6 +9439,11 @@ async def startup_init(app):
             name="event-redeem-expiry-loop",
         )
 
+        app.bot_data["deleted_sweep_task"] = asyncio.create_task(
+            deleted_account_sweep_loop(app),
+            name="deleted-account-sweep-loop",
+        )
+
         if app.job_queue is not None:
             app.job_queue.run_daily(
                 daily_shop_reset_job,
@@ -8672,6 +9523,7 @@ async def post_shutdown(app):
         ("spawn_expiry_task", "Spawn expiry"),
         ("auto_spawn_task", "Auto-spawn"),
         ("event_redeem_task", "Event/redeem expiry"),
+        ("deleted_sweep_task", "Deleted-account sweep"),
         ("log_worker_task", "Log channel worker"),
         ("shop_reset_task", "Shop reset"),
         ("staff_menu_task", "Staff menu refresh"),
@@ -9209,6 +10061,10 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("removechar", removechar))
     app.add_handler(CommandHandler("gift", gift))
     app.add_handler(CommandHandler("delete", delete))
+    app.add_handler(CommandHandler("deleteuser", deleteuser))
+    app.add_handler(CommandHandler("restoreuser", restoreuser))
+    app.add_handler(CommandHandler("moveuser", moveuser))
+    app.add_handler(CallbackQueryHandler(data_confirm_callback, pattern=r"^dconf:(go|no):[0-9a-f]{10}$"))
     app.add_handler(CommandHandler("discontinue", discontinue_command))
     app.add_handler(CommandHandler("continue", continue_command))
     app.add_handler(CommandHandler("executives", executives))
@@ -9545,6 +10401,7 @@ def main():
 
     app.add_handler(CallbackQueryHandler(gstats_callback, pattern=r"^gstats:delete:-?\d+$"))
     app.add_handler(CallbackQueryHandler(owner_notification_callback, pattern=r"^owner_notify:(yes|no)$"), group=-1)
+    app.add_handler(CallbackQueryHandler(deleted_account_review_callback, pattern=r"^delacct:(ask|keep|yes|no):-?\d+:[0-9a-f]{10}$"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
     app.add_handler(CallbackQueryHandler(event_claim_callback, pattern=r"^event:"))
     app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r"^tr_(accept|decline):"))
