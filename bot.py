@@ -238,6 +238,25 @@ def log_character_action(code, name, user, action):
         print("Character action log error:", e)
 
 
+def get_character_adder_text(code):
+    """'Name (@username)' of whoever first added this character, or 'Unknown' when no record exists."""
+    try:
+        docs = [d for d in _mc("character_additions_v2").find({"character_code": str(code)})
+                if (d.get("action") or "add") == "add"]
+        if not docs:
+            return "Unknown"
+        d = min(docs, key=lambda x: str(x.get("added_at") or "9999"))
+        name = " ".join(v for v in [d.get("added_first_name"), d.get("added_last_name")] if v).strip()
+        username = (d.get("added_username") or "").strip()
+        handle = f"@{username}" if username else "No username"
+        if not name:
+            return html_escape(handle) if username else "Unknown"
+        return f"{html_escape(name)} ({html_escape(handle)})"
+    except Exception as e:
+        print("Character adder lookup error:", e)
+        return "Unknown"
+
+
 def _swap_shop_rows(user_id, docs):
     """Replace a user's 4 shop rows atomically (delete + insert in one transaction)."""
     def _work(session):
@@ -3956,6 +3975,8 @@ async def send_character_check_result(bot, chat_id, character, source_message=No
     lines.append(f"🔎 Recruitment Name: {', '.join(recruit_names) if recruit_names else '— Not set'}")
     if (await asyncio.to_thread(is_character_discontinued, code)):
         lines.append("🚫 Discontinued — no longer spawns")
+    adder_text = (await asyncio.to_thread(get_character_adder_text, code))
+    lines += ["", f"➕ Added by: {adder_text}"]
     lines += ["", "👑 Owners:"]
     for uid, qty in owners:
         u = owner_names.get(int(uid))
