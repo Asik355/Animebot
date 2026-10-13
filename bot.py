@@ -1462,8 +1462,7 @@ HELP_MODULES = {
             "🗂 Data (Owner only)",
             "Delete, back up, restore and transfer a user's game data. Use the commands in private chat.",
             [("/finduser <name or @username>", "Find a user's ID from part of a saved name or username (lists all matches, tap an ID to copy)"),
-             ("/deleteuser <user_id>", "Preview what would be deleted for that user"),
-             ("/deleteuser <user_id> confirm", "Permanently delete that user's data. A backup file is sent to your PM first (nothing is stored on the bot)"),
+             ("/deleteuser <user_id>", "Preview what would be deleted, then press 🗑 Delete Data (private chat) to permanently delete that user's data. A backup file is sent to your PM first (nothing is stored on the bot)"),
              ("/restoreuser <user_id>", "Show the latest backup of a deleted user, then press ✅ Confirm Restore (private chat). Refused if the user already has data or the backup was already transferred. You can also reply to a backup file the bot sent you with /restoreuser (no ID needed)"),
              ("/moveuser <old_id> <new_id>", "Show a preview of copying a deleted account's data to the same person's NEW account (it must have pressed /start first), then press ✅ Confirm Transfer. The old data or backup is kept and cannot be transferred twice"),
              ("/removechar <user_id> <code/name> [quantity]", "Remove characters from a user's collection (also listed under Characters)")],
@@ -5982,7 +5981,7 @@ async def _run_move(old, new, expected):
         return False, ("❌ Transfer failed. The bot only removes what it had just copied and the original data is "
                        "untouched. Nothing was lost; check the new account and try again.")
     tail = (f"The old account's data is still in the main database: once you have checked the new account, remove the "
-            f"old data with /deleteuser {old} confirm." if plan["kind"] == "live data" else "The backup was kept.")
+            f"old data with /deleteuser {old}." if plan["kind"] == "live data" else "The backup was kept.")
     return True, f"✅ Transferred {result['characters']} character copy(ies) and the profile from {old} to {new}.\n{tail}"
 
 async def moveuser(update, context):
@@ -6063,11 +6062,14 @@ async def data_confirm_callback(update, context):
         return
     if action == "no":
         await _dacct_answer(q, "Cancelled.")
-        await _edit("↩️ Cancelled. Nothing was changed.")
+        await _edit("↩️ Cancelled. Nothing was deleted." if rec["kind"] == "delete"
+                    else "↩️ Cancelled. Nothing was changed.")
         return
     await _dacct_answer(q, "Working…")
     try:
-        if rec["kind"] == "restore":
+        if rec["kind"] == "delete":
+            _ok, text = await _run_delete(context, rec["uid"], q.from_user)
+        elif rec["kind"] == "restore":
             _ok, text = await _run_restore(rec["uid"], rec["ref"])
         elif rec["kind"] == "restore_file":
             _ok, text = await _run_restore_file(rec["uid"], rec["docs"])
@@ -6153,7 +6155,7 @@ async def deleteuser(update, context):
     args = context.args or []
     if not args or not args[0].lstrip("-").isdigit():
         await safe_reply_text(update.message,
-            "Usage: /deleteuser <user_id>\nThen confirm with: /deleteuser <user_id> confirm")
+            "Usage: /deleteuser <user_id>")
         return
     uid = int(args[0])
     if is_owner(uid):
@@ -6167,39 +6169,52 @@ async def deleteuser(update, context):
         return
     first, last, username = names if names else ("Unknown", "", "")
     display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
-    if len(args) < 2 or args[1].lower() != "confirm":
-        await safe_reply_text(update.message,
-            f"⚠️ This will permanently delete {display} [{uid}]: {owned} character(s), coins and profile.\n"
-            f"📁 A backup file of all their data will be sent to your PM first (it is not stored on the bot).\n\n"
-            f"Confirm with: /deleteuser {uid} confirm")
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        await safe_reply_text(update.message, "Use /deleteuser in your private chat with the bot.")
         return
+    token = uuid.uuid4().hex[:10]
+    _data_pending(context)[token] = {"kind": "delete", "owner": update.effective_user.id, "uid": uid,
+                                     "exp": time.monotonic() + _DATA_CONFIRM_SECONDS}
+    await safe_reply_text(update.message,
+        f"⚠️ This will permanently delete {display} [{uid}]: {owned} character(s), coins and profile.\n"
+        f"📁 A backup file of all their data will be sent to your PM first (it is not stored on the bot).\n\n"
+        f"Press Delete Data to delete it (valid for 10 minutes). Nothing has been deleted yet.",
+        reply_markup=_data_confirm_keyboard(token, "🗑 Delete Data"))
+
+async def _run_delete(context, uid, actor):
+    """Owner's Delete Data button: re-check, send the backup file to the owner's PM, then delete. Returns (ok, text)."""
+    if is_owner(uid):
+        return False, "❌ You can't delete an owner account. Nothing was deleted."
+    names = await asyncio.to_thread(mongo_db.get_user_names, uid)
+    owned = await asyncio.to_thread(lambda: _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid}))
+    if not names and not owned:
+        return False, "❌ No data found for that user ID. Nothing was deleted."
+    first, last, username = names if names else ("Unknown", "", "")
+    display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
     # Collect all of the user's data and send it to the owner's PM BEFORE deleting. Nothing is stored anywhere else.
     try:
         import io as _io
         payload, fname, _counts, _raw = await asyncio.to_thread(_archive_user_data, uid)
         bio = _io.BytesIO(payload)
         bio.name = fname
-        await context.bot.send_document(chat_id=update.effective_user.id, document=bio, filename=fname,
+        await context.bot.send_document(chat_id=actor.id, document=bio, filename=fname,
                                         caption=f"Data of user {uid}, sent before deletion. Keep this file private.")
     except Exception as e:
         print("deleteuser backup-file error:", e)
-        await safe_reply_text(update.message,
-            "❌ I could not send the backup file to your PM (open a private chat with me and press Start). "
-            "Nothing was deleted.")
-        return
+        return False, ("❌ I could not send the backup file to your PM (open a private chat with me and press Start). "
+                       "Nothing was deleted.")
     try:
         copies, removed = (await asyncio.to_thread(purge_user_data, uid))
     except Exception as e:
         print("deleteuser error:", e)
-        await safe_reply_text(update.message, "❌ Could not delete that user. Nothing was changed.")
-        return
-    await safe_reply_text(update.message,
-        f"🗑 Deleted {display} [{uid}].\n🧹 Removed {copies} character copy(ies).\n📁 The backup file was sent to your PM.")
+        return False, "❌ Could not delete that user. Nothing was deleted."
     await notify_staff_action(
         context,
-        f"🗑 USER DELETED\n👤 {display} [{uid}]\n🧹 {copies} character copy(ies)\n👤 By: {display_user(update.effective_user)}",
-        actor_id=update.effective_user.id,
+        f"🗑 USER DELETED\n👤 {display} [{uid}]\n🧹 {copies} character copy(ies)\n👤 By: {display_user(actor)}",
+        actor_id=actor.id,
     )
+    return True, f"🗑 Deleted {display} [{uid}].\n🧹 Removed {copies} character copy(ies).\n📁 The backup file was sent to your PM."
 
 DEFAULT_GSTATS_GROUP_ID = -1003379716050
 DEFAULT_GSTATS_GROUP_TITLE = "Wonderland Anime gc"
