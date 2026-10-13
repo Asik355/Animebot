@@ -1461,9 +1461,10 @@ HELP_MODULES = {
         ("data", "🗂 Data", _help_page(
             "🗂 Data (Owner only)",
             "Delete, back up, restore and transfer a user's game data. Use the commands in private chat.",
-            [("/deleteuser <user_id>", "Preview what would be deleted for that user"),
-             ("/deleteuser <user_id> confirm", "Permanently delete that user's data (no backup is made)"),
-             ("/restoreuser <user_id>", "Show the latest backup of a deleted user, then press ✅ Confirm Restore (private chat). Refused if the user already has data or the backup was already transferred"),
+            [("/finduser <name or @username>", "Find a user's ID from part of a saved name or username (lists all matches, tap an ID to copy)"),
+             ("/deleteuser <user_id>", "Preview what would be deleted for that user"),
+             ("/deleteuser <user_id> confirm", "Permanently delete that user's data. A backup file is sent to your PM first (nothing is stored on the bot)"),
+             ("/restoreuser <user_id>", "Show the latest backup of a deleted user, then press ✅ Confirm Restore (private chat). Refused if the user already has data or the backup was already transferred. You can also reply to a backup file the bot sent you with /restoreuser (no ID needed)"),
              ("/moveuser <old_id> <new_id>", "Show a preview of copying a deleted account's data to the same person's NEW account (it must have pressed /start first), then press ✅ Confirm Transfer. The old data or backup is kept and cannot be transferred twice"),
              ("/removechar <user_id> <code/name> [quantity]", "Remove characters from a user's collection (also listed under Characters)")],
             "🔔 Deleted-account notices: when the bot thinks an account may be deleted it sends you a notice with "
@@ -5415,7 +5416,11 @@ def _archive_user_data(uid):
     doc = {"archived_at": stamp, "user_id": uid,
            "note": "Backup made right before an owner-confirmed deletion. Contains personal data: keep it private.",
            "data": data}
-    payload = _json.dumps(doc, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+    try:
+        from bson import json_util as _ju          # keeps ObjectId/dates exact, so the file can be restored
+        payload = _ju.dumps(doc, ensure_ascii=False, indent=2).encode("utf-8")
+    except Exception:
+        payload = _json.dumps(doc, ensure_ascii=False, indent=2, default=str).encode("utf-8")
     return payload, f"deleted_user_{uid}_{stamp}.json", {k: len(v) for k, v in data.items()}, data
 
 def _save_archive_locally(filename, payload):
@@ -5753,6 +5758,81 @@ async def _run_restore(uid, expected_backup_id):
     return True, (f"✅ Restored user {uid}: {counts.get(mongo_db.COLLECTIONS, 0)} character copy(ies) and their profile. "
                   f"The backup was kept.")
 
+def _live_data_problem(uid):
+    """Text if this user already has data in the main database (restoring could overwrite/duplicate it), else None."""
+    if _mc(mongo_db.USERS).find_one({"_id": uid}, {"_id": 1}) is not None \
+            or _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid}) > 0:
+        return (f"❌ User {uid} already has data in the main database, so restoring could overwrite or duplicate it. "
+                f"Nothing was restored.")
+    return None
+
+def _restore_from_file_plan(raw):
+    """READ-ONLY. Parse a backup file the bot sent to the owner. Returns (uid, docs, None) or (None, None, problem)."""
+    try:
+        from bson import json_util as _ju
+        doc = _ju.loads(raw.decode("utf-8"))
+    except Exception:
+        return None, None, "❌ That file is not a valid backup file. Nothing was restored."
+    if not isinstance(doc, dict) or not isinstance(doc.get("data"), dict):
+        return None, None, "❌ That file is not a backup file made by this bot. Nothing was restored."
+    uid = doc.get("user_id")
+    if not isinstance(uid, int) or isinstance(uid, bool):
+        return None, None, "❌ The backup file has no valid user ID. Nothing was restored."
+    if _deleted_review_protected(uid):
+        return None, None, "❌ That ID cannot be restored with this command."
+    try:
+        docs = _restore_docs({"data": doc["data"]}, uid)
+    except ValueError as e:
+        return None, None, f"❌ The backup file cannot be used ({e}). Nothing was restored."
+    problem = _live_data_problem(uid)
+    if problem:
+        return None, None, problem
+    return uid, docs, None
+
+async def _run_restore_file(uid, docs):
+    """Re-check and restore from a file-based backup. Returns (ok, text). Used only by the owner's confirm button."""
+    if _deleted_review_protected(uid):
+        return False, "❌ That ID cannot be restored with this command."
+    try:
+        problem = await asyncio.to_thread(_live_data_problem, uid)
+    except Exception as e:
+        print("restore-file lookup error:", e)
+        return False, "❌ Database error. Nothing was restored."
+    if problem:
+        return False, problem
+    try:
+        counts = await asyncio.to_thread(_restore_user_data, uid, docs)
+    except Exception as e:
+        print(f"restore-file error for {uid}:", e)
+        return False, (f"❌ Restore failed. The bot only removes the records it had just added. "
+                       f"Check with /deleteuser {uid} whether any data is present, then try again.")
+    return True, (f"✅ Restored user {uid}: {counts.get(mongo_db.COLLECTIONS, 0)} character copy(ies) and their profile "
+                  f"from the backup file.")
+
+async def _restore_from_file(update, context, document):
+    if (document.file_size or 0) > 15 * 1024 * 1024:
+        await safe_reply_text(update.message, "❌ That file is too large to be a backup file. Nothing was restored.")
+        return
+    try:
+        tg_file = await document.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        print("restore-file download error:", e)
+        await safe_reply_text(update.message, "❌ I could not download that file. Nothing was restored.")
+        return
+    uid, docs, problem = await asyncio.to_thread(_restore_from_file_plan, raw)
+    if problem:
+        await safe_reply_text(update.message, problem)
+        return
+    chars = len(docs.get(mongo_db.COLLECTIONS, []))
+    token = uuid.uuid4().hex[:10]
+    _data_pending(context)[token] = {"kind": "restore_file", "owner": update.effective_user.id, "uid": uid,
+                                     "docs": docs, "exp": time.monotonic() + _DATA_CONFIRM_SECONDS}
+    await safe_reply_text(update.message,
+        f"♻️ Backup file for user {uid}: {chars} character copy(ies) and their profile.\n\n"
+        f"Press Confirm Restore to restore it (valid for 10 minutes). Nothing has been changed yet.",
+        reply_markup=_data_confirm_keyboard(token, "✅ Confirm Restore"))
+
 async def restoreuser(update, context):
     if not is_owner(update.effective_user.id):
         await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
@@ -5762,8 +5842,13 @@ async def restoreuser(update, context):
         await safe_reply_text(update.message, "❌ Use /restoreuser in your private chat with the bot.")
         return
     args = context.args or []
+    reply = update.message.reply_to_message if update.message else None
+    if not args and reply is not None and reply.document is not None:
+        await _restore_from_file(update, context, reply.document)
+        return
     if not args or not re.fullmatch(r"[0-9]+", args[0]):
-        await safe_reply_text(update.message, "Usage: /restoreuser <user_id>")
+        await safe_reply_text(update.message,
+            "Usage: /restoreuser <user_id>\nOr reply to a backup file the bot sent you with /restoreuser")
         return
     uid = int(args[0])
     if _deleted_review_protected(uid):
@@ -5984,6 +6069,8 @@ async def data_confirm_callback(update, context):
     try:
         if rec["kind"] == "restore":
             _ok, text = await _run_restore(rec["uid"], rec["ref"])
+        elif rec["kind"] == "restore_file":
+            _ok, text = await _run_restore_file(rec["uid"], rec["docs"])
         else:
             _ok, text = await _run_move(rec["old"], rec["new"], rec["ref"])
     except Exception as e:                              # never leave the owner without an answer
@@ -6002,6 +6089,62 @@ async def deleted_account_sweep_loop(app):
         except Exception as e:
             print("Deleted-account sweep error; recovering:", e)
             await asyncio.sleep(600)
+
+def _find_users(query, limit=100):
+    """READ-ONLY. Users whose saved first name, last name or @username match every word of `query`."""
+    q = (query or "").strip().lstrip("@").strip()
+    if not q:
+        return [], 0
+    users = _mc(mongo_db.USERS)
+    fields = ("first_name", "last_name", "username")
+    ands = []
+    for word in q.split():
+        pat = {"$regex": re.escape(word), "$options": "i"}
+        ands.append({"$or": [{f: pat} for f in fields]})
+    flt = {"$and": ands}
+    if q.isdigit():
+        flt = {"$or": [flt, {"_id": int(q)}]}
+    total = users.count_documents(flt)
+    rows = list(users.find(flt, {"_id": 1, "first_name": 1, "last_name": 1, "username": 1}).limit(limit))
+    out = []
+    for r in rows:
+        uid = r["_id"]
+        owned = _mc(mongo_db.COLLECTIONS).count_documents({"user_id": uid})
+        name = " ".join(v for v in [r.get("first_name"), r.get("last_name")] if v).strip() or "Unknown"
+        out.append((uid, name, r.get("username") or "", owned))
+    out.sort(key=lambda x: (x[1].lower(), x[0]))
+    return out, total
+
+async def finduser(update, context):
+    """Owner only: find a user's ID from part of a saved name or @username."""
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await safe_reply_text(update.message, "Usage: /finduser <name or @username>")
+        return
+    try:
+        rows, total = await asyncio.to_thread(_find_users, query)
+    except Exception as e:
+        print("finduser error:", e)
+        await safe_reply_text(update.message, "❌ Database error. Nothing was changed.")
+        return
+    shown_query = html_escape(query)
+    if not rows:
+        await safe_reply_text(update.message, f"❌ No user found for \"{shown_query}\".", parse_mode="HTML")
+        return
+    entries = []
+    for i, (uid, name, username, owned) in enumerate(rows, 1):
+        handle = f"@{html_escape(username)}" if username else "No username"
+        entries.append(f"{i}. {html_escape(name)} ({handle})\n   🆔 ID: <code>{uid}</code>\n   🎴 Characters: {owned}")
+    head = f'🔎 Matches for "{shown_query}" ({total}):'
+    if total > len(rows):
+        head = f'🔎 Showing {len(rows)} of {total} matches for "{shown_query}".\nType a longer name to narrow it down.'
+    chunks = [entries[i:i + 15] for i in range(0, len(entries), 15)]
+    for n, chunk in enumerate(chunks):
+        text = (head + "\n\n" if n == 0 else "") + "\n\n".join(chunk)
+        await safe_reply_text(update.message, text, parse_mode="HTML")
 
 async def deleteuser(update, context):
     if not is_owner(update.effective_user.id):
@@ -6026,8 +6169,23 @@ async def deleteuser(update, context):
     display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
     if len(args) < 2 or args[1].lower() != "confirm":
         await safe_reply_text(update.message,
-            f"⚠️ This will permanently delete {display} [{uid}]: {owned} character(s), coins and profile.\n\n"
+            f"⚠️ This will permanently delete {display} [{uid}]: {owned} character(s), coins and profile.\n"
+            f"📁 A backup file of all their data will be sent to your PM first (it is not stored on the bot).\n\n"
             f"Confirm with: /deleteuser {uid} confirm")
+        return
+    # Collect all of the user's data and send it to the owner's PM BEFORE deleting. Nothing is stored anywhere else.
+    try:
+        import io as _io
+        payload, fname, _counts, _raw = await asyncio.to_thread(_archive_user_data, uid)
+        bio = _io.BytesIO(payload)
+        bio.name = fname
+        await context.bot.send_document(chat_id=update.effective_user.id, document=bio, filename=fname,
+                                        caption=f"Data of user {uid}, sent before deletion. Keep this file private.")
+    except Exception as e:
+        print("deleteuser backup-file error:", e)
+        await safe_reply_text(update.message,
+            "❌ I could not send the backup file to your PM (open a private chat with me and press Start). "
+            "Nothing was deleted.")
         return
     try:
         copies, removed = (await asyncio.to_thread(purge_user_data, uid))
@@ -6036,7 +6194,7 @@ async def deleteuser(update, context):
         await safe_reply_text(update.message, "❌ Could not delete that user. Nothing was changed.")
         return
     await safe_reply_text(update.message,
-        f"🗑 Deleted {display} [{uid}].\n🧹 Removed {copies} character copy(ies).")
+        f"🗑 Deleted {display} [{uid}].\n🧹 Removed {copies} character copy(ies).\n📁 The backup file was sent to your PM.")
     await notify_staff_action(
         context,
         f"🗑 USER DELETED\n👤 {display} [{uid}]\n🧹 {copies} character copy(ies)\n👤 By: {display_user(update.effective_user)}",
@@ -6266,7 +6424,8 @@ def format_staff_list(title, rows):
         lines.append("None assigned yet.")
     for i, (uid, name, username) in enumerate(rows, 1):
         handle = f" (@{html_escape(username)})" if username else ""
-        lines.append(f"{i}. {html_escape(name)}{handle} - ID: {uid}")
+        link = f"https://t.me/{username}" if username else f"tg://user?id={uid}"
+        lines.append(f'{i}. <a href="{html_escape(link, quote=True)}">{html_escape(name)}</a>{handle} - ID: <code>{uid}</code>')
     return "\n".join(lines)
 
 
@@ -10158,6 +10317,7 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("gift", gift))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("deleteuser", deleteuser))
+    app.add_handler(CommandHandler("finduser", finduser))
     app.add_handler(CommandHandler("restoreuser", restoreuser))
     app.add_handler(CommandHandler("moveuser", moveuser))
     app.add_handler(CallbackQueryHandler(data_confirm_callback, pattern=r"^dconf:(go|no):[0-9a-f]{10}$"))
