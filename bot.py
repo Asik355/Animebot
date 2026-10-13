@@ -1914,6 +1914,70 @@ def clear_photo_restriction(code):
     return True
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Balanced spawn mix + per-group cooldown
+#   * Old/new mix: the available characters are split by code into an OLDER half and a NEWER half. Every spawn
+#     picks one half at random (50/50), then a random character from it -> a fair mix, never mostly old or new.
+#   * Cooldown: after a Common/Rare/Epic character spawns in a group it cannot spawn again in THAT group for a
+#     random 36-48 hours (1.5-2 days). When the time is over it is simply back in the normal random pool, with no
+#     priority. If every character of a rarity is cooling down in a group, the one that finishes soonest is used,
+#     so spawning never stops. Legendary / Mythical / Celestial are exempt: their rules are unchanged.
+#     Stored in MongoDB (group_spawn_cooldown_v1), so restarts keep it.
+# ---------------------------------------------------------------------------------------------------------------
+_GROUP_COOLDOWN_COLL = "group_spawn_cooldown_v1"
+_HIGH_RARITIES = ("Legendary", "Mythical", "Celestial")
+_COOLDOWN_MIN_HOURS = 36
+_COOLDOWN_MAX_HOURS = 48
+
+
+def _group_cooldowns(chat_id):
+    """{code: cooldown_end_epoch} for this group; finished cooldowns are cleaned up."""
+    if chat_id is None:
+        return {}
+    try:
+        import time as _t
+        now = _t.time()
+        doc = _mc(_GROUP_COOLDOWN_COLL).find_one({"_id": int(chat_id)}) or {}
+        until = doc.get("until") or {}
+        active = {str(c): float(u) for c, u in until.items() if float(u) > now}
+        expired = [c for c, u in until.items() if float(u) <= now]
+        if expired:
+            _mc(_GROUP_COOLDOWN_COLL).update_one({"_id": int(chat_id)}, {"$unset": {f"until.{c}": "" for c in expired}})
+        return active
+    except Exception as e:
+        print("Group spawn cooldown load error:", e)
+        return {}
+
+
+def _group_cooldown_add(chat_id, character):
+    """Start the 1.5-2 day cooldown for a spawned Common/Rare/Epic character in this group."""
+    try:
+        if str(character[3]) in _HIGH_RARITIES:
+            return
+        import time as _t
+        end = _t.time() + random.uniform(_COOLDOWN_MIN_HOURS, _COOLDOWN_MAX_HOURS) * 3600
+        _mc(_GROUP_COOLDOWN_COLL).update_one({"_id": int(chat_id)}, {"$set": {f"until.{character[0]}": end}}, upsert=True)
+    except Exception as e:
+        print("Group spawn cooldown save error:", e)
+
+
+def _apply_group_cooldown(rows, cooldowns):
+    """Rows not cooling down; if all are, only the one whose cooldown ends soonest."""
+    free = [r for r in rows if str(r[0]) not in cooldowns]
+    if free or not rows:
+        return free
+    return [min(rows, key=lambda r: cooldowns.get(str(r[0]), 0))]
+
+
+def _pick_old_new_mix(rows):
+    """Random old/new mix: pick the older or the newer half with equal chance, then a random character from it."""
+    if len(rows) < 2:
+        return random.choice(rows)
+    ordered = sorted(rows, key=lambda r: int(r[0]) if str(r[0]).isdigit() else 0)
+    mid = len(ordered) // 2
+    return random.choice(random.choice([ordered[:mid], ordered[mid:]]))
+
+
 def _choose_unlimited_fallback_character(excluded_codes=None, chat_id=None, allow_recent=False, require_photo=False):
     """Emergency picker: always prefer an unused Common/Rare/Epic character."""
     excluded = {str(code) for code in (excluded_codes or set())}
@@ -1930,24 +1994,23 @@ def _choose_unlimited_fallback_character(excluded_codes=None, chat_id=None, allo
     if not rows:
         return None
     try:
-        counts = mongo_db.sh_code_counts()
-        # Least-used first prevents unnecessary repeats while keeping the choice random.
-        least = min(counts.get(str(r[0]), 0) for r in rows)
-        pool = [r for r in rows if counts.get(str(r[0]), 0) == least]
-        return random.choice(pool)
+        rows = _apply_group_cooldown(rows, _group_cooldowns(chat_id)) or rows
     except Exception as e:
-        pass
-        print("Fallback character count lookup error:", e)
-        return random.choice(rows)
+        print("Fallback group-cooldown error:", e)
+    return _pick_old_new_mix(rows)
 
 def choose_character(chat_id, excluded_codes=None, app=None, respect_daily_limit=True, require_photo=False):
     excluded = {str(code) for code in (excluded_codes or set())}
     if respect_daily_limit:
         excluded.update(get_daily_random_spawn_limited_codes(chat_id, app))
     excluded.update(get_recent_global_spawn_codes(chat_id))
+    cooldowns = _group_cooldowns(chat_id)
 
     def available_rows(rarity):
-        return [row for row in get_characters_by_rarity(rarity) if str(row[0]) not in excluded and (not require_photo or spawn_photo_ok(row))]
+        rows = [row for row in get_characters_by_rarity(rarity) if str(row[0]) not in excluded and (not require_photo or spawn_photo_ok(row))]
+        if rarity in _HIGH_RARITIES:
+            return rows
+        return _apply_group_cooldown(rows, cooldowns)
 
     available = [(r, w) for r, w in CHANCES if available_rows(r)]
 
@@ -1964,15 +2027,7 @@ def choose_character(chat_id, excluded_codes=None, app=None, respect_daily_limit
             rarity = random.choices([r for r, _ in available], weights=[w for _, w in available], k=1)[0]
             rows = available_rows(rarity)
             if rows:
-                counts = mongo_db.sh_code_counts()
-
-                rows.sort(key=lambda r: int(r[0]) if str(r[0]).isdigit() else 0)
-                mid = max(1, len(rows) // 2)
-                buckets = [rows[:mid], rows[mid:]] if len(rows) > 1 else [rows]
-                totals = [sum(counts.get(str(r[0]), 0) for r in b) for b in buckets]
-                bucket = buckets[0] if len(buckets) == 1 or totals[0] < totals[1] else buckets[1] if totals[1] < totals[0] else random.choice(buckets)
-                least = min(counts.get(str(r[0]), 0) for r in bucket)
-                return random.choice([r for r in bucket if counts.get(str(r[0]), 0) == least])
+                return _pick_old_new_mix(rows)
 
     return _choose_unlimited_fallback_character(excluded, chat_id, require_photo=require_photo)
 
@@ -6748,6 +6803,7 @@ async def owner_notification_callback(update, context):
 
 def record_spawn_history(chat_id, character, spawned_by="auto"):
     try:
+        _group_cooldown_add(chat_id, character)
         return mongo_db.sh_insert(chat_id, character[0], character[3], spawned_by, india_timestamp())
     except Exception as e:
         print("Spawn history error:", e)
