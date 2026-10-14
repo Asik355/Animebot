@@ -417,13 +417,17 @@ def save_guess_state(user_id, attempts, secret=None, active=False):
 @retry_write
 def finish_guess_win(user_id, attempt, per_win, cap):
     """Award min(per_win, cap - total_so_far) coins and close the game. Returns reward."""
-    d = col(USERS).find_one({"_id": int(user_id)}, {"guess_reward_total": 1})
+    day = (datetime.now(timezone(timedelta(hours=5, minutes=30))) - timedelta(hours=4)).date().isoformat()
+    d = col(USERS).find_one({"_id": int(user_id)}, {"guess_reward_total": 1, "guess_reward_day": 1})
     total = int((d or {}).get("guess_reward_total") or 0)
+    if (d or {}).get("guess_reward_day") != day:
+        total = 0
     reward = min(int(per_win), max(0, int(cap) - total))
     col(USERS).update_one(
         {"_id": int(user_id)},
-        {"$inc": {"coins": reward, "guess_reward_total": reward},
-         "$set": {"guess_attempts": int(attempt), "guess_secret": None, "guess_active": 0}},
+        {"$inc": {"coins": reward},
+         "$set": {"guess_reward_total": total + reward, "guess_reward_day": day,
+                  "guess_attempts": int(attempt), "guess_secret": None, "guess_active": 0}},
     )
     return reward
 
