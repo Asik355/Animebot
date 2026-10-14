@@ -3464,6 +3464,10 @@ async def mystats(update, context):
     send_remaining = max(0, BERRY_TRANSFER_DAILY_SEND_LIMIT - int(sent_today or 0))
     receive_remaining = max(0, BERRY_TRANSFER_DAILY_RECEIVE_LIMIT - int(received_today or 0))
 
+    guess_doc = (await asyncio.to_thread(_mc(mongo_db.USERS).find_one, {"_id": update.effective_user.id}, {"guess_reward_total": 1, "guess_reward_day": 1})) or {}
+    guess_earned = int(guess_doc.get("guess_reward_total") or 0) if guess_doc.get("guess_reward_day") == shop_rotation_key() else 0
+    guess_remaining = max(0, GUESS_REWARD_CAP - guess_earned)
+
     await safe_reply_text(update.message,
         f"👤 {update.effective_user.first_name}\n\n"
         f"🛡 Role: {(await asyncio.to_thread(staff_role, update.effective_user.id))}\n"
@@ -3475,7 +3479,10 @@ async def mystats(update, context):
         f"📥 Received today: {int(received_today)} ⦵\n"
         f"📊 Send remaining: {send_remaining} ⦵\n"
         f"📊 Receive remaining: {receive_remaining} ⦵\n"
-        f"🔄 Transfers today: {int(transfers_today or 0)}"
+        f"🔄 Transfers today: {int(transfers_today or 0)}\n\n"
+        f"🎯 Number Guess (daily cap)\n"
+        f"🎁 Earned today: {guess_earned} ⦵\n"
+        f"📊 Remaining: {guess_remaining} ⦵"
     , parse_mode="HTML")
 
 SHOP_RARITIES = ("Common", "Rare", "Legendary", "Mythical")
