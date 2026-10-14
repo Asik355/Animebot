@@ -1,594 +1,832 @@
 import dns.resolver
+
 dns.resolver.default_resolver = dns.resolver.Resolver(configure=False)
-dns.resolver.default_resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+dns.resolver.default_resolver.nameservers = ["8.8.8.8"]
 
-
-#!/usr/bin/env python3
 """
-migrate_to_mongo.py - one-time import of bot_database.db + JSON registries into MongoDB Atlas.
+MongoDB (Atlas) for the bot - the ONLY file that talks to the database driver.
 
-Run it LOCALLY (where your real bot_database.db lives), with MONGO_URI set in .env or the shell:
+  * the bot imports this module as its data layer   ->  import migrate_to_mongo as store
+  * run it directly to move an existing SQLite file ->  python migrate_to_mongo.py [rose_clone.db]
+        --dry-run   show what would be copied, write nothing
+        --force     copy again even though a migration was already recorded
 
-    python migrate_to_mongo.py --dry-run          # read + transform + report, no MongoDB needed
-    python migrate_to_mongo.py                    # real import (refuses if data already exists)
-    python migrate_to_mongo.py --force            # re-run / overwrite by key (idempotent upserts)
-    python migrate_to_mongo.py --wipe --yes       # drop migrated collections first, then import
+Environment:  MONGO_URI (required)   MONGO_DB (optional, default "telegram_bot")
 
-Mapping
--------
-Core tables (reshaped for the refactored bot):
-    users_v2                     -> users          (_id = user_id; includes guess_* game fields)
-    characters_v2                -> characters     (+ recruit_names[] and discontinued flag embedded)
-    character_recruit_names_v2   -> characters.recruit_names (ordered by old id)
-    discontinued_characters_v2   -> characters.discontinued/_at/_by
-    collections_v2               -> collections    (one doc per copy; old id kept as legacy_id)
-    favorites_v2                 -> favorites      (_id = user_id)
-JSON files:
-    approved_groups.json, auto_spawn_groups.json, bot_groups.json, bot_group_state.json,
-    gstats_hidden_groups.json                                    -> groups (one doc per chat)
-    notification_settings.json   -> notification_settings
-    restrictions.json            -> restrictions
-    character_spawn_cooldowns.json -> character_spawn_cooldowns (_id = character code,
-                                    last_spawned_at kept verbatim as the original ISO string)
-Every other SQLite table is copied 1:1 into a collection with the SAME NAME (for the later
-refactor phases): AUTOINCREMENT `id` becomes `_id`, other primary keys get unique indexes,
-and `counters` is seeded so new ids continue where SQLite left off.
+Collections (same names as the old SQLite tables, so nothing is lost in translation):
+  settings, warn_log, notes, filters, blocklist, setlog_pending, super_admins, approved, allowlist,
+  captcha_pending, roast_profiles, roast_battles, roast_results, roast_votes, court_cases,
+  court_votes, court_verdicts, modlog (new: per-group moderation history)  (+ counters for auto-increment ids, meta for the migration marker)
 
-The script is idempotent (upserts by key) and never modifies the SQLite file or JSON files.
+Speed: the bot reads settings / approvals / allowlist / blocklist / filters / notes / super admins
+on almost every message, so those are cached in memory and the cache is updated on every write
+(one bot instance = one process, so the cache can't go stale).
 """
-
-import argparse
-import json
-from datetime import datetime
-import sqlite3
+import logging
+import os
+import shutil
 import sys
-from pathlib import Path
+import tempfile
+import threading
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-HERE = Path(__file__).resolve().parent
+import certifi
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReplaceOne, ReturnDocument
+from pymongo.errors import ConfigurationError, DuplicateKeyError, PyMongoError
 
-CORE_TABLES = {
-    "users_v2", "characters_v2", "character_recruit_names_v2",
-    "discontinued_characters_v2", "collections_v2", "favorites_v2",
-}
-SKIP_TABLES = {"sqlite_sequence"}
-MIGRATED_CORE_COLLECTIONS = ["users", "characters", "collections", "favorites",
-                             "groups", "notification_settings", "restrictions",
-                             "character_spawn_cooldowns", "orphan_recruit_names"]
-
-
-# --------------------------------------------------------------------------
-# Reading
-# --------------------------------------------------------------------------
-def open_sqlite(path):
-    if not Path(path).exists():
-        sys.exit(f"SQLite file not found: {path}")
-    conn = sqlite3.connect(str(path))  # this script only ever SELECTs from it
-    conn.row_factory = sqlite3.Row
-    return conn
+log = logging.getLogger("mongo")
+DBError = PyMongoError  # what callers catch for "the database failed"
 
 
-def table_names(conn):
-    return [r[0] for r in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+class StoreError(RuntimeError):
+    """Startup problem with a readable message (bad URI, unreachable cluster, ...)."""
 
 
-def read_table(conn, name):
-    return [dict(r) for r in conn.execute(f'SELECT * FROM "{name}"')]
+# ------------------------------------------------------------------ connection
+_client = None
+_db = None
+_lock = threading.RLock()
 
 
-def pk_columns(conn, name):
-    info = conn.execute(f'PRAGMA table_info("{name}")').fetchall()
-    pks = sorted((r["pk"], r["name"]) for r in info if r["pk"] > 0)
-    return [c for _, c in pks]
+def _wants_tls(uri):
+    u = uri.lower()
+    return u.startswith("mongodb+srv://") or "tls=true" in u or "ssl=true" in u
 
 
-def read_json(path, default):
-    p = Path(path)
-    if not p.exists():
-        return None
+def connect(uri=None):
+    """Connect to MongoDB Atlas (mongodb+srv:// is fine), create the indexes, return the database."""
+    global _client, _db
+    if _db is not None:
+        return _db
+    uri = (uri or os.getenv("MONGO_URI") or "").strip()
+    if not uri:
+        raise StoreError("MONGO_URI is not set.")
+    kwargs = dict(serverSelectionTimeoutMS=10000, connectTimeoutMS=10000, socketTimeoutMS=30000,
+                  retryWrites=True, appname="telegram-group-bot")
+    if _wants_tls(uri):
+        kwargs["tlsCAFile"] = certifi.where()  # current CA bundle: TLS verification just works
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"  ! could not parse {p.name}: {exc}")
-        return default
+        client = MongoClient(uri, **kwargs)
+        client.admin.command("ping")
+    except ConfigurationError as e:
+        raise StoreError(f"MONGO_URI is not valid: {e}. If the password has special characters "
+                         "(@ : / ? # %), URL-encode them.") from e
+    except PyMongoError as e:
+        raise StoreError(
+            f"Could not reach MongoDB ({type(e).__name__}: {e}). Check: (1) MONGO_URI is correct, "
+            "(2) the database user/password are right, (3) Atlas > Network Access allows this "
+            "machine (Render: add 0.0.0.0/0), (4) the cluster isn't paused.") from e
+    name = (os.getenv("MONGO_DB") or "").strip()
+    if not name:
+        try:
+            name = client.get_default_database().name  # a database named inside the URI
+        except (ConfigurationError, PyMongoError):
+            name = "telegram_bot"
+    _client, _db = client, client[name]
+    _ensure_indexes()
+    log.info("MongoDB connected (database: %s).", name)
+    return _db
 
 
-# --------------------------------------------------------------------------
-# Pure transforms (no MongoDB needed - used by --dry-run too)
-# --------------------------------------------------------------------------
-def build_users(rows):
-    docs = []
-    for r in rows:
-        docs.append({
-            "_id": int(r["user_id"]),
-            "username": r.get("username") or "",
-            "first_name": r.get("first_name") or "",
-            "last_name": r.get("last_name") or "",
-            "coins": int(r.get("coins") or 0),
-            "last_daily": r.get("last_daily"),
-            "guess_day": r.get("guess_day"),
-            "guess_attempts": int(r.get("guess_attempts") or 0),
-            "guess_secret": r.get("guess_secret"),
-            "guess_active": int(r.get("guess_active") or 0),
-            "guess_reward_total": int(r.get("guess_reward_total") or 0),
-        })
-    return docs
+def col(name):
+    if _db is None:
+        raise StoreError("Database not connected: call connect() first.")
+    return _db[name]
 
 
-def build_characters(chars, recruit_rows, discontinued_rows):
-    recruit = {}
-    for r in sorted(recruit_rows, key=lambda x: x["id"]):
-        recruit.setdefault(str(r["character_code"]), []).append(r["recruit_name"])
-    disc = {str(r["character_code"]): r for r in discontinued_rows}
-    docs, orphan_recruit, orphan_disc = [], set(recruit), set(disc)
-    for r in chars:
-        code = str(r["code"])
-        orphan_recruit.discard(code)
-        orphan_disc.discard(code)
-        name = r.get("name")
-        doc = {
-            "code": code,
-            "code_int": int(code) if code.isdigit() else 0,
-            "name": name,
-            "name_ci": str(name).casefold() if name else None,
-            "anime": r.get("anime"),
-            "rarity": r.get("rarity"),
-            "worth": int(r.get("worth") or 0),
-            "photo_file_id": r.get("photo_file_id"),
-            "recruit_names": recruit.get(code, []),
-        }
-        if code in disc:
-            doc["discontinued"] = True
-            doc["discontinued_at"] = disc[code].get("discontinued_at")
-            doc["discontinued_by"] = disc[code].get("discontinued_by")
-        docs.append(doc)
-    return docs, sorted(orphan_recruit), sorted(orphan_disc)
+def next_id(name):
+    """Auto-increment id (the old AUTOINCREMENT columns), atomic on the server."""
+    doc = col("counters").find_one_and_update(
+        {"_id": name}, {"$inc": {"seq": 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+    return int(doc["seq"])
 
 
-def build_collections(rows):
-    return [{
-        "legacy_id": int(r["id"]),
-        "user_id": int(r["user_id"]),
-        "character_code": str(r["character_code"]),
-        "caught_at": r.get("caught_at"),
-    } for r in rows]
+def _clean(doc):
+    if doc is not None:
+        doc.pop("_id", None)
+    return doc
 
 
-def build_favorites(rows):
-    return [{"_id": int(r["user_id"]), "character_code": str(r["character_code"]), "set_at": r.get("set_at")}
-            for r in rows]
+UNIQUE_INDEXES = {
+    "settings": ["chat_id", "key"], "notes": ["chat_id", "name"], "filters": ["chat_id", "keyword"],
+    "blocklist": ["chat_id", "word"], "approved": ["chat_id", "user_id"],
+    "allowlist": ["chat_id", "kind", "value"], "captcha_pending": ["chat_id", "user_id"],
+    "setlog_pending": ["channel_id"], "super_admins": ["user_id"], "warn_log": ["id"],
+    "roast_profiles": ["chat_id", "user_id"], "roast_battles": ["id"], "roast_results": ["id"],
+    "roast_votes": ["battle_id", "voter_id"], "court_cases": ["id"],
+    "court_votes": ["case_id", "voter_id"], "court_verdicts": ["id"],
+    "modlog": ["id"], "notice_pending": ["chat_id", "message_id"],
+}
+PLAIN_INDEXES = {
+    "warn_log": [["chat_id", "user_id"]], "captcha_pending": [["expires"]],
+    "roast_battles": [["chat_id"]], "roast_profiles": [["chat_id", "points"]],
+    "court_cases": [["chat_id", "case_no"], ["chat_id", "defendant_id"]], "court_verdicts": [["case_id"]],
+    "modlog": [["chat_id", "id"]], "notice_pending": [["delete_at"]],
+}
+# MongoDB deletes a document by itself once its "expire_at" date has passed (no bot code involved).
+# Documents without an expire_at (the old modlog rows) are never touched by this.
+TTL_INDEXES = ("modlog", "notice_pending")
 
 
-def _id_list(data):
-    """Accept a list of ids, or a dict {id: bool}; return {int_id: bool}."""
-    out = {}
-    if isinstance(data, list):
-        for x in data:
-            if str(x).lstrip("-").isdigit():
-                out[int(x)] = True
-    elif isinstance(data, dict):
-        for k, v in data.items():
-            if str(k).lstrip("-").isdigit():
-                out[int(k)] = bool(v)
+def _ensure_indexes():
+    for name, keys in UNIQUE_INDEXES.items():
+        try:
+            col(name).create_index([(k, ASCENDING) for k in keys], unique=True)
+        except PyMongoError as e:
+            log.warning("Couldn't create the unique index on %s%s: %s", name, keys, e)
+    for name, groups in PLAIN_INDEXES.items():
+        for keys in groups:
+            try:
+                col(name).create_index([(k, ASCENDING) for k in keys])
+            except PyMongoError as e:
+                log.warning("Couldn't create an index on %s%s: %s", name, keys, e)
+    for name in TTL_INDEXES:
+        try:
+            col(name).create_index("expire_at", expireAfterSeconds=0)
+        except PyMongoError as e:
+            log.warning("Couldn't create the automatic-cleanup index on %s: %s", name, e)
+
+
+# ------------------------------------------------------------------ settings
+_S = {}  # chat_id -> {key: value}
+
+
+def _settings(chat_id):
+    d = _S.get(chat_id)
+    if d is None:
+        d = {r["key"]: r["value"] for r in col("settings").find({"chat_id": chat_id})}
+        if len(_S) > 5000:
+            _S.clear()
+        _S[chat_id] = d
+    return d
+
+
+def get_setting(chat_id, key, default=None):
+    with _lock:
+        return _settings(int(chat_id)).get(key, default)
+
+
+def set_setting(chat_id, key, value):
+    chat_id, value = int(chat_id), str(value)
+    with _lock:
+        col("settings").update_one({"chat_id": chat_id, "key": key}, {"$set": {"value": value}}, upsert=True)
+        _settings(chat_id)[key] = value
+
+
+def del_setting(chat_id, key):
+    chat_id = int(chat_id)
+    with _lock:
+        col("settings").delete_one({"chat_id": chat_id, "key": key})
+        _settings(chat_id).pop(key, None)
+
+
+def del_setting_everywhere(key):
+    with _lock:
+        col("settings").delete_many({"key": key})
+        _S.clear()
+
+
+def settings_with_prefix(chat_id, prefix):
+    with _lock:
+        return {k: v for k, v in _settings(int(chat_id)).items() if k.startswith(prefix)}
+
+
+# ------------------------------------------------------------------ approved users
+_APP = {}  # chat_id -> {user_id: True} (insertion ordered)
+
+
+def _approved(chat_id):
+    d = _APP.get(chat_id)
+    if d is None:
+        d = {r["user_id"]: True for r in col("approved").find({"chat_id": chat_id})}
+        if len(_APP) > 5000:
+            _APP.clear()
+        _APP[chat_id] = d
+    return d
+
+
+def is_approved(chat_id, user_id):
+    with _lock:
+        return int(user_id) in _approved(int(chat_id))
+
+
+def approve(chat_id, user_id):
+    chat_id, user_id = int(chat_id), int(user_id)
+    with _lock:
+        col("approved").update_one({"chat_id": chat_id, "user_id": user_id},
+                                   {"$set": {"chat_id": chat_id, "user_id": user_id}}, upsert=True)
+        _approved(chat_id)[user_id] = True
+
+
+def unapprove(chat_id, user_id):
+    chat_id, user_id = int(chat_id), int(user_id)
+    with _lock:
+        col("approved").delete_one({"chat_id": chat_id, "user_id": user_id})
+        _approved(chat_id).pop(user_id, None)
+
+
+def approved_ids(chat_id):
+    with _lock:
+        return list(_approved(int(chat_id)))
+
+
+def approved_count(chat_id):
+    with _lock:
+        return len(_approved(int(chat_id)))
+
+
+def unapprove_all(chat_id):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("approved").delete_many({"chat_id": chat_id}).deleted_count
+        _APP[chat_id] = {}
+        return n
+
+
+# ------------------------------------------------------------------ allowlist
+_ALLOW = {}  # chat_id -> {kind: set(values)}
+
+
+def _allow(chat_id):
+    d = _ALLOW.get(chat_id)
+    if d is None:
+        d = defaultdict(set)
+        for r in col("allowlist").find({"chat_id": chat_id}):
+            d[r["kind"]].add(r["value"])
+        if len(_ALLOW) > 5000:
+            _ALLOW.clear()
+        _ALLOW[chat_id] = d
+    return d
+
+
+def allow_load(chat_id):
+    with _lock:
+        out = defaultdict(set)
+        for kind, values in _allow(int(chat_id)).items():
+            out[kind] = set(values)
+        return out
+
+
+def allow_count(chat_id):
+    with _lock:
+        return sum(len(v) for v in _allow(int(chat_id)).values())
+
+
+def allow_add(chat_id, kind, value):
+    """True if it was new, False if it was already on the list."""
+    chat_id = int(chat_id)
+    with _lock:
+        try:
+            col("allowlist").insert_one({"chat_id": chat_id, "kind": kind, "value": value})
+        except DuplicateKeyError:
+            _allow(chat_id)[kind].add(value)
+            return False
+        _allow(chat_id)[kind].add(value)
+        return True
+
+
+def allow_remove(chat_id, kind, value):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("allowlist").delete_one({"chat_id": chat_id, "kind": kind, "value": value}).deleted_count
+        _allow(chat_id)[kind].discard(value)
+        return bool(n)
+
+
+def allow_clear(chat_id):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("allowlist").delete_many({"chat_id": chat_id}).deleted_count
+        _ALLOW[chat_id] = defaultdict(set)
+        return n
+
+
+# ------------------------------------------------------------------ blocklist
+_BLOCK = {}  # chat_id -> [words]
+
+
+def _block(chat_id):
+    d = _BLOCK.get(chat_id)
+    if d is None:
+        d = [r["word"] for r in col("blocklist").find({"chat_id": chat_id})]
+        if len(_BLOCK) > 5000:
+            _BLOCK.clear()
+        _BLOCK[chat_id] = d
+    return d
+
+
+def block_words(chat_id):
+    with _lock:
+        return list(_block(int(chat_id)))
+
+
+def block_add(chat_id, word):
+    chat_id = int(chat_id)
+    with _lock:
+        col("blocklist").update_one({"chat_id": chat_id, "word": word},
+                                    {"$set": {"chat_id": chat_id, "word": word}}, upsert=True)
+        words = _block(chat_id)
+        if word not in words:
+            words.append(word)
+
+
+def block_remove(chat_id, word):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("blocklist").delete_one({"chat_id": chat_id, "word": word}).deleted_count
+        words = _block(chat_id)
+        if word in words:
+            words.remove(word)
+        return bool(n)
+
+
+# ------------------------------------------------------------------ filters
+_FILT = {}  # chat_id -> {keyword: reply}
+
+
+def _filters(chat_id):
+    d = _FILT.get(chat_id)
+    if d is None:
+        d = {r["keyword"]: r["reply"] for r in col("filters").find({"chat_id": chat_id})}
+        if len(_FILT) > 5000:
+            _FILT.clear()
+        _FILT[chat_id] = d
+    return d
+
+
+def filter_rows(chat_id):
+    with _lock:
+        return list(_filters(int(chat_id)).items())
+
+
+def filter_add(chat_id, keyword, reply):
+    chat_id = int(chat_id)
+    with _lock:
+        col("filters").update_one({"chat_id": chat_id, "keyword": keyword}, {"$set": {"reply": reply}},
+                                  upsert=True)
+        _filters(chat_id)[keyword] = reply
+
+
+def filter_remove(chat_id, keyword):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("filters").delete_one({"chat_id": chat_id, "keyword": keyword}).deleted_count
+        _filters(chat_id).pop(keyword, None)
+        return bool(n)
+
+
+# ------------------------------------------------------------------ notes
+_NOTES = {}  # chat_id -> {name: content}
+
+
+def _notes(chat_id):
+    d = _NOTES.get(chat_id)
+    if d is None:
+        d = {r["name"]: r["content"] for r in col("notes").find({"chat_id": chat_id})}
+        if len(_NOTES) > 2000:
+            _NOTES.clear()
+        _NOTES[chat_id] = d
+    return d
+
+
+def note_get(chat_id, name):
+    with _lock:
+        return _notes(int(chat_id)).get(name)
+
+
+def note_set(chat_id, name, content):
+    chat_id = int(chat_id)
+    with _lock:
+        col("notes").update_one({"chat_id": chat_id, "name": name}, {"$set": {"content": content}}, upsert=True)
+        _notes(chat_id)[name] = content
+
+
+def note_names(chat_id):
+    with _lock:
+        return list(_notes(int(chat_id)))
+
+
+def note_del(chat_id, name):
+    chat_id = int(chat_id)
+    with _lock:
+        n = col("notes").delete_one({"chat_id": chat_id, "name": name}).deleted_count
+        _notes(chat_id).pop(name, None)
+        return bool(n)
+
+
+# ------------------------------------------------------------------ warnings
+def warn_add(chat_id, user_id, reason, ts):
+    col("warn_log").insert_one({"id": next_id("warn_log"), "chat_id": int(chat_id), "user_id": int(user_id),
+                                "reason": reason, "ts": int(ts)})
+
+
+def warn_active(chat_id, user_id, expiry=0):
+    """Unexpired warnings, oldest first, as (id, reason, ts). Expired ones are deleted first."""
+    chat_id, user_id = int(chat_id), int(user_id)
+    if expiry:
+        col("warn_log").delete_many({"chat_id": chat_id, "ts": {"$lt": int(time.time()) - int(expiry)}})
+    rows = col("warn_log").find({"chat_id": chat_id, "user_id": user_id}, sort=[("id", ASCENDING)])
+    return [(r["id"], r.get("reason"), r.get("ts")) for r in rows]
+
+
+def warn_delete(warn_id, chat_id=None):
+    """Delete one warning. Pass chat_id so a warning id can only ever be removed from its own group."""
+    flt = {"id": warn_id}
+    if chat_id is not None:
+        flt["chat_id"] = int(chat_id)
+    col("warn_log").delete_one(flt)
+
+
+def warn_clear(chat_id, user_id):
+    col("warn_log").delete_many({"chat_id": int(chat_id), "user_id": int(user_id)})
+
+
+# ------------------------------------------------------------------ captcha
+def captcha_put(chat_id, user_id, msg_id, answer, attempts, expires, mention):
+    chat_id, user_id = int(chat_id), int(user_id)
+    col("captcha_pending").replace_one(
+        {"chat_id": chat_id, "user_id": user_id},
+        {"chat_id": chat_id, "user_id": user_id, "msg_id": msg_id, "answer": answer,
+         "attempts": attempts, "expires": int(expires), "mention": mention}, upsert=True)
+
+
+def captcha_get(chat_id, user_id):
+    """(msg_id, answer, attempts, mention) or None."""
+    r = col("captcha_pending").find_one({"chat_id": int(chat_id), "user_id": int(user_id)})
+    return (r["msg_id"], r["answer"], r.get("attempts", 0), r.get("mention")) if r else None
+
+
+def captcha_delete(chat_id, user_id):
+    col("captcha_pending").delete_one({"chat_id": int(chat_id), "user_id": int(user_id)})
+
+
+def captcha_set_attempts(chat_id, user_id, attempts):
+    col("captcha_pending").update_one({"chat_id": int(chat_id), "user_id": int(user_id)},
+                                      {"$set": {"attempts": attempts}})
+
+
+def captcha_pop(chat_id, user_id):
+    """msg_id of the pending challenge (or None); the record is removed."""
+    r = col("captcha_pending").find_one_and_delete({"chat_id": int(chat_id), "user_id": int(user_id)})
+    return r["msg_id"] if r else None
+
+
+def captcha_pop_chat(chat_id):
+    """[(user_id, msg_id)] for everyone still waiting in this chat; all records removed."""
+    chat_id = int(chat_id)
+    rows = [(r["user_id"], r["msg_id"]) for r in col("captcha_pending").find({"chat_id": chat_id})]
+    col("captcha_pending").delete_many({"chat_id": chat_id})
+    return rows
+
+
+def captcha_take_expired(now):
+    """[(chat_id, user_id, msg_id, mention)] whose time ran out; removed. Each one is claimed
+    atomically, so even two overlapping sweeps can't fail the same member twice."""
+    out = []
+    for r in list(col("captcha_pending").find({"expires": {"$lte": int(now)}})):
+        if col("captcha_pending").delete_one({"chat_id": r["chat_id"], "user_id": r["user_id"]}).deleted_count:
+            out.append((r["chat_id"], r["user_id"], r["msg_id"], r.get("mention")))
     return out
 
 
-def build_groups(json_dir):
-    """Merge every group-related JSON file into {chat_id: fields}."""
-    groups = {}
-
-    def touch(cid):
-        return groups.setdefault(cid, {})
-
-    approved = read_json(json_dir / "approved_groups.json", [])
-    for cid in _id_list(approved or []):
-        touch(cid)["approved"] = True
-
-    auto = read_json(json_dir / "auto_spawn_groups.json", [])
-    for cid in _id_list(auto or []):
-        touch(cid)["auto_spawn"] = True
-
-    hidden = read_json(json_dir / "gstats_hidden_groups.json", [])
-    for cid in _id_list(hidden or []):
-        touch(cid)["gstats_hidden"] = True
-
-    state = read_json(json_dir / "bot_group_state.json", {})
-    for cid, val in _id_list(state or {}).items():
-        touch(cid)["bot_enabled"] = val
-
-    info = read_json(json_dir / "bot_groups.json", {})
-    if isinstance(info, dict):
-        for k, v in info.items():
-            if str(k).lstrip("-").isdigit() and isinstance(v, dict):
-                d = touch(int(k))
-                d.update({"registered": True, "title": v.get("title"),
-                          "type": v.get("type"), "username": v.get("username")})
-
-    # make absent booleans explicit so queries are uniform
-    for d in groups.values():
-        for flag in ("approved", "auto_spawn", "registered", "gstats_hidden"):
-            d.setdefault(flag, False)
-    return groups
+# ------------------------------------------------------------------ log-channel handshake
+def setlog_put(channel_id, message_id, ts):
+    channel_id = int(channel_id)
+    col("setlog_pending").replace_one({"channel_id": channel_id},
+                                      {"channel_id": channel_id, "message_id": message_id, "ts": int(ts)},
+                                      upsert=True)
 
 
-def build_notifications(json_dir):
-    data = read_json(json_dir / "notification_settings.json", {}) or {}
-    users = data.get("users", {}) if isinstance(data, dict) else {}
-    return [{"_id": int(k), "enabled": bool(v)} for k, v in users.items() if str(k).lstrip("-").isdigit()]
+def setlog_get(channel_id):
+    """(message_id, ts) or None."""
+    r = col("setlog_pending").find_one({"channel_id": int(channel_id)})
+    return (r["message_id"], r["ts"]) if r else None
 
 
-def build_restrictions(json_dir):
-    data = read_json(json_dir / "restrictions.json", {}) or {}
-    docs = []
-    if isinstance(data, dict):
-        for k, v in data.items():
-            if not str(k).lstrip("-").isdigit():
-                continue
-            entry = dict(v) if isinstance(v, dict) else {"expiry": int(v)}
-            entry["_id"] = int(k)
-            docs.append(entry)
-    return docs
+def setlog_del(channel_id):
+    col("setlog_pending").delete_one({"channel_id": int(channel_id)})
 
 
-def build_spawn_cooldowns(json_dir):
-    """
-    character_spawn_cooldowns.json: {character_code: "ISO timestamp of last spawn"}.
-    Returns (docs, bad_entries). Timestamps are stored exactly as in the file (string), so
-    nothing about the cooldown clock changes; unparseable entries are reported, not silently dropped.
-    """
-    data = read_json(json_dir / "character_spawn_cooldowns.json", {}) or {}
-    docs, bad = [], []
-    if not isinstance(data, dict):
-        return docs, [f"top level is {type(data).__name__}, expected an object {{code: timestamp}}"]
-    for k, v in data.items():
-        code = str(k).strip()
-        if not code:
-            bad.append(f"empty character code (value={v!r})")
-            continue
-        try:
-            datetime.fromisoformat(str(v))
-        except Exception:
-            bad.append(f"character {code}: invalid timestamp {v!r}")
-            continue
-        docs.append({"_id": code, "character_code": code, "last_spawned_at": str(v)})
-    return docs, bad
+# ------------------------------------------------------------------ super admins (bot moderators)
+_SA = None  # {user_id: (username, ts)} - small, loaded once
 
 
-# --------------------------------------------------------------------------
-# Pre-flight validation (pure, no MongoDB needed) - runs in --dry-run AND before every real import
-# --------------------------------------------------------------------------
-# unique indexes that mongo_db.ensure_indexes() creates on migrated collections
-UNIQUE_KEYS = {
-    "group_character_spawn_v1": ["chat_id", "character_code", "day_key"],
-    "event_claims_v2": ["event_id", "user_id"],
-    "redeem_claims_v2": ["code", "user_id"],
-    "shop_v3": ["user_id", "slot"],
-    "transfer_blocks_v2": ["user_id_1", "user_id_2"],
-}
+def _super_admins():
+    global _SA
+    if _SA is None:
+        _SA = {r["user_id"]: (r.get("username"), r.get("ts") or 0) for r in col("super_admins").find({})}
+    return _SA
 
 
-def _walk_values(doc):
-    for v in doc.values():
-        if isinstance(v, dict):
-            yield from _walk_values(v)
-        elif isinstance(v, (list, tuple)):
-            for x in v:
-                if isinstance(x, dict):
-                    yield from _walk_values(x)
-                else:
-                    yield x
-        else:
-            yield v
+def sa_rows():
+    with _lock:
+        items = sorted(_super_admins().items(), key=lambda kv: (kv[1][1], kv[0]))
+        return [(uid, username) for uid, (username, _) in items]
 
 
-def validate_documents(named_docs, unique_specs):
-    """
-    named_docs:   {collection: [doc, ...]}
-    unique_specs: {collection: [[field, ...], ...]}   (each list is one unique index)
-    Returns a list of human-readable problems (empty list = every record will import cleanly).
-    Checks: duplicate _id, duplicate values for each unique index, BSON-encodable values,
-    integers inside the signed 64-bit range, and (when pymongo's bson is installed) a real BSON encode.
-    """
-    problems = []
-    try:
-        import bson  # shipped with pymongo
-    except Exception:  # pragma: no cover
-        bson = None
-    for coll, docs in named_docs.items():
-        seen_id = {}
-        specs, _dedup = [], set()
-        for sp in [["_id"]] + [list(x) for x in unique_specs.get(coll, [])]:
-            if tuple(sp) not in _dedup:  # the same index can be declared twice (UNIQUE_KEYS + primary key)
-                _dedup.add(tuple(sp))
-                specs.append(sp)
-        seen = {tuple(sp): {} for sp in specs}
-        for i, d in enumerate(docs):
-            for sp in specs:
-                if any(f not in d or d[f] is None for f in sp):
-                    continue  # partial/sparse behaviour: missing keys are not indexed
-                key = tuple(d[f] for f in sp)
-                if key in seen[tuple(sp)]:
-                    problems.append(f"{coll}: duplicate unique key {sp}={key} (docs #{seen[tuple(sp)][key]} and #{i})")
-                else:
-                    seen[tuple(sp)][key] = i
-            for v in _walk_values(d):
-                if isinstance(v, bool) or v is None or isinstance(v, (str, float)):
-                    if isinstance(v, float) and v != v:
-                        problems.append(f"{coll}: NaN value in doc #{i}")
-                    continue
-                if isinstance(v, int) and not (-2 ** 63 <= v < 2 ** 63):
-                    problems.append(f"{coll}: integer out of 64-bit range in doc #{i}: {v}")
-                elif isinstance(v, bytes):
-                    continue
-                elif not isinstance(v, int):
-                    problems.append(f"{coll}: unsupported value type {type(v).__name__} in doc #{i}")
-            if bson is not None:
+def is_super_admin(user_id):
+    with _lock:
+        return int(user_id) in _super_admins()
+
+
+def sa_add(user_id, username, added_by, ts):
+    user_id = int(user_id)
+    with _lock:
+        col("super_admins").replace_one(
+            {"user_id": user_id},
+            {"user_id": user_id, "username": username, "added_by": added_by, "ts": int(ts)}, upsert=True)
+        _super_admins()[user_id] = (username, int(ts))
+
+
+def sa_remove(user_id):
+    """Removes the Super Admin; returns the username that was stored (or None)."""
+    user_id = int(user_id)
+    with _lock:
+        stored = (_super_admins().get(user_id) or (None, 0))[0]
+        col("super_admins").delete_one({"user_id": user_id})
+        _super_admins().pop(user_id, None)
+        return stored
+
+
+def sa_set_username(user_id, username):
+    user_id = int(user_id)
+    with _lock:
+        col("super_admins").update_one({"user_id": user_id}, {"$set": {"username": username}})
+        if user_id in _super_admins():
+            _super_admins()[user_id] = (username, _super_admins()[user_id][1])
+
+
+# ------------------------------------------------------------------ per-group moderation log
+# One row per moderation event, always stored under the chat_id of the group it happened in.
+# (The optional Telegram log channel still works exactly as before; this is the stored history.)
+MODLOG_KEEP = 1000  # newest rows kept per group (safety cap on top of the time limit below)
+HISTORY_KEEP_DAYS = 15  # action history rows are deleted automatically by MongoDB after this many days
+_MODLOG_PRUNE_EVERY = 50
+
+
+def modlog_add(chat_id, category, text, ts):
+    chat_id = int(chat_id)
+    row_id = next_id("modlog")
+    col("modlog").insert_one({"id": row_id, "chat_id": chat_id, "category": str(category),
+                              "text": str(text)[:2000], "ts": int(ts),
+                              "expire_at": datetime.fromtimestamp(int(ts), timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)})
+    if row_id % _MODLOG_PRUNE_EVERY == 0:  # keep the history bounded, one group at a time
+        cutoff = list(col("modlog").find({"chat_id": chat_id}, {"id": 1}, sort=[("id", DESCENDING)],
+                                         skip=MODLOG_KEEP, limit=1))
+        if cutoff:
+            col("modlog").delete_many({"chat_id": chat_id, "id": {"$lte": cutoff[0]["id"]}})
+
+
+def modlog_recent(chat_id, limit=20, category=None):
+    """Newest first: [{id, category, text, ts}] for THIS group only."""
+    flt = {"chat_id": int(chat_id)}
+    if category:
+        flt["category"] = category
+    rows = col("modlog").find(flt, sort=[("id", DESCENDING)], limit=max(1, min(int(limit), 200)))
+    return [{"id": r["id"], "category": r.get("category"), "text": r.get("text", ""), "ts": r.get("ts", 0)}
+            for r in rows]
+
+
+def modlog_count(chat_id):
+    return col("modlog").count_documents({"chat_id": int(chat_id)})
+
+
+# ------------------------------------------------------------------ action notices that delete themselves later
+# One row per bot notice that must disappear after NOTICE_LIFETIME. The row lives only until the notice is deleted
+# (notice_take_due removes it); "expire_at" is a safety net so an unprocessed row can never stay longer than
+# HISTORY_KEEP_DAYS after its delete time.
+NOTICE_LIFETIME = 24 * 60 * 60  # a notice is deleted 1 day after it was sent
+
+
+def notice_schedule(chat_id, message_id, delete_at=None):
+    chat_id, message_id = int(chat_id), int(message_id)
+    delete_at = int(delete_at or (time.time() + NOTICE_LIFETIME))
+    col("notice_pending").replace_one(
+        {"chat_id": chat_id, "message_id": message_id},
+        {"chat_id": chat_id, "message_id": message_id, "delete_at": delete_at,
+         "expire_at": datetime.fromtimestamp(delete_at, timezone.utc) + timedelta(days=HISTORY_KEEP_DAYS)},
+        upsert=True)
+
+
+def notice_take_due(now, limit=50):
+    """[(chat_id, message_id)] whose time has come; each row is removed atomically as it is claimed, so two
+    overlapping sweeps can never delete the same notice twice."""
+    out = []
+    for r in list(col("notice_pending").find({"delete_at": {"$lte": int(now)}}).limit(int(limit))):
+        if col("notice_pending").delete_one({"_id": r["_id"]}).deleted_count:
+            out.append((r["chat_id"], r["message_id"]))
+    return out
+
+
+# ------------------------------------------------------------------ owner-chosen defaults for NEW groups
+# {setting key: value} for every default the Bot Owner changed in the 👑 Owner panel. One small document for the
+# whole bot; loaded once and kept in step with every write (one bot process, so it cannot go stale).
+_OWNER_DEF = None
+
+
+def owner_defaults():
+    global _OWNER_DEF
+    with _lock:
+        if _OWNER_DEF is None:
+            _OWNER_DEF = dict((col("meta").find_one({"_id": "new_group_defaults"}) or {}).get("values") or {})
+        return dict(_OWNER_DEF)
+
+
+def set_owner_default(key, value):
+    with _lock:
+        owner_defaults()
+        col("meta").update_one({"_id": "new_group_defaults"}, {"$set": {f"values.{key}": value}}, upsert=True)
+        _OWNER_DEF[key] = value
+
+
+def del_owner_default(key):
+    """Back to the original value for this setting."""
+    with _lock:
+        owner_defaults()
+        col("meta").update_one({"_id": "new_group_defaults"}, {"$unset": {f"values.{key}": ""}})
+        _OWNER_DEF.pop(key, None)
+
+
+# ------------------------------------------------------------------ read-only inspection (Bot Owner panel)
+HIDDEN_SETTING_PREFIXES = ("uname:", "lastname:")  # per-member bookkeeping, not group configuration
+
+
+def settings_snapshot(chat_id):
+    """A copy of one group's settings (member bookkeeping hidden). Never touches another group."""
+    with _lock:
+        return {k: v for k, v in _settings(int(chat_id)).items() if not k.startswith(HIDDEN_SETTING_PREFIXES)}
+
+
+def chat_overview(chat_id):
+    """Row counts of every group-specific collection for ONE group (read-only)."""
+    chat_id = int(chat_id)
+    out = {}
+    for name in CHAT_COLLECTIONS:
+        out[name] = col(name).count_documents({"chat_id": chat_id})
+    return out
+
+
+def warn_recent(chat_id, limit=10):
+    """Newest warnings recorded in ONE group: [(user_id, reason, ts)]."""
+    rows = col("warn_log").find({"chat_id": int(chat_id)}, sort=[("id", DESCENDING)], limit=int(limit))
+    return [(r["user_id"], r.get("reason"), r.get("ts")) for r in rows]
+
+
+# ------------------------------------------------------------------ group -> supergroup migration
+CHAT_COLLECTIONS = ("settings", "warn_log", "notes", "filters", "blocklist", "approved", "allowlist",
+                    "captcha_pending", "roast_profiles", "roast_battles", "roast_results", "roast_votes",
+                    "court_cases", "court_votes", "court_verdicts", "modlog")
+
+
+def migrate_chat(old_id, new_id):
+    """A basic group became a supergroup (new chat id): move every saved record across."""
+    old_id, new_id = int(old_id), int(new_id)
+    with _lock:
+        for name in CHAT_COLLECTIONS:
+            c = col(name)
+            for doc in list(c.find({"chat_id": old_id})):
                 try:
-                    bson.encode(d)
-                except Exception as exc:
-                    problems.append(f"{coll}: BSON encode failed for doc #{i}: {exc}")
-    return problems
+                    c.update_one({"_id": doc["_id"]}, {"$set": {"chat_id": new_id}})
+                except DuplicateKeyError:  # the new id already has that record: the old one wins
+                    key = {k: doc[k] for k in UNIQUE_INDEXES.get(name, []) if k != "chat_id" and k in doc}
+                    c.delete_one({"chat_id": new_id, **key})
+                    c.update_one({"_id": doc["_id"]}, {"$set": {"chat_id": new_id}})
+        for cache in (_S, _APP, _ALLOW, _BLOCK, _FILT, _NOTES):
+            cache.pop(old_id, None)
+            cache.pop(new_id, None)
 
 
-# --------------------------------------------------------------------------
-# Writing (MongoDB)
-# --------------------------------------------------------------------------
-def chunked(seq, n=1000):
-    for i in range(0, len(seq), n):
-        yield seq[i:i + n]
+# ------------------------------------------------------------------ SQLite -> MongoDB migration
+# table -> (key columns used to upsert, ordered columns)
+TABLES = {
+    "settings": (["chat_id", "key"], ["chat_id", "key", "value"]),
+    "warn_log": (["id"], ["id", "chat_id", "user_id", "reason", "ts"]),
+    "notes": (["chat_id", "name"], ["chat_id", "name", "content"]),
+    "filters": (["chat_id", "keyword"], ["chat_id", "keyword", "reply"]),
+    "blocklist": (["chat_id", "word"], ["chat_id", "word"]),
+    "setlog_pending": (["channel_id"], ["channel_id", "message_id", "ts"]),
+    "super_admins": (["user_id"], ["user_id", "username", "added_by", "ts"]),
+    "approved": (["chat_id", "user_id"], ["chat_id", "user_id"]),
+    "allowlist": (["chat_id", "kind", "value"], ["chat_id", "kind", "value"]),
+    "captcha_pending": (["chat_id", "user_id"],
+                        ["chat_id", "user_id", "msg_id", "answer", "attempts", "expires", "mention"]),
+    "roast_profiles": (["chat_id", "user_id"],
+                       ["chat_id", "user_id", "name", "points", "wins", "losses", "draws", "streak",
+                        "best_streak", "roasts_given", "roasts_received"]),
+    "roast_battles": (["id"], ["id", "chat_id", "challenger_id", "challenger_name", "opponent_id",
+                               "opponent_name", "status", "text_a", "text_b", "algo_a", "algo_b",
+                               "created", "deadline", "message_id"]),
+    "roast_results": (["id"], ["id", "battle_id", "chat_id", "winner_id", "loser_id", "final_a", "final_b",
+                               "votes_a", "votes_b", "outcome", "ts"]),
+    "roast_votes": (["battle_id", "voter_id"], ["battle_id", "chat_id", "voter_id", "choice", "ts"]),
+    "court_cases": (["id"], ["id", "chat_id", "case_no", "defendant_id", "defendant_name", "opened_by",
+                             "opened_by_name", "charge", "evidence", "plea", "status", "bail", "sentence",
+                             "appeals", "message_id", "opened", "closes"]),
+    "court_votes": (["case_id", "voter_id"], ["case_id", "chat_id", "voter_id", "vote", "ts"]),
+    "court_verdicts": (["id"], ["id", "case_id", "chat_id", "defendant_id", "verdict", "guilty_votes",
+                               "innocent_votes", "plea", "sentence", "ts"]),
+}
+AUTO_ID_TABLES = ("warn_log", "roast_battles", "roast_results", "court_cases", "court_verdicts")
+SKIP_SETTING_KEYS = {"purgefrom"}  # leftovers of an old purge module; the bot deletes them anyway
 
 
-def bulk_upsert(collection, docs, key):
-    """Upsert docs by `key` (a field name, or list of field names). Returns count written."""
-    from pymongo import ReplaceOne
-    keys = [key] if isinstance(key, str) else list(key)
-    total = 0
-    for batch in chunked(docs):
-        ops = [ReplaceOne({k: d[k] for k in keys}, d, upsert=True) for d in batch]
-        if ops:
-            collection.bulk_write(ops, ordered=False)
-            total += len(ops)
-    return total
-
-
-def migrate(args):
-    conn = open_sqlite(args.db)
-    json_dir = Path(args.json_dir)
-    tables = table_names(conn)
-    print(f"SQLite: {args.db}  ({len(tables)} tables)")
-    print(f"JSON dir: {json_dir}\n")
-
-    # ---- read + transform --------------------------------------------------
-    users = build_users(read_table(conn, "users_v2")) if "users_v2" in tables else []
-    recruit_rows = read_table(conn, "character_recruit_names_v2") if "character_recruit_names_v2" in tables else []
-    disc_rows = read_table(conn, "discontinued_characters_v2") if "discontinued_characters_v2" in tables else []
-    chars, orphan_recruit, orphan_disc = build_characters(
-        read_table(conn, "characters_v2") if "characters_v2" in tables else [],
-        recruit_rows,
-        disc_rows,
-    )
-    orphan_recruit_rows = [dict(r, _id=r["id"]) for r in recruit_rows if str(r["character_code"]) in set(orphan_recruit)]
-    colls = build_collections(read_table(conn, "collections_v2")) if "collections_v2" in tables else []
-    favs = build_favorites(read_table(conn, "favorites_v2")) if "favorites_v2" in tables else []
-    groups = build_groups(json_dir)
-    notifs = build_notifications(json_dir)
-    restr = build_restrictions(json_dir)
-    cooldowns, cooldown_bad = build_spawn_cooldowns(json_dir)
-
-    generic = {}
-    for t in tables:
-        if t in CORE_TABLES or t in SKIP_TABLES:
-            continue
-        generic[t] = read_table(conn, t)
-    seq = {}
-    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='sqlite_sequence'").fetchone():
-        seq = {r["name"]: int(r["seq"]) for r in conn.execute("SELECT name, seq FROM sqlite_sequence")}
-
-    json_files = ["approved_groups.json", "auto_spawn_groups.json", "bot_groups.json",
-                  "bot_group_state.json", "gstats_hidden_groups.json",
-                  "notification_settings.json", "restrictions.json",
-                  "character_spawn_cooldowns.json"]
-    missing_json = [f for f in json_files if not (json_dir / f).exists()]
-
-    known_codes = {c["code"] for c in chars}
-    missing_chars = sorted({c["character_code"] for c in colls if c["character_code"] not in known_codes})
-    known_users = {u["_id"] for u in users}
-    ownerless = sorted({c["user_id"] for c in colls if c["user_id"] not in known_users})
-
-    if missing_json:
-        print("WARNING: these JSON files were not found in the JSON dir, so their data will NOT be migrated:")
-        for f in missing_json:
-            print(f"    - {f}")
-        print()
-    print("Source summary")
-    print(f"  users: {len(users)} (total coins {sum(u['coins'] for u in users)})")
-    print(f"  characters: {len(chars)}   collection copies: {len(colls)}   favorites: {len(favs)}")
-    print(f"  groups: {len(groups)}   notification settings: {len(notifs)}   restrictions: {len(restr)}")
-    print(f"  character spawn cooldowns: {len(cooldowns)}")
-    print(f"  other tables: {len(generic)} ({sum(len(v) for v in generic.values())} rows)")
-    if orphan_recruit:
-        print(f"  note: recruit names of deleted characters {orphan_recruit} are kept in `orphan_recruit_names` (nothing is dropped)")
-    if orphan_disc:
-        print(f"  note: discontinued flags of deleted characters {orphan_disc} cannot be attached to a character and are not migrated")
-    cd_unknown = sorted(c["_id"] for c in cooldowns if c["_id"] not in known_codes)
-    if cd_unknown:
-        print(f"  note: cooldowns for characters not in characters_v2 (still migrated): {cd_unknown}")
-    if missing_chars:
-        print(f"  note: collection copies pointing at missing characters (still migrated): {missing_chars}")
-    if ownerless:
-        print(f"  note: collection owners with no users row (still migrated): {ownerless}")
-
-    # ---- pre-flight validation: every record must import without a unique-key / BSON error ----
-    named = {"users": users, "characters": chars, "collections": colls, "favorites": favs,
-             "orphan_recruit_names": orphan_recruit_rows, "notification_settings": notifs,
-             "restrictions": restr, "character_spawn_cooldowns": cooldowns}
-    for t, rows in generic.items():
-        pk = pk_columns(conn, t)
-        docs = []
-        for r in rows:
-            d = dict(r)
-            if len(pk) == 1:
-                d["_id"] = d[pk[0]]
-            docs.append(d)
-        named[t] = docs
-    unique_specs = {
-        "characters": [["code"], ["name_ci"]],
-        "collections": [["legacy_id"]],
-    }
-    for t, cols in UNIQUE_KEYS.items():
-        if t in named:
-            unique_specs[t] = [cols]
-    for t in generic:
-        pk = pk_columns(conn, t)
-        if len(pk) > 1:
-            unique_specs.setdefault(t, []).append(pk)
-    problems_pre = validate_documents(named, unique_specs)
-    problems_pre += [f"character_spawn_cooldowns.json: {m}" for m in cooldown_bad]
-    total_docs = sum(len(v) for v in named.values()) + len(groups)
-    print(f"\nPre-flight validation: {total_docs} documents checked across {len(named) + 1} collections "
-          f"-> {len(problems_pre)} problem(s)")
-    for line in problems_pre[:25]:
-        print("  !", line)
-    if len(problems_pre) > 25:
-        print(f"  ... and {len(problems_pre) - 25} more")
-
-    if args.dry_run:
-        print("\nDRY RUN: nothing written. Generic tables that would be copied:")
-        for t, rows in generic.items():
-            pk = pk_columns(conn, t)
-            print(f"  {t:34s} rows={len(rows):5d}  pk={pk}")
-        if problems_pre:
-            print("\nDRY RUN RESULT: NOT READY - fix the problems above first.")
-            return 1
-        print("\nDRY RUN RESULT: OK - every record passed validation.")
-        return 0
-
-    if problems_pre:
-        sys.exit("\nRefusing to import: pre-flight validation found problems (see above). Nothing was written.")
-
-    # ---- connect -------------------------------------------------------------
-    import mongo_db
+def _read_sqlite(path):
+    """Read every table of the SQLite file (a private copy, so the original isn't touched)."""
+    import sqlite3
+    tmp = tempfile.mkdtemp(prefix="sqlite_copy_")
     try:
-        mongo_db.init_mongo()
-    except Exception as exc:
-        sys.exit(f"\nCould not connect to MongoDB: {exc}\n"
-                 "Check MONGO_URI in .env and that your current IP is allowed under Atlas -> Network Access.")
-    db = mongo_db.get_db()
-
-    if args.wipe:
-        if not args.yes:
-            sys.exit("--wipe drops collections; re-run with --yes to confirm.")
-        for name in MIGRATED_CORE_COLLECTIONS + list(generic) + ["counters"]:
-            db[name].drop()
-        print("\nWiped target collections.")
-    elif not args.force and db["users"].estimated_document_count() > 0:
-        sys.exit("\nTarget `users` collection already has data. Refusing to overwrite.\n"
-                 "Use --force to upsert over it, or --wipe --yes to start clean.")
-
-    print("\nCreating indexes ...")
-    mongo_db.ensure_indexes()
-    db["collections"].create_index("legacy_id", unique=True, partialFilterExpression={"legacy_id": {"$type": "int"}})
-
-    # ---- write -----------------------------------------------------------------
-    print("Writing core collections ...")
-    bulk_upsert(db["users"], users, "_id")
-    bulk_upsert(db["characters"], chars, "code")
-    bulk_upsert(db["collections"], colls, "legacy_id")
-    bulk_upsert(db["favorites"], favs, "_id")
-    if orphan_recruit_rows:  # nothing is thrown away: rows whose character no longer exists
-        bulk_upsert(db["orphan_recruit_names"], orphan_recruit_rows, "_id")
-
-    from pymongo import UpdateOne
-    ops = [UpdateOne({"_id": cid}, {"$set": fields}, upsert=True) for cid, fields in groups.items()]
-    for batch in chunked(ops):
-        db["groups"].bulk_write(batch, ordered=False)
-    bulk_upsert(db["notification_settings"], notifs, "_id")
-    bulk_upsert(db["restrictions"], restr, "_id")
-    bulk_upsert(db["character_spawn_cooldowns"], cooldowns, "_id")
-
-    print("Writing remaining tables (kept for later phases) ...")
-    for t, rows in generic.items():
-        pk = pk_columns(conn, t)
-        if not rows:
-            continue
-        if len(pk) == 1:
-            docs = []
-            for r in rows:
-                d = dict(r)
-                d["_id"] = d[pk[0]]  # original column is kept too
-                docs.append(d)
-            bulk_upsert(db[t], docs, "_id")
-        else:
-            db[t].create_index([(c, 1) for c in pk], unique=True, name="pk_" + "_".join(pk))
-            bulk_upsert(db[t], [dict(r) for r in rows], pk)
-        # counters so next_sequence() continues the AUTOINCREMENT series
-        if "id" in pk and len(pk) == 1:
-            top = max([int(r["id"]) for r in rows] + [seq.get(t, 0)])
-            db["counters"].update_one({"_id": t}, {"$max": {"seq": top}}, upsert=True)
-    for t, v in seq.items():
-        if t in generic or t in {"collections_v2"}:
-            db["counters"].update_one({"_id": t}, {"$max": {"seq": v}}, upsert=True)
-
-    # ---- verify ----------------------------------------------------------------
-    print("\nVerification")
-    problems = []
-
-    def check(label, expected, actual):
-        ok = expected == actual
-        if ok and isinstance(expected, dict):
-            print(f"  [OK] {label}: {len(expected)} entries identical")
-        else:
-            print(f"  [{'OK' if ok else 'MISMATCH'}] {label}: sqlite/json={expected}  mongo={actual}")
-        if not ok:
-            problems.append(label)
-
-    check("users", len(users), db["users"].count_documents({}))
-    agg = list(db["users"].aggregate([{"$group": {"_id": None, "c": {"$sum": "$coins"}}}]))
-    check("total coins", sum(u["coins"] for u in users), agg[0]["c"] if agg else 0)
-    check("characters", len(chars), db["characters"].count_documents({}))
-    check("collection copies", len(colls), db["collections"].count_documents({}))
-    check("favorites", len(favs), db["favorites"].count_documents({}))
-    embedded = sum(len(d.get("recruit_names", [])) for d in db["characters"].find({}, {"recruit_names": 1}))
-    check("character_recruit_names_v2 (embedded + orphans)", len(recruit_rows),
-          embedded + db["orphan_recruit_names"].count_documents({}))
-    check("discontinued_characters_v2", len(disc_rows) - len(orphan_disc), db["characters"].count_documents({"discontinued": True}))
-    check("groups", len(groups), db["groups"].count_documents({}))
-    check("notification settings", len(notifs), db["notification_settings"].count_documents({}))
-    check("restrictions", len(restr), db["restrictions"].count_documents({}))
-    check("character spawn cooldowns", len(cooldowns), db["character_spawn_cooldowns"].count_documents({}))
-    check("cooldown timestamps", {c["_id"]: c["last_spawned_at"] for c in cooldowns},
-          {d["_id"]: d.get("last_spawned_at") for d in db["character_spawn_cooldowns"].find({})})
-    for t, rows in generic.items():
-        check(t, len(rows), db[t].count_documents({}))
-
-    per_user_src = {}
-    for c in colls:
-        per_user_src[c["user_id"]] = per_user_src.get(c["user_id"], 0) + 1
-    per_user_dst = {d["_id"]: d["n"] for d in db["collections"].aggregate(
-        [{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}])}
-    check("per-user collection sizes", per_user_src, per_user_dst)
-
-    n_core = len(CORE_TABLES & set(tables))
-    print(f"\n  {n_core + len(generic)} of {len(tables)} SQLite tables verified against MongoDB "
-          f"({n_core} core + {len(generic)} copied 1:1)")
-    if problems:
-        print(f"\nFINISHED WITH MISMATCHES: {problems}")
-        return 1
-    print("\nMigration complete and verified. Keep bot_database.db and the JSON files as your backup.")
-    return 0
+        for ext in ("", "-wal", "-shm"):
+            if os.path.exists(path + ext):
+                shutil.copy(path + ext, os.path.join(tmp, "db" + ext))
+        conn = sqlite3.connect(os.path.join(tmp, "db"))
+        have = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        data = {}
+        for table, (_, cols) in TABLES.items():
+            if table not in have:
+                data[table] = []
+                continue
+            present = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+            use = [c for c in cols if c in present]
+            rows = conn.execute(f"SELECT {', '.join(use)} FROM {table}").fetchall()
+            data[table] = [dict(zip(use, r)) for r in rows]
+        conn.close()
+        return data
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
-def main():
-    default_db = "bot_database.db"
-    ap = argparse.ArgumentParser(description="Migrate bot_database.db + JSON files to MongoDB Atlas")
-    ap.add_argument("--db", default=str(HERE / default_db), help="path to SQLite file")
-    ap.add_argument("--json-dir", default=str(HERE), help="folder containing the JSON files")
-    ap.add_argument("--dry-run", action="store_true", help="read/transform/report only; no MongoDB access")
-    ap.add_argument("--force", action="store_true", help="upsert even if target already has data")
-    ap.add_argument("--wipe", action="store_true", help="drop target collections before importing")
-    ap.add_argument("--yes", action="store_true", help="confirm destructive --wipe")
-    sys.exit(migrate(ap.parse_args()))
+def migrate_sqlite(path, dry_run=False, force=False, log_fn=print):
+    """Copy the SQLite file into MongoDB. Safe to re-run with --force (upserts by natural key)."""
+    if not os.path.exists(path):
+        raise StoreError(f"SQLite file not found: {path}")
+    data = _read_sqlite(path)
+    if not dry_run:
+        connect()
+        marker = col("meta").find_one({"_id": "sqlite_migration"})
+        if marker and not force:
+            raise StoreError("A migration was already recorded on "
+                             f"{time.ctime(marker.get('ts', 0))}. Re-running could overwrite newer data; "
+                             "use --force if you really want to copy again.")
+    log_fn(f"{'DRY RUN - ' if dry_run else ''}Source: {path}")
+    copied = {}
+    for table, (keys, cols) in TABLES.items():
+        rows = data[table]
+        if table == "settings":
+            rows = [r for r in rows if r.get("key") not in SKIP_SETTING_KEYS]
+        if not dry_run and rows:
+            ops = [ReplaceOne({k: r[k] for k in keys}, r, upsert=True) for r in rows]
+            for i in range(0, len(ops), 500):
+                col(table).bulk_write(ops[i:i + 500], ordered=False)
+        copied[table] = len(rows)
+        log_fn(f"  {table:<16} {len(rows):>6} rows")
+    if not dry_run:
+        for table in AUTO_ID_TABLES:
+            top = max((r["id"] for r in data[table]), default=0)
+            if top:
+                col("counters").update_one({"_id": table}, {"$max": {"seq": top}}, upsert=True)
+        problems = []
+        for table, n in copied.items():
+            have = col(table).count_documents({})
+            if have < n:
+                problems.append(f"{table}: copied {n} but found {have}")
+        if problems:
+            raise StoreError("Verification failed: " + "; ".join(problems))
+        col("meta").replace_one({"_id": "sqlite_migration"},
+                                {"_id": "sqlite_migration", "ts": time.time(), "source": os.path.basename(path),
+                                 "rows": copied}, upsert=True)
+        log_fn("Done. Every table was copied and verified in MongoDB.")
+    return copied
+
+
+def auto_seed(path="rose_clone.db"):
+    """Called at bot startup: if an old SQLite file sits next to the code and the Mongo database is
+    still empty, import it once. Does nothing otherwise (never overwrites a live database)."""
+    path = os.getenv("SQLITE_SEED_PATH", path)
+    if not os.path.exists(path):
+        return False
+    if col("meta").find_one({"_id": "sqlite_migration"}) or col("settings").count_documents({}) > 0:
+        return False
+    log.info("MongoDB is empty and %s exists: importing it once.", path)
+    migrate_sqlite(path, log_fn=log.info)
+    return True
+
+
+def _cli(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    path = args[0] if args else "rose_clone.db"
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    try:
+        migrate_sqlite(path, dry_run="--dry-run" in argv, force="--force" in argv)
+    except StoreError as e:
+        sys.exit(f"ERROR: {e}")
 
 
 if __name__ == "__main__":
-    main()
+    _cli(sys.argv[1:])
