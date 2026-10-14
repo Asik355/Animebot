@@ -2777,6 +2777,7 @@ async def clearspawn(update, context):
             await safe_reply_text(update.message, "ℹ️ There is no active character spawn in this group.")
             return
         await cancel_spawn_expiry_task(spawn)
+        await asyncio.to_thread(mark_spawn_expiry_notified, spawn.get("history_id"))
 
     await safe_delete_message(context.bot, chat_id, spawn.get("message_id"))
     context.application.bot_data.setdefault("next_auto_spawn_at", {})[chat_id] = (
@@ -7233,6 +7234,32 @@ async def status(update, context):
         for chat_id, sp in list(active.items())[:10]:
             remaining = max(0, int((sp["expires_at"] - datetime.now()).total_seconds()))
             lines.append(f"• Chat {chat_id}: {sp['name']} [{sp['rarity']}] — {format_duration(remaining)} left")
+    if update.effective_chat.type != "private":
+        chunks = []
+        current = ""
+        for line in lines:
+            while len(line) > 4000:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.append(line[:4000])
+                line = line[4000:]
+            candidate = f"{current}\n{line}" if current else line
+            if len(candidate) > 4000:
+                chunks.append(current)
+                current = line
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        try:
+            for chunk in chunks:
+                await context.bot.send_message(chat_id=update.effective_user.id, text=chunk)
+        except (Forbidden, BadRequest):
+            await safe_reply_text(update.message, "📩 I couldn't message you privately. Open a private chat with me, press Start, then run /status again.")
+            return
+        await safe_reply_text(update.message, "📩 Opened in your private chat.")
+        return
     await safe_reply_text(update.message, "\n".join(lines))
 
 async def event(update, context):
