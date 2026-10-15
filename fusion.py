@@ -434,11 +434,14 @@ _deps = {
     "log_action": None,               # log_character_action(code, name, user, "add")
     "mark_success": None,             # mark_success(update) for the log pipeline
     "safe_reply": None,               # async safe_reply_text(message, text, **kw)
+    "skip_keyboard": None,            # bot.skip_keyboard() - the "⏭ Skip" reply keyboard
+    "is_skip_text": lambda t: (t or "").strip().lower() in ("/skip", "⏭ skip"),
 }
 
 
 def bind(**kwargs):
-    """Inject bot.py helpers: is_owner, is_executive, symbols, conv_timeout, notify, log_action, mark_success, safe_reply."""
+    """Inject bot.py helpers: is_owner, is_executive, symbols, conv_timeout, notify, log_action, mark_success, safe_reply,
+    skip_keyboard, is_skip_text."""
     _deps.update({k: v for k, v in kwargs.items() if v is not None})
 
 
@@ -1100,6 +1103,407 @@ async def addevo_cancel(update, context):
 
 
 # ==========================================================================
+# /editevo - edit an EVOLUTION character and its recipe in one place (normal characters use /edit)
+# ==========================================================================
+(X_NAME, X_ANIME, X_RARITY, X_WORTH, X_PHOTO, X_CODE, X_BASE, X_QTY, X_STONES, X_BERRIES) = range(210, 220)
+_XKEYS = ("eevo_code0", "eevo_row", "eevo_recipe", "eevo_name", "eevo_anime", "eevo_rarity", "eevo_worth",
+          "eevo_photo", "eevo_code", "eevo_base", "eevo_qty", "eevo_stones", "eevo_berries")
+
+
+def _clear_x(context):
+    for k in _XKEYS:
+        context.user_data.pop(k, None)
+
+
+def _skip_markup():
+    fn = _deps.get("skip_keyboard")
+    return fn() if fn else None
+
+
+def _is_skip(text):
+    return bool(_deps["is_skip_text"](text))
+
+
+def _creates_cycle(base_code, evo_code):
+    """True if `evo_code` is already an ancestor of `base_code` through other recipes (A->B and B->A style loops)."""
+    cur, seen = str(base_code), set()
+    while cur not in seen:
+        seen.add(cur)
+        if cur == str(evo_code):
+            return True
+        recipe = get_recipe_sync(cur)
+        if not recipe:
+            return False
+        cur = str(recipe["base_code"])
+    return True
+
+
+def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berries):
+    """Checks for /editevo (the evolution character already exists, so codes are compared against OTHER characters)."""
+    base_code, new_code = str(base_code), str(new_code)
+    if not _valid_code(new_code):
+        return "❌ The evolution code must be exactly 4 digits (0001-9999)."
+    if new_code != str(evo_code0) and (_row(new_code) is not None or get_recipe_sync(new_code) is not None):
+        return "❌ That code already exists."
+    if not _valid_code(base_code) or _row(base_code) is None:
+        return "❌ The base character code does not exist."
+    if base_code == new_code:
+        return "❌ A character cannot evolve into itself (the base code equals the evolution code)."
+    if not isinstance(base_qty, int) or not (1 <= base_qty <= EVO_MAX_BASE_QTY):
+        return f"❌ Base quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
+    if not isinstance(stones, int) or stones < EVO_MIN_STONES:
+        return f"❌ Evolution Stones must be at least {EVO_MIN_STONES}."
+    if stones > EVO_MAX_STONES:
+        return f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}."
+    if not isinstance(berries, int) or berries < 0 or berries > EVO_MAX_BERRIES:
+        return "❌ Berries cost must be a whole number (0 or more)."
+    other = get_recipe_by_base_sync(base_code)
+    if other is not None and str(other["_id"]) != str(evo_code0):
+        return "❌ That base character already has another evolution recipe (conflict)."
+    if _creates_cycle(base_code, evo_code0):
+        return "❌ That would create an evolution loop (the base already comes from this evolution)."
+    return None
+
+
+def edit_evolution_sync(code0, v, edited_by):
+    """
+    Saves the character edit AND the recipe edit in ONE transaction (both or neither).
+    v = {name, anime, rarity, worth, photo (or None to keep), code, base, qty, stones, berries}
+    """
+    err = validate_recipe_edit(code0, v["code"], v["base"], v["qty"], v["stones"], v["berries"])
+    if err:
+        return {"ok": False, "error": err}
+    if _name_taken_by_other(v["name"], code0):
+        return {"ok": False, "error": "❌ A character with that name already exists."}
+
+    def _work(session):
+        done = mongo_db.update_character_tx(session, code0, v["code"], v["name"], v["anime"], v["rarity"], v["worth"],
+                                            None, evolution=True)
+        if not done:
+            raise _EvoAbort("notevo")
+        if v.get("photo"):
+            mongo_db.col(mongo_db.CHARACTERS).update_one({"code": v["code"]}, {"$set": {"photo_file_id": v["photo"]}},
+                                                         session=session)
+        fields = {"evo_code": v["code"], "base_code": str(v["base"]), "base_qty": int(v["qty"]),
+                  "stones": int(v["stones"]), "berries": int(v["berries"])}
+        res = _recipes().update_one({"_id": v["code"]}, {"$set": fields}, session=session)
+        if res.matched_count != 1:      # recipe had been deleted with /delevo: this edit recreates it
+            _recipes().insert_one({"_id": v["code"], **fields, "created_by": int(edited_by), "created_at": _stamp()},
+                                  session=session)
+
+    try:
+        mongo_db.run_transaction(_work)
+    except _EvoAbort:
+        return {"ok": False, "error": "❌ This is not an Evolution character (or it no longer exists)."}
+    except mongo_db.DuplicateKeyError:
+        return {"ok": False, "error": "❌ The name, code or base character already has a record. Nothing was changed."}
+    finally:
+        mongo_db.invalidate_character_cache()
+    return {"ok": True}
+
+
+def _name_taken_by_other(name, code):
+    folded = mongo_db.strip_evo_mark(name).casefold()
+    return any(r[0] != str(code) and mongo_db.strip_evo_mark(r[1]).casefold() == folded for r in mongo_db.get_all_characters())
+
+
+def _current(value):
+    return "None (required)" if value in (None, "") else value
+
+
+async def editevo_start(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return -1
+    if update.effective_chat.type != "private":
+        await _reply(msg, "⚠️ /editevo can only be used in the bot's PM (private chat).")
+        return -1
+    if not _is_staff_evo(user.id):              # Owner + Executive only
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return -1
+    query = " ".join(getattr(context, "args", None) or []).strip()
+    if not query:
+        await _reply(msg, "Usage: /editevo <4-digit code or name of an Evolution character>")
+        return -1
+    q = mongo_db.strip_evo_mark(query)
+    if _valid_code(q):
+        row = await asyncio.to_thread(_row, q)
+        rows = [row] if row else []
+    else:
+        rows = await asyncio.to_thread(mongo_db.find_characters_by_name_parts, q)
+    if not rows:
+        await _reply(msg, "❌ Character not found. Use the 4-digit code or the name.")
+        return -1
+    evo_rows = [r for r in rows if mongo_db.is_evolution_character(r[0])]
+    if not evo_rows:
+        await _reply(msg, "❌ That is a normal character. Normal characters are edited with /edit.")
+        return -1
+    if len(evo_rows) > 1:
+        listing = "\n".join(f"• {r[1]} [{r[0]}]" for r in evo_rows[:10])
+        await _reply(msg, f"❓ Several Evolution characters match. Send /editevo with the 4-digit code:\n{listing}")
+        return -1
+    row = evo_rows[0]
+    _clear_x(context)
+    d = context.user_data
+    d["eevo_code0"], d["eevo_row"] = row[0], row
+    d["eevo_recipe"] = await asyncio.to_thread(get_recipe_sync, row[0])
+    await _reply(msg, f"✏️ Editing {row[1]} [{row[0]}] (Evolution)\n\n1️⃣ Send the new name, or tap ⏭ Skip to keep it."
+                      f"\nCurrent: {mongo_db.strip_evo_mark(row[1])}", reply_markup=_skip_markup())
+    return X_NAME
+
+
+async def _x_gate(update, context):
+    """Re-check the role on every step (it could be revoked mid-flow) and that the flow is still alive."""
+    if not _is_staff_evo(update.effective_user.id):
+        _clear_x(context)
+        await _reply(update.effective_message, NOT_ALLOWED_TEXT)
+        return False
+    if "eevo_code0" not in context.user_data:
+        await _reply(update.effective_message, "❌ The edit expired. Start again with /editevo.")
+        return False
+    return True
+
+
+async def editevo_name(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_name"] = mongo_db.strip_evo_mark(d["eevo_row"][1])
+    else:
+        name = mongo_db.strip_evo_mark(msg.text)
+        if not name:
+            await _reply(msg, "❌ The name cannot be empty.")
+            return X_NAME
+        if await asyncio.to_thread(_name_taken_by_other, name, d["eevo_code0"]):
+            await _reply(msg, "❌ A character with that name already exists. Send a different name.")
+            return X_NAME
+        d["eevo_name"] = name
+    await _reply(msg, f"2️⃣ Anime name, or ⏭ Skip.\nCurrent: {d['eevo_row'][2]}", reply_markup=_skip_markup())
+    return X_ANIME
+
+
+async def editevo_anime(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_anime"] = d["eevo_row"][2]
+    else:
+        anime = (msg.text or "").strip()
+        if not anime:
+            await _reply(msg, "❌ The anime name cannot be empty.")
+            return X_ANIME
+        d["eevo_anime"] = anime
+    await _reply(msg, f"3️⃣ Rarity (Common / Rare / Epic / Legendary / Mythical / Celestial), or ⏭ Skip.\n"
+                      f"Current: {d['eevo_row'][3]}", reply_markup=_skip_markup())
+    return X_RARITY
+
+
+async def editevo_rarity(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_rarity"] = d["eevo_row"][3]
+    else:
+        rarity = (msg.text or "").strip().title()
+        if rarity not in _deps["symbols"]:
+            await _reply(msg, "❌ Invalid rarity.")
+            return X_RARITY
+        d["eevo_rarity"] = rarity
+    await _reply(msg, f"4️⃣ Worth in Berries, or ⏭ Skip.\nCurrent: {d['eevo_row'][4]}", reply_markup=_skip_markup())
+    return X_WORTH
+
+
+async def editevo_worth(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_worth"] = int(d["eevo_row"][4] or 0)
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n > EVO_MAX_WORTH:
+            await _reply(msg, "❌ Worth must be a whole number (0 or more).")
+            return X_WORTH
+        d["eevo_worth"] = n
+    await _reply(msg, "5️⃣ Send the new photo, or ⏭ Skip to keep the current one.", reply_markup=_skip_markup())
+    return X_PHOTO
+
+
+async def editevo_photo(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if getattr(msg, "photo", None):
+        d["eevo_photo"] = msg.photo[-1].file_id
+    elif _is_skip(msg.text):
+        d["eevo_photo"] = None
+    else:
+        await _reply(msg, "❌ Send a photo, or tap ⏭ Skip.")
+        return X_PHOTO
+    await _reply(msg, f"6️⃣ Evolution character code (4 digits), or ⏭ Skip.\nCurrent: {d['eevo_code0']}",
+                 reply_markup=_skip_markup())
+    return X_CODE
+
+
+async def editevo_code(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_code"] = d["eevo_code0"]
+    else:
+        code = (msg.text or "").strip()
+        if not _valid_code(code):
+            await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
+            return X_CODE
+        if code != d["eevo_code0"] and (_row(code) is not None or await asyncio.to_thread(get_recipe_sync, code)):
+            await _reply(msg, "❌ That code already exists.")
+            return X_CODE
+        d["eevo_code"] = code
+    recipe = d["eevo_recipe"]
+    cur = recipe["base_code"] if recipe else None
+    await _reply(msg, f"7️⃣ Base character code (the character that evolves into this one)"
+                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_BASE
+
+
+async def editevo_base(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_base"] = str(recipe["base_code"])
+    else:
+        code = (msg.text or "").strip()
+        if not _valid_code(code) or await asyncio.to_thread(_row, code) is None:
+            await _reply(msg, "❌ That base character code does not exist.")
+            return X_BASE
+        if code == d["eevo_code"]:
+            await _reply(msg, "❌ A character cannot evolve into itself. Send a different base code.")
+            return X_BASE
+        d["eevo_base"] = code
+    cur = recipe["base_qty"] if recipe else None
+    await _reply(msg, f"8️⃣ Base character quantity required (1-{EVO_MAX_BASE_QTY})"
+                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_QTY
+
+
+async def editevo_qty(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_qty"] = int(recipe["base_qty"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
+            await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
+            return X_QTY
+        d["eevo_qty"] = n
+    cur = recipe["stones"] if recipe else None
+    await _reply(msg, f"9️⃣ Evolution Stones required (minimum {EVO_MIN_STONES})"
+                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_STONES
+
+
+async def editevo_stones(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_stones"] = int(recipe["stones"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n < EVO_MIN_STONES:
+            await _reply(msg, f"❌ Evolution Stones must be a number of at least {EVO_MIN_STONES}.")
+            return X_STONES
+        if n > EVO_MAX_STONES:
+            await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
+            return X_STONES
+        d["eevo_stones"] = n
+    cur = recipe["berries"] if recipe else None
+    await _reply(msg, f"🔟 Berries cost{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_BERRIES
+
+
+async def editevo_berries(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_berries"] = int(recipe["berries"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n > EVO_MAX_BERRIES:
+            await _reply(msg, "❌ Berries cost must be a whole number (0 or more).")
+            return X_BERRIES
+        d["eevo_berries"] = n
+    user, code0 = update.effective_user, d["eevo_code0"]
+    values = {"name": d["eevo_name"], "anime": d["eevo_anime"], "rarity": d["eevo_rarity"], "worth": d["eevo_worth"],
+              "photo": d["eevo_photo"], "code": d["eevo_code"], "base": d["eevo_base"], "qty": d["eevo_qty"],
+              "stones": d["eevo_stones"], "berries": d["eevo_berries"]}
+    try:
+        res = await asyncio.to_thread(edit_evolution_sync, code0, values, user.id)
+    except Exception as e:
+        logger.error("editevo failed: %s", e)
+        _clear_x(context)
+        await _reply(msg, "❌ Update failed. Nothing was changed. Please try again.")
+        return -1
+    _clear_x(context)
+    if not res["ok"]:
+        await _reply(msg, res["error"])
+        return -1
+    base, evo = _row(values["base"]), _row(values["code"])
+    await _reply(
+        msg,
+        "✅ Evolution edited successfully!\n\n"
+        f"{values['qty']}× {_char_label(base)}\n➡️ {_char_label(evo)}\n"
+        f"💰 Worth: {values['worth']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries",
+        reply_markup=_remove_keyboard())
+    try:
+        if _deps["log_action"]:
+            await asyncio.to_thread(_deps["log_action"], values["code"], values["name"], user, "edit")
+        if _deps["notify"]:
+            old = f"🔁 Old code: {code0}\n" if code0 != values["code"] else ""
+            await _deps["notify"](
+                context,
+                f"✏️ EVOLUTION UPDATED\n{values['qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
+                f"🏷 {_sym(values['rarity'])} {values['rarity']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries\n"
+                f"{old}👤 By: {user.id}", actor_id=user.id)
+        if _deps["mark_success"]:
+            _deps["mark_success"](update)
+    except Exception as e:
+        logger.info("editevo notification skipped: %s", e)
+    return -1
+
+
+def _remove_keyboard():
+    try:
+        from telegram import ReplyKeyboardRemove
+        return ReplyKeyboardRemove()
+    except Exception:
+        return None
+
+
+async def editevo_cancel(update, context):
+    _clear_x(context)
+    if update.effective_message is not None:
+        await _reply(update.effective_message, "❌ Evolution edit cancelled.", reply_markup=_remove_keyboard())
+    return -1
+
+
+# ==========================================================================
 # /item (personal inventory) and /stone (stone leaderboard)
 # ==========================================================================
 # To add a future item: add ONE line here. Its count is read from the given field of the user's document
@@ -1188,6 +1592,24 @@ def _register_evolution(app):
             E_PHOTO: [MessageHandler(filters.PHOTO, addevo_photo), MessageHandler(text, addevo_photo)],
         },
         fallbacks=[CommandHandler("cancel", addevo_cancel)],
+        allow_reentry=True,
+        conversation_timeout=_deps["conv_timeout"],
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("editevo", editevo_start)],
+        states={
+            X_NAME: [MessageHandler(text, editevo_name)],
+            X_ANIME: [MessageHandler(text, editevo_anime)],
+            X_RARITY: [MessageHandler(text, editevo_rarity)],
+            X_WORTH: [MessageHandler(text, editevo_worth)],
+            X_PHOTO: [MessageHandler(filters.PHOTO, editevo_photo), MessageHandler(text, editevo_photo)],
+            X_CODE: [MessageHandler(text, editevo_code)],
+            X_BASE: [MessageHandler(text, editevo_base)],
+            X_QTY: [MessageHandler(text, editevo_qty)],
+            X_STONES: [MessageHandler(text, editevo_stones)],
+            X_BERRIES: [MessageHandler(text, editevo_berries)],
+        },
+        fallbacks=[CommandHandler("cancel", editevo_cancel)],
         allow_reentry=True,
         conversation_timeout=_deps["conv_timeout"],
     ))

@@ -1379,18 +1379,21 @@ def _help_page(title, overview, entries, note=None):
 
 
 def _addedit_page(role):
-    """Add & Edit page: Owner sees /addevo + /delevo, Executive sees /addevo, Scout sees neither."""
+    """Add & Edit page: Owner sees /addevo, /editevo, /delevo; Executive sees /addevo, /editevo; Scout sees none of them."""
+    staff_evo = role in ("owner", "executive")
     entries = [
         ("/addcharacter", "Add a character (guided)"),
-        ("/editphoto <name/code>", "Edit a character photo"),
+        ("/editphoto <name/code>", "Edit a normal character's photo" + (" (Evolution photos: use /editevo)" if staff_evo else "")),
         ("/editcharacter <code/name>",
-         "Edit name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit; "
-         "also edits Evolution characters)" if role != "scout" else
-         "Edit name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit)"),
+         "Edit a normal character: name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit)"
+         + (". Evolution characters can't be edited here - use /editevo" if staff_evo else "")),
     ]
-    if role in ("owner", "executive"):
+    if staff_evo:
         entries.append(("/addevo", "Add an Evolution (guided, PM only): base code, quantity, name, anime, rarity, worth, "
                                    "Evolution Stones (min 10), Berrys cost, code, photo"))
+        entries.append(("/editevo <code/name>", "Edit an Evolution character AND its recipe (guided, PM only): name, anime, rarity, "
+                                                "worth, photo, code, base character, quantity, Evolution Stones, Berrys cost. "
+                                                "Normal characters use /edit"))
     if role == "owner":
         entries.append(("/delevo <code>", "Delete an Evolution recipe (Owner only). Evolution characters users already own are kept"))
     return _help_page(
@@ -2866,6 +2869,9 @@ async def character_selection_callback(update, context):
         await send_character_check_result(context.bot, query.message.chat_id, character, query.message)
         return
     if action == "edit":
+        if await asyncio.to_thread(mongo_db.is_evolution_character, code):   # normal characters only
+            await query.edit_message_text("⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+            return ConversationHandler.END
         context.user_data["edit_code_original"] = code
         context.user_data["edit_character"] = character
         await query.edit_message_text(
@@ -4988,6 +4994,9 @@ async def addphoto(update, context):
     if not character:
         await safe_reply_text(update.message, "❌ Character not found.")
         return
+    if await asyncio.to_thread(mongo_db.is_evolution_character, character[0]):
+        await safe_reply_text(update.message, "⚡ This is an Evolution character. Change its photo with /editevo.")
+        return
 
     context.user_data["photo_code"] = character[0]
     await safe_reply_text(update.message,
@@ -5004,6 +5013,10 @@ async def receive_photo(update, context):
     ):
         return
 
+    if await asyncio.to_thread(mongo_db.is_evolution_character, code):    # still guarded at save time
+        context.user_data.pop("photo_code", None)
+        await safe_reply_text(update.message, "⚡ This is an Evolution character. Change its photo with /editevo.")
+        return
     try:
         updated = (await asyncio.to_thread(mongo_db.update_character_photo, code, update.message.photo[-1].file_id))
     except Exception as e:
@@ -5038,16 +5051,25 @@ async def editcharacter(update, context):
         return ConversationHandler.END
     query = " ".join(context.args).strip()
     character = (await asyncio.to_thread(get_character, query))
+    normal_matches = []
     if not character:
         matches = (await asyncio.to_thread(find_characters_by_name_parts, query))
-        if len(matches) > 1:
+        normal_matches = [m for m in matches if not mongo_db.is_evolution_character(m[0])]
+        if matches and not normal_matches:
+            await safe_reply_text(update.message, "⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+            return ConversationHandler.END
+        if len(matches) > 1 and len(normal_matches) == 1:
+            character = normal_matches[0]      # the other match is an Evolution character: edit the normal one
+    if not character:
+        if len(normal_matches) > 1:
             await safe_reply_text(
                 update.message,
                 "❓ Multiple characters found. Select one:",
-                reply_markup=character_selection_keyboard(update.effective_user.id, "edit", matches),
+                reply_markup=character_selection_keyboard(update.effective_user.id, "edit", normal_matches),
             )
             return ConversationHandler.END
-        recruit_matches = (await asyncio.to_thread(find_characters_by_recruit_name_partial, query))
+        recruit_matches = [m for m in (await asyncio.to_thread(find_characters_by_recruit_name_partial, query))
+                           if not mongo_db.is_evolution_character(m[0])]
         if len(recruit_matches) > 1:
             await safe_reply_text(
                 update.message,
@@ -5058,6 +5080,9 @@ async def editcharacter(update, context):
         await safe_reply_text(update.message, "❌ Character not found. Use a 4-digit code, first name, last name, or full name.")
         return ConversationHandler.END
     code = character[0]
+    if await asyncio.to_thread(mongo_db.is_evolution_character, code):    # /edit and /editcharacter: NORMAL characters only
+        await safe_reply_text(update.message, "⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+        return ConversationHandler.END
     context.user_data["edit_code_original"] = code
     context.user_data["edit_character"] = character
     await safe_reply_text(update.message,
@@ -5157,8 +5182,12 @@ async def edit_code(update, context):
         return ConversationHandler.END
     new_recruit_names = d.get("edit_recruit_names", (await asyncio.to_thread(get_recruit_names, old_code)))
     try:
-        (await asyncio.to_thread(mongo_db.update_character, old_code, new_code, d["edit_name"], d["edit_anime"],
-                                  d["edit_rarity"], d["edit_worth"], new_recruit_names))
+        updated = (await asyncio.to_thread(mongo_db.update_character, old_code, new_code, d["edit_name"], d["edit_anime"],
+                                           d["edit_rarity"], d["edit_worth"], new_recruit_names))
+        if not updated:      # missing, or an Evolution character (those use /editevo)
+            await safe_reply_text(update.message, "❌ Update failed: the character no longer exists, or it is an Evolution character (use /editevo).")
+            context.user_data.clear()
+            return ConversationHandler.END
     except mongo_db.DuplicateKeyError:
         await safe_reply_text(update.message, "❌ Update failed: name or code may already exist.")
         context.user_data.clear()
@@ -8287,7 +8316,7 @@ LOG_CATEGORIES = {
     "character": ("Character events",
                   "Spawns, catches, adding/editing/deleting characters, gifts, collection changes",
                   {"spawn", "callcharacter", "add", "addcharacter", "addphoto", "editphoto",
-                   "addevo", "delevo", "edit", "editcharacter", "gift", "removechar", "delete", "discontinue", "continue", "clearspawn"}),
+                   "addevo", "editevo", "delevo", "edit", "editcharacter", "gift", "removechar", "delete", "discontinue", "continue", "clearspawn"}),
     "shop": ("Shop activities", "Opening and using the daily character shop", {"shop"}),
     "economy": ("Economy", "Daily rewards, Berry transfers, selling, exchanging and transferring characters, redeem codes",
                 {"daily", "berrytransfer", "berry", "sell", "exchange", "transfer", "redeem"}),
@@ -9677,6 +9706,7 @@ COMMANDS = {
     "continue": "Owner: allow a discontinued character again",
     "editphoto": "Edit character photo",
     "addevo": "Owner/Executive: add an evolution",
+    "editevo": "Owner/Executive: edit an evolution",
     "delevo": "Owner: delete an evolution recipe",
     "evolution": "View all evolution recipes",
     "evolve": "Evolve a character",
@@ -10376,7 +10406,7 @@ async def scout_list_command(update, context):
     await safe_reply_text(update.effective_message, format_staff_list("Scouts", rows), parse_mode="HTML")
 
 EXECUTIVE_COMMANDS = {
-    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "restrict", "unrestrict", "restrictions",
+    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict", "restrictions",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory", "addmessage",
     "btransfer", "unbtransfer", "setrules",
 }
@@ -10687,7 +10717,7 @@ def main():
         app.add_handler(CommandHandler(command_name, callback))
     fusion.bind(is_owner=is_owner, is_executive=is_executive, symbols=SYMBOL, conv_timeout=CONV_TIMEOUT,
                 notify=notify_staff_action, log_action=log_character_action, mark_success=mark_success,
-                safe_reply=safe_reply_text)
+                safe_reply=safe_reply_text, skip_keyboard=skip_keyboard, is_skip_text=is_skip_text)
     fusion.register(app)  # stone tasks, /stone, /item, Evolution: /addevo /evolution /evolve /delevo
 
     register_executive_commands(app)

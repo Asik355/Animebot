@@ -689,37 +689,44 @@ def update_character_photo(code, photo):
     return res.matched_count == 1
 
 
-def update_character(old_code, new_code, name, anime, rarity, worth, recruit_names=None):
+def update_character_tx(session, old_code, new_code, name, anime, rarity, worth, recruit_names=None, evolution=False):
     """
-    Edit a character. If the code changes, collections and favorites are re-pointed in the
-    same transaction. Raises DuplicateKeyError on code/name clash.
+    The character-edit writes, to be run INSIDE a transaction (session may be None). Returns False (nothing written) when the
+    character does not exist OR is the wrong kind: evolution=False edits NORMAL characters only, evolution=True edits
+    EVOLUTION characters only. If the code changes, collections, favorites and Evolution recipes are re-pointed too.
+    Raises DuplicateKeyError on code/name clash.
     """
     old_code, new_code = str(old_code), str(new_code)
     name = strip_evo_mark(name) if name else name       # never store the lightning mark (char_type is untouched)
+    kind = {"char_type": CHAR_TYPE_EVOLUTION} if evolution else {"char_type": {"$ne": CHAR_TYPE_EVOLUTION}}
+    fields = {
+        "code": new_code, "code_int": int(new_code) if new_code.isdigit() else 0,
+        "name": name, "name_ci": str(name).casefold() if name else None,
+        "anime": anime, "rarity": rarity, "worth": int(worth),
+    }
+    if recruit_names is not None:
+        fields["recruit_names"] = _clean_names(recruit_names)
+    res = col(CHARACTERS).update_one({"code": old_code, **kind}, {"$set": fields}, session=session)
+    if res.matched_count != 1:
+        return False
+    if new_code != old_code:
+        col(COLLECTIONS).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
+        col(FAVORITES).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
+        # Evolution recipes keep pointing at the renumbered character (base side and result side)
+        col(FUSION_EVOLUTION_RECIPES).update_many({"base_code": old_code}, {"$set": {"base_code": new_code}}, session=session)
+        recipe = col(FUSION_EVOLUTION_RECIPES).find_one({"_id": old_code}, session=session)
+        if recipe:
+            col(FUSION_EVOLUTION_RECIPES).delete_one({"_id": old_code}, session=session)
+            recipe.update({"_id": new_code, "evo_code": new_code})
+            col(FUSION_EVOLUTION_RECIPES).insert_one(recipe, session=session)
+    return True
 
-    def _work(session):
-        if new_code != old_code:
-            col(COLLECTIONS).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
-            col(FAVORITES).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
-            # Evolution recipes keep pointing at the renumbered character (base side and result side)
-            col(FUSION_EVOLUTION_RECIPES).update_many({"base_code": old_code}, {"$set": {"base_code": new_code}}, session=session)
-            recipe = col(FUSION_EVOLUTION_RECIPES).find_one({"_id": old_code}, session=session)
-            if recipe:
-                col(FUSION_EVOLUTION_RECIPES).delete_one({"_id": old_code}, session=session)
-                recipe.update({"_id": new_code, "evo_code": new_code})
-                col(FUSION_EVOLUTION_RECIPES).insert_one(recipe, session=session)
-        fields = {
-            "code": new_code, "code_int": int(new_code) if new_code.isdigit() else 0,
-            "name": name, "name_ci": str(name).casefold() if name else None,
-            "anime": anime, "rarity": rarity, "worth": int(worth),
-        }
-        if recruit_names is not None:
-            fields["recruit_names"] = _clean_names(recruit_names)
-        res = col(CHARACTERS).update_one({"code": old_code}, {"$set": fields}, session=session)
-        return res.matched_count == 1
 
+def update_character(old_code, new_code, name, anime, rarity, worth, recruit_names=None, evolution=False):
+    """Edit a character (normal ones by default; Evolution characters are edited with /editevo -> evolution=True)."""
     try:
-        return run_transaction(_work)
+        return run_transaction(lambda session: update_character_tx(
+            session, old_code, new_code, name, anime, rarity, worth, recruit_names, evolution))
     finally:
         invalidate_character_cache()
 
