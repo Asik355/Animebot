@@ -296,6 +296,20 @@ def ensure_indexes():
     col("berry_transfers_v2").create_index([("sender_id", ASCENDING), ("transfer_day", ASCENDING)], name="sender_day")
     col("berry_transfers_v2").create_index([("receiver_id", ASCENDING), ("transfer_day", ASCENDING)], name="receiver_day")
     col("events_v2").create_index([("active", ASCENDING)], name="active")
+    ensure_fusion_collections()
+
+
+def ensure_fusion_collections():
+    """Idempotent. Creates the Fusion collections (visible in Atlas right after startup) and their index."""
+    existing = set(get_db().list_collection_names())
+    for name in (FUSION_STONE_TASKS, FUSION_STONE_DAILY, FUSION_EVOLUTION_RECIPES):
+        if name not in existing:
+            try:
+                get_db().create_collection(name)
+            except Exception:   # already created by a concurrent start-up: fine
+                pass
+    col(FUSION_STONE_TASKS).create_index([("day", ASCENDING)], name="day")
+    col(FUSION_EVOLUTION_RECIPES).create_index([("base_code", ASCENDING)], unique=True, name="uniq_base_code")
 
 
 # --------------------------------------------------------------------------
@@ -445,8 +459,35 @@ def invalidate_character_cache():
         _char_cache["docs"] = None
 
 
+# ---- Character type (NORMAL / EVOLUTION) --------------------------------------------------------------
+# Existing characters have no `char_type` field and are NORMAL. Evolution characters are created by /addevo with
+# char_type = "EVOLUTION". The lightning mark is DISPLAY ONLY: it is added in _row()/display_name() and is never
+# stored in the character's name (every write path strips it).
+CHAR_TYPE_NORMAL = "NORMAL"
+CHAR_TYPE_EVOLUTION = "EVOLUTION"
+EVO_MARK = "\u26a1"   # lightning
+
+
+def strip_evo_mark(name):
+    """Remove every lightning mark (also the emoji-variant form) so a mark is never saved, and never doubled.
+    A name without a mark is returned exactly as given."""
+    text = str(name or "")
+    if EVO_MARK not in text:
+        return text
+    return " ".join(text.replace(EVO_MARK + "\ufe0f", " ").replace(EVO_MARK, " ").split())
+
+
+def display_name(name, char_type=None):
+    """Reusable display rule: EVOLUTION -> 'Name ⚡' (exactly one mark); NORMAL -> 'Name'."""
+    if char_type == CHAR_TYPE_EVOLUTION:
+        base = strip_evo_mark(name)
+        return f"{base} {EVO_MARK}" if base else name
+    return name
+
+
 def _row(d):
-    return (d["code"], d.get("name"), d.get("anime"), d.get("rarity"), d.get("worth"), d.get("photo_file_id"))
+    return (d["code"], display_name(d.get("name"), d.get("char_type")), d.get("anime"), d.get("rarity"),
+            d.get("worth"), d.get("photo_file_id"))
 
 
 def _chars():
@@ -486,12 +527,28 @@ def get_all_characters():
 
 
 def get_characters_by_rarity(rarity):
-    return [_row(d) for d in _chars() if d.get("rarity") == rarity and not d.get("discontinued")]
+    """Random-spawn / shop / recruit pool. Evolution characters are NEVER in it (checked by char_type)."""
+    return [_row(d) for d in _chars()
+            if d.get("rarity") == rarity and not d.get("discontinued")
+            and d.get("char_type") != CHAR_TYPE_EVOLUTION]
+
+
+def get_character_type(code):
+    """'EVOLUTION' / 'NORMAL', or None if the character does not exist."""
+    code = str(code)
+    for d in _chars():
+        if d["code"] == code:
+            return d.get("char_type") or CHAR_TYPE_NORMAL
+    return None
+
+
+def is_evolution_character(code):
+    return get_character_type(code) == CHAR_TYPE_EVOLUTION
 
 
 def get_character_names(codes):
     wanted = {str(c) for c in codes}
-    return {d["code"]: d.get("name") for d in _chars() if d["code"] in wanted}
+    return {d["code"]: display_name(d.get("name"), d.get("char_type")) for d in _chars() if d["code"] in wanted}
 
 
 def find_characters_by_name_parts(query):
@@ -592,9 +649,10 @@ def continue_character(code):
     return res.modified_count > 0
 
 
-def _char_doc(code, name, anime, rarity, worth, photo, recruit_names=None):
+def _char_doc(code, name, anime, rarity, worth, photo, recruit_names=None, char_type=None):
     code = str(code)
-    return {
+    name = strip_evo_mark(name) if name else name      # the lightning mark is never stored
+    doc = {
         "code": code,
         "code_int": int(code) if code.isdigit() else 0,
         "name": name,
@@ -605,6 +663,9 @@ def _char_doc(code, name, anime, rarity, worth, photo, recruit_names=None):
         "photo_file_id": photo,
         "recruit_names": _clean_names(recruit_names),
     }
+    if char_type == CHAR_TYPE_EVOLUTION:                # NORMAL characters keep no field (missing == NORMAL)
+        doc["char_type"] = CHAR_TYPE_EVOLUTION
+    return doc
 
 
 @retry_write
@@ -612,6 +673,13 @@ def insert_character(code, name, anime, rarity, worth, photo=None, recruit_names
     """Raises DuplicateKeyError if the code or (case-insensitive) name already exists."""
     col(CHARACTERS).insert_one(_char_doc(code, name, anime, rarity, worth, photo, recruit_names))
     invalidate_character_cache()
+
+
+def insert_evolution_character(code, name, anime, rarity, worth, photo, session=None):
+    """Create an EVOLUTION character in the normal characters collection. Raises DuplicateKeyError on code/name clash.
+    Caller must call invalidate_character_cache() after the surrounding transaction commits."""
+    col(CHARACTERS).insert_one(
+        _char_doc(code, name, anime, rarity, worth, photo, None, char_type=CHAR_TYPE_EVOLUTION), session=session)
 
 
 @retry_write
@@ -627,11 +695,19 @@ def update_character(old_code, new_code, name, anime, rarity, worth, recruit_nam
     same transaction. Raises DuplicateKeyError on code/name clash.
     """
     old_code, new_code = str(old_code), str(new_code)
+    name = strip_evo_mark(name) if name else name       # never store the lightning mark (char_type is untouched)
 
     def _work(session):
         if new_code != old_code:
             col(COLLECTIONS).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
             col(FAVORITES).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
+            # Evolution recipes keep pointing at the renumbered character (base side and result side)
+            col(FUSION_EVOLUTION_RECIPES).update_many({"base_code": old_code}, {"$set": {"base_code": new_code}}, session=session)
+            recipe = col(FUSION_EVOLUTION_RECIPES).find_one({"_id": old_code}, session=session)
+            if recipe:
+                col(FUSION_EVOLUTION_RECIPES).delete_one({"_id": old_code}, session=session)
+                recipe.update({"_id": new_code, "evo_code": new_code})
+                col(FUSION_EVOLUTION_RECIPES).insert_one(recipe, session=session)
         fields = {
             "code": new_code, "code_int": int(new_code) if new_code.isdigit() else 0,
             "name": name, "name_ci": str(name).casefold() if name else None,
@@ -655,6 +731,8 @@ def delete_character(code):
     def _work(session):
         col(COLLECTIONS).delete_many({"character_code": code}, session=session)
         col(FAVORITES).delete_many({"character_code": code}, session=session)
+        # a recipe whose base or result character is gone can never work: remove it
+        col(FUSION_EVOLUTION_RECIPES).delete_many({"$or": [{"_id": code}, {"base_code": code}]}, session=session)
         return col(CHARACTERS).delete_one({"code": code}, session=session).deleted_count == 1
 
     try:
@@ -756,7 +834,7 @@ def get_collection_summary(user_id):
     for d in _chars():
         s = stats.get(d["code"])
         if s:
-            rows.append((d["code"], d.get("name"), d.get("anime"), d.get("rarity"),
+            rows.append((d["code"], display_name(d.get("name"), d.get("char_type")), d.get("anime"), d.get("rarity"),
                          d.get("photo_file_id"), int(s["qty"]), s.get("last")))
     return rows
 
@@ -1115,6 +1193,11 @@ def replace_restrictions(data):
 BOT_SETTINGS = "bot_settings"
 PENDING_LOG_PROMPTS = "pending_log_prompts"
 OP_RECEIPTS = "op_receipts"
+
+# ---- Fusion system collections (Special Stone daily tasks, Evolution) - used by fusion.py
+FUSION_STONE_TASKS = "stone_tasks"            # one doc per user per IST day: task progress + claimed flags
+FUSION_STONE_DAILY = "stone_daily"            # one doc per IST day: the daily /add target character codes
+FUSION_EVOLUTION_RECIPES = "evolution_recipes"  # one doc per Evolution character code (used by the Evolution system)
 
 
 @retry_read

@@ -109,6 +109,7 @@ DAILY_RESET_HOUR = 4
 ITEMS_PER_PAGE = 5
 
 import mongo_db
+import fusion  # Special Stone Daily Task System
 
 
 def _mc(name):
@@ -1343,6 +1344,14 @@ def _build_help_text_raw():
         "/redeem <code> — Redeem a code\n\n"
         "🛒 Shop\n"
         "/shop — Open your personal character shop\n\n"
+        "⚡ Evolution\n"
+        "/evolution — View all evolution recipes\n"
+        "/evolve [code/name] — Evolve a character (needs base characters, Evolution Stones and Berrys)\n\n"
+        "💎 Stones & Items\n"
+        "/stonetask — View your daily stone tasks and claim rewards\n"
+        "/claimstone — Claim the stones of your completed tasks\n"
+        "/stone — Stone leaderboard\n"
+        "/item — View your items (personal inventory)\n\n"
         "📜 Rules\n"
         "/rules — View the bot usage rules (/rules noformat for raw text)\n\n"
         "👥 Staff\n"
@@ -1367,6 +1376,27 @@ def _help_page(title, overview, entries, note=None):
     if note:
         lines.extend(["", note])
     return "\n".join(lines)
+
+
+def _addedit_page(role):
+    """Add & Edit page: Owner sees /addevo + /delevo, Executive sees /addevo, Scout sees neither."""
+    entries = [
+        ("/addcharacter", "Add a character (guided)"),
+        ("/editphoto <name/code>", "Edit a character photo"),
+        ("/editcharacter <code/name>",
+         "Edit name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit; "
+         "also edits Evolution characters)" if role != "scout" else
+         "Edit name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit)"),
+    ]
+    if role in ("owner", "executive"):
+        entries.append(("/addevo", "Add an Evolution (guided, PM only): base code, quantity, name, anime, rarity, worth, "
+                                   "Evolution Stones (min 10), Berrys cost, code, photo"))
+    if role == "owner":
+        entries.append(("/delevo <code>", "Delete an Evolution recipe (Owner only). Evolution characters users already own are kept"))
+    return _help_page(
+        "🎴 Add & Edit Characters (Owner, Executive & Scout)",
+        "Add and maintain characters. The editor also changes recruitment/search names.",
+        entries)
 
 
 HELP_ROLE_TITLES = {"owner": "👑 Owner Commands", "executive": "⚡ Executive Commands", "scout": "🔭 Scout Commands"}
@@ -1507,12 +1537,7 @@ HELP_MODULES = {
             "Clearing the rules is reserved for the Owner.")),
     ],
     "scout": [
-        ("addedit", "🎴 Add & Edit", _help_page(
-            "🎴 Add & Edit Characters (Owner, Executive & Scout)",
-            "Add and maintain characters. The editor also changes recruitment/search names.",
-            [("/addcharacter", "Add a character (guided)"),
-             ("/addphoto <name/code>", "Add a character photo"),
-             ("/editcharacter <code/name>", "Edit name, anime, rank/rarity, worth, 4-digit code, recruitment/search names")])),
+        ("addedit", "🎴 Add & Edit", _addedit_page("scout")),
         ("spawntools", "🛠 Spawn Tools", _help_page(
             "🛠 Spawn Tools (Owner, Executive & Scout)",
             "Fix spawns that got stuck.",
@@ -1541,6 +1566,10 @@ def _module_button(label, callback_data):
                 continue
     return InlineKeyboardButton(label, callback_data=callback_data)
 
+
+# Add & Edit shows in all three role menus; the Owner and Executive pages also list the Evolution commands.
+HELP_MODULES["owner"].append(("addedit", "🎴 Add & Edit", _addedit_page("owner")))
+HELP_MODULES["executive"].append(("addedit", "🎴 Add & Edit", _addedit_page("executive")))
 
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Please run /help to open your own menu."
 # Executive and Scout modules stay in their own menus AND are copied (same text) into the Owner menu.
@@ -2161,6 +2190,12 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
         active = app.bot_data.setdefault("active_spawns", {})
         if chat_id in active:
             return False, "❌ A character is already spawned in this chat."
+
+        # Evolution characters are obtained ONLY by evolving: never spawn one (checked by character type, not name/code).
+        if character is not None and await asyncio.to_thread(mongo_db.is_evolution_character, character[0]):
+            if not random_spawn:
+                return False, "❌ Evolution characters cannot be spawned. They are only obtained by evolving."
+            character = None   # random spawn: fall through and pick a normal character instead
 
         if random_spawn:
             excluded_for_random = (await asyncio.to_thread(get_daily_random_spawn_limited_codes, chat_id, app))
@@ -3112,6 +3147,7 @@ async def add(update, context):
     mark_success(update)
     caught_rarity = caught_spawn["rarity"]
     caught_symbol = SYMBOL.get(caught_rarity, "⭐")
+    await fusion.record_catch(user_id, caught_rarity, caught_spawn["code"])  # stone task progress (never raises)
     await safe_reply_text(
         update.message,
         f"🌸 Recruiter: {berry_display_name(update.effective_user)}\n\n"
@@ -3122,8 +3158,10 @@ async def add(update, context):
         f"Worth: {caught_spawn['worth']} Berrys\n"
     )
 
-async def get_collection_rows(user_id, sort_mode="tier"):
+async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
     rows = (await asyncio.to_thread(mongo_db.get_collection_summary, user_id))
+    if rarity:      # tier filter from the Tier menu: only this tier's characters
+        rows = [r for r in rows if r[3] == rarity]
 
     rarity_order = {
         "Celestial": 0,
@@ -3154,33 +3192,52 @@ def set_favorite(user_id, character_code):
 def clear_favorite(user_id):
     mongo_db.clear_favorite(user_id)
 
-def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code):
+# Tier menu (🔹 Tier button): highest tier first. Callback mode format: <sort>[~<Rarity>], e.g. "name~Epic".
+COLLECTION_TIERS = ("Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
+COLLECTION_SORTS = {"tier", "time", "name", "qty"}
+
+
+def _parse_coll_mode(value):
+    """'name~Epic' -> ('name', 'Epic'); unknown tier names are ignored (-> None)."""
+    action, _sep, tier = str(value).partition("~")
+    return action, (tier if tier in COLLECTION_TIERS else None)
+
+
+def collection_tier_keyboard(user_id):
+    """The tier menu shown after tapping 🔹 Tier: one tier per row, then Back to the full collection."""
+    rows = [[InlineKeyboardButton(rarity_text(r), callback_data=f"coll:{user_id}:tier~{r}:0")] for r in COLLECTION_TIERS]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"coll:{user_id}:tier:0")])
+    return InlineKeyboardMarkup(rows)
+
+
+def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity=None):
+    suffix = f"~{rarity}" if rarity else ""          # the tier filter travels inside the button data
     buttons = []
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"coll:{user_id}:{sort_mode}:{page-1}"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"coll:{user_id}:{sort_mode}{suffix}:{page-1}"))
     nav.append(InlineKeyboardButton(f"📖 {page+1}/{total_pages}", callback_data=f"coll:{user_id}:nochange:0"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"coll:{user_id}:{sort_mode}:{page+1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"coll:{user_id}:{sort_mode}{suffix}:{page+1}"))
     buttons.append(nav)
 
     buttons.append([
-        InlineKeyboardButton("🔹 Tier", callback_data=f"coll:{user_id}:tier:0"),
-        InlineKeyboardButton("🔤 Name", callback_data=f"coll:{user_id}:name:0"),
+        InlineKeyboardButton("🔹 Tier", callback_data=f"coll:{user_id}:tiermenu:0"),
+        InlineKeyboardButton("🔤 Name", callback_data=f"coll:{user_id}:name{suffix}:0"),
     ])
     buttons.append([
-        InlineKeyboardButton("🔢 Quantity", callback_data=f"coll:{user_id}:qty:0"),
-        InlineKeyboardButton("🕒 Recent", callback_data=f"coll:{user_id}:time:0"),
+        InlineKeyboardButton("🔢 Quantity", callback_data=f"coll:{user_id}:qty{suffix}:0"),
+        InlineKeyboardButton("🕒 Recent", callback_data=f"coll:{user_id}:time{suffix}:0"),
     ])
 
     if favorite_code:
         buttons.append([
             InlineKeyboardButton("⭐ Favourite", callback_data=f"coll:{user_id}:nochange:0"),
-            InlineKeyboardButton("❌ Clear Favourite", callback_data=f"coll:{user_id}:clearfav:0"),
+            InlineKeyboardButton("❌ Clear Favourite", callback_data=f"coll:{user_id}:clearfav{suffix}:0"),
         ])
     return InlineKeyboardMarkup(buttons)
 
-def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name="Player"):
+def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name="Player", tier_filter=None):
     total_pages = max(1, (len(rows) + per_page - 1) // per_page)
     page = max(0, min(page, total_pages - 1))
     page_rows = rows[page * per_page:(page + 1) * per_page]
@@ -3189,7 +3246,8 @@ def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_
         "━━━━━━━━━━━━━━━━━━\n"
         f"❀• {owner_name} •❀'s crew  ➜  Page {page + 1}/{total_pages}\n"
         "━━━━━━━━━━━━━━━━━━\n\n"
-        f"📚 Collection: {total_copies} total | {len(rows)} unique\n"
+        + (f"📚 {rarity_text(tier_filter)} collection: {sum(r[5] for r in rows)} total | {len(rows)} unique\n" if tier_filter
+           else f"📚 Collection: {total_copies} total | {len(rows)} unique\n")
     )
 
     current_rarity = None
@@ -3202,15 +3260,21 @@ def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_
 
     text += "\n━━━━━━━━━━━━━━━━━━"
     labels = {"tier": "🔹 Sorted by Tier", "time": "🕒 Sorted by Recent", "name": "🔤 Sorted by Name", "qty": "🔢 Sorted by Quantity"}
-    text += "\n" + labels.get(sort_mode, "🔹 Sorted by Tier")
+    if tier_filter:      # tier view: "Tier: Epic" (plus the sort when it is not the default tier sort)
+        text += f"\n🔹 Tier: {rarity_text(tier_filter)}" + ("" if sort_mode == "tier" else f" | {labels.get(sort_mode, '')}")
+    else:
+        text += "\n" + labels.get(sort_mode, "🔹 Sorted by Tier")
     if favorite_code:
         fav = next((r for r in rows if r[0] == favorite_code), None)
         if fav:
             text += f"\n⭐ Favourite: {fav[1]} [{fav[0]}]"
     return text, total_pages, page
 
-async def send_collection(update_or_query, context, user_id, page=0, sort_mode="tier", edit=False, owner_name=None):
-    rows = await get_collection_rows(user_id, sort_mode)
+async def send_collection(update_or_query, context, user_id, page=0, sort_mode="tier", edit=False, owner_name=None, rarity=None):
+    rows = await get_collection_rows(user_id, sort_mode, rarity)
+    if not rows and rarity:      # the last copy of that tier was sold/moved meanwhile: fall back to the full collection
+        rarity = None
+        rows = await get_collection_rows(user_id, sort_mode)
     sender_message = getattr(update_or_query, "message", None)
     if sender_message is None and hasattr(update_or_query, "effective_message"):
         sender_message = update_or_query.effective_message
@@ -3235,10 +3299,10 @@ async def send_collection(update_or_query, context, user_id, page=0, sort_mode="
             else "Player"
         ) or "Player"
     text, total_pages, page = build_collection_text(
-        rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name
+        rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name, rarity
     )
     text = add_display_name_header(sender_message, text)
-    keyboard = collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code)
+    keyboard = collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity)
 
     photo = None
     if favorite_code:
@@ -3427,21 +3491,33 @@ async def collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.answer("❌ This collection belongs to another user.", show_alert=True)
         return
 
-    await query.answer()
-    action = parts[2]
+    action, rarity = _parse_coll_mode(parts[2])      # e.g. "name~Epic" -> ("name", "Epic")
     if action == "nochange":
+        await query.answer()
         return
+    if action == "tiermenu":                         # 🔹 Tier: swap the buttons for the tier list (text stays)
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=collection_tier_keyboard(user_id))
+        except Exception as e:
+            print("Tier menu error:", e)
+        return
+    if rarity and not await get_collection_rows(user_id, "tier", rarity):
+        await query.answer(f"❌ You have no {rarity} characters.", show_alert=True)   # nothing changes on screen
+        return
+
+    await query.answer()
     if action == "clearfav":
         (await asyncio.to_thread(clear_favorite, user_id))
         page = 0
         action = "tier"
 
-    if action not in {"tier", "time", "name", "qty"}:
+    if action not in COLLECTION_SORTS:
         action = "tier"
 
     await send_collection(
         query, context, user_id, page, action, edit=True,
-        owner_name=query.from_user.first_name or "Player"
+        owner_name=query.from_user.first_name or "Player", rarity=rarity
     )
 
 async def mystats(update, context):
@@ -4131,6 +4207,8 @@ async def sell(update, context):
     if not ok:
         await safe_reply_text(update.message, f"❌ You only have {available} copy/copies of {name}.")
         return
+
+    await fusion.record_sell(update.effective_user.id, rarity, quantity)  # stone task progress (never raises)
 
     try:
         await update.message.delete()
@@ -4901,7 +4979,7 @@ async def addphoto(update, context):
 
     if not context.args:
         await safe_reply_text(update.message,
-            "Usage: /addphoto <name or code>"
+            "Usage: /editphoto <name or code>"
         )
         return
 
@@ -8208,8 +8286,8 @@ async def cancel_conversation(update, context):
 LOG_CATEGORIES = {
     "character": ("Character events",
                   "Spawns, catches, adding/editing/deleting characters, gifts, collection changes",
-                  {"spawn", "callcharacter", "add", "addcharacter", "addphoto",
-                   "editcharacter", "gift", "removechar", "delete", "discontinue", "continue", "clearspawn"}),
+                  {"spawn", "callcharacter", "add", "addcharacter", "addphoto", "editphoto",
+                   "addevo", "delevo", "edit", "editcharacter", "gift", "removechar", "delete", "discontinue", "continue", "clearspawn"}),
     "shop": ("Shop activities", "Opening and using the daily character shop", {"shop"}),
     "economy": ("Economy", "Daily rewards, Berry transfers, selling, exchanging and transferring characters, redeem codes",
                 {"daily", "berrytransfer", "berry", "sell", "exchange", "transfer", "redeem"}),
@@ -9597,7 +9675,15 @@ COMMANDS = {
     "delete": "Owner: delete a character",
     "discontinue": "Owner: stop a character from spawning",
     "continue": "Owner: allow a discontinued character again",
-    "addphoto": "Add character photo",
+    "editphoto": "Edit character photo",
+    "addevo": "Owner/Executive: add an evolution",
+    "delevo": "Owner: delete an evolution recipe",
+    "evolution": "View all evolution recipes",
+    "evolve": "Evolve a character",
+    "item": "View your items (inventory)",
+    "stone": "Stone leaderboard",
+    "stonetask": "View your daily stone tasks",
+    "claimstone": "Claim your completed task stones",
     "addcharacter": "Add a character",
     "editcharacter": "Edit a character",
     "addlist": "Character add/edit ranking",
@@ -9655,7 +9741,8 @@ PUBLIC_COMMANDS = {
     "start", "help", "spawn", "add", "mycollection", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
-    "shop", "exchange", "guess_num", "nguess", "rules"
+    "shop", "exchange", "guess_num", "nguess", "rules",
+    "evolution", "evolve", "item", "stone", "stonetask", "claimstone",
 }
 
 def make_bot_commands(names):
@@ -10289,15 +10376,15 @@ async def scout_list_command(update, context):
     await safe_reply_text(update.effective_message, format_staff_list("Scouts", rows), parse_mode="HTML")
 
 EXECUTIVE_COMMANDS = {
-    "addcharacter", "addphoto", "editcharacter", "restrict", "unrestrict", "restrictions",
+    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "restrict", "unrestrict", "restrictions",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory", "addmessage",
     "btransfer", "unbtransfer", "setrules",
 }
 SCOUT_COMMANDS = {
-    "addcharacter", "addphoto", "editcharacter", "clearspawn", "notifications", "notificationoff", "notificationon",
+    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
 }
 def register_executive_commands(app):
-    app.add_handler(CommandHandler("addphoto", addphoto))
+    app.add_handler(CommandHandler(["editphoto", "addphoto"], addphoto))   # /addphoto = hidden alias of /editphoto
     app.add_handler(CommandHandler(["scouts", "scout"], scout_list_command))
     app.add_handler(CommandHandler("restrict", restrict))
     app.add_handler(CommandHandler("unrestrict", unrestrict))
@@ -10314,7 +10401,7 @@ def register_executive_commands(app):
 
     edit_conv = ConversationHandler(
         entry_points=[
-            CommandHandler("editcharacter", editcharacter),
+            CommandHandler(["editcharacter", "edit"], editcharacter),   # /edit = short alias
             CallbackQueryHandler(character_selection_callback, pattern=r"^charselect:edit:"),
         ],
         states={
@@ -10349,7 +10436,7 @@ def register_executive_commands(app):
     app.add_handler(add_conv)
 
 OWNER_COMMANDS = {
-    "callcharacter", "clearspawn", "gift", "delete", "discontinue", "continue",
+    "delevo", "callcharacter", "clearspawn", "gift", "delete", "discontinue", "continue",
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
     "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "removechar", "boton",
@@ -10598,6 +10685,10 @@ def main():
     )
     for command_name, callback in public_handlers:
         app.add_handler(CommandHandler(command_name, callback))
+    fusion.bind(is_owner=is_owner, is_executive=is_executive, symbols=SYMBOL, conv_timeout=CONV_TIMEOUT,
+                notify=notify_staff_action, log_action=log_character_action, mark_success=mark_success,
+                safe_reply=safe_reply_text)
+    fusion.register(app)  # stone tasks, /stone, /item, Evolution: /addevo /evolution /evolve /delevo
 
     register_executive_commands(app)
     register_owner_commands(app)
