@@ -32,6 +32,7 @@ from html import escape as html_escape
 import random
 import re
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
@@ -110,6 +111,7 @@ ITEMS_PER_PAGE = 5
 
 import mongo_db
 import fusion  # Special Stone Daily Task System
+import theme   # Bot Theme Customization (Owner: /help -> Owner Commands -> 🎨 Customize Bot)
 
 
 def _mc(name):
@@ -1009,7 +1011,8 @@ async def track_bot_membership(update, context):
 
 SPAWN_LIFETIME = 20 * 60  # 20 minutes
 AUTO_SPAWN_INTERVAL = 30 * 60  # 30 minutes
-PERSONAL_SPAWN_COOLDOWN = 3600  # 1 hour
+PERSONAL_SPAWN_COOLDOWN = 3600  # 1 hour: Scouts and general members
+STAFF_SPAWN_COOLDOWN = 1800     # 30 minutes: Owner and Executive
 GROUP_SPAWN_COOLDOWN = 70       # 70 seconds
 SYMBOL = {
     "Common": "⚪",
@@ -1310,7 +1313,7 @@ def _number_commands(text):
 
 
 def build_help_text():
-    return _number_commands(_build_help_text_raw())
+    return theme.decorate_help_text(_number_commands(_build_help_text_raw()))
 
 
 def _build_help_text_raw():
@@ -1582,6 +1585,7 @@ for _role in ("executive", "scout"):
         if _module[0] not in _owner_keys:
             HELP_MODULES["owner"].append(_module)
             _owner_keys.add(_module[0])
+HELP_MODULES["owner"].append(("customize", "🎨 Customize Bot", "🎨 Customize Bot"))    # Owner only (opens theme.py's hub)
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -1600,13 +1604,15 @@ def _help_module_visible(key, user_id):
         return False
     if key == "scouts" and is_owner(uid):
         return False
+    if key == "customize" and not is_owner(uid):
+        return False
     return True
 
 
 def help_grid_keyboard(role, owner_id):
     """LAYER 2: module buttons in a strict 3-column grid + « Back to Layer 1 (main help)."""
-    buttons = [_module_button(label, f"help:{owner_id}:{role}:{key}") for key, label, _text in HELP_MODULES[role]
-               if _help_module_visible(key, owner_id)]
+    buttons = [_module_button(label, f"theme:{owner_id}:hub:open" if key == "customize" else f"help:{owner_id}:{role}:{key}")
+               for key, label, _text in HELP_MODULES[role] if _help_module_visible(key, owner_id)]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:back")])
     return InlineKeyboardMarkup(rows)
@@ -1691,6 +1697,16 @@ def berry_display_name(user):
     last = (user.last_name or "").strip()
     return " ".join(part for part in (first, last) if part) or "Unknown"
 
+def personal_spawn_cooldown(user_id):
+    """/spawn cooldown in seconds: Owner and Executive 30 minutes; Scouts and general members 1 hour (unchanged)."""
+    try:
+        if is_owner(user_id) or is_executive(user_id):
+            return STAFF_SPAWN_COOLDOWN
+    except Exception:
+        pass
+    return PERSONAL_SPAWN_COOLDOWN
+
+
 def get_active_event():
     d = _mc("events_v2").find_one({"active": 1}, sort=[("created_at", -1), ("_id", -1)])
     if not d:
@@ -1726,6 +1742,8 @@ async def _active_event_cached():
 def format_reward(reward_type, reward_value):
     if reward_type == "coins":
         return f"🪙 {reward_value} Berrys"
+    if reward_type == "stones":
+        return f"💎 {reward_value} Special Stone" + ("" if str(reward_value) == "1" else "s")
     if reward_type == "character":
         character = get_character_by_code(str(reward_value))
         if character:
@@ -2521,6 +2539,13 @@ async def guess_number(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hint = "⬆️ The number is HIGHER!" if guess < secret else "⬇️ The number is LOWER!"
         await safe_reply_text(message, header + f"{hint}\n🔢 Attempts: {attempt}/10", parse_mode="HTML")
 
+START_TEXT = (
+    "🎮 Welcome to Anime Character Catcher!\n\n"
+    "Catch characters, build your collection, earn Berrys, and enjoy the game.\n\n"
+    "📖 Use /help to see all available commands."
+)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (await save_user_async(update.effective_user))
     if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
@@ -2532,10 +2557,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await refresh_group_command_menu(context.bot, update.effective_chat.id, user_id)
 
+    if await theme.send_start(update, context):     # only acts when the Owner saved a customization; otherwise False
+        return
+
     await safe_reply_text(update.message,
-        "🎮 Welcome to Anime Character Catcher!\n\n"
-        "Catch characters, build your collection, earn Berrys, and enjoy the game.\n\n"
-        "📖 Use /help to see all available commands.",
+        START_TEXT,
         reply_markup=start_help_keyboard(update.effective_user.id),
     )
 
@@ -2662,7 +2688,7 @@ async def spawn(update, context):
 
     now_dt = datetime.now()
     last_calls = context.application.bot_data.setdefault("last_calls", {})
-    personal_remaining = PERSONAL_SPAWN_COOLDOWN - (now_dt - last_calls[user_id]).total_seconds() if user_id in last_calls else 0
+    personal_remaining = personal_spawn_cooldown(user_id) - (now_dt - last_calls[user_id]).total_seconds() if user_id in last_calls else 0
     if personal_remaining > 0:
         await safe_reply_text(
             update.message,
@@ -2750,7 +2776,7 @@ async def cooldown(update, context):
 
     # Personal and group /spawn cooldowns.
     last_calls = context.application.bot_data.setdefault("last_calls", {})
-    personal_remaining = (PERSONAL_SPAWN_COOLDOWN - (now_dt - last_calls[update.effective_user.id]).total_seconds()
+    personal_remaining = (personal_spawn_cooldown(update.effective_user.id) - (now_dt - last_calls[update.effective_user.id]).total_seconds()
                           if update.effective_user.id in last_calls else 0)
     personal_text = format_duration(personal_remaining) if personal_remaining > 0 else "Ready"
 
@@ -7416,28 +7442,29 @@ async def add_event_name(update, context):
     if not text or text.startswith("/"):
         await safe_reply_text(update.message, "❌ Event name required."); return EVENT_NAME
     context.user_data["event_name"]=text
-    await safe_reply_text(update.message, "2️⃣ Event 2-digit code (00-99):")
+    await safe_reply_text(update.message, "2️⃣ Event code (letters and digits, any length, e.g. spring2025):")
     return EVENT_CODE
 
 async def add_event_code(update, context):
-    text=update.message.text.strip()
-    if not text.isdigit() or len(text)!=2:
-        await safe_reply_text(update.message, "❌ Event code must be exactly 2 digits (00-99). Send again:")
+    key, text, code_error = parse_code(update.message.text)
+    if code_error:
+        await safe_reply_text(update.message, f"❌ {code_error} Send the event code again:")
         return EVENT_CODE
-    exists = (await asyncio.to_thread(_mc("events_v2").find_one, {"active": 1, "event_code": text}))
-    if exists:
-        await safe_reply_text(update.message, "❌ This event code is already in use. Send another 2-digit code:")
+    active_events = (await asyncio.to_thread(lambda: list(_mc("events_v2").find({"active": 1}))))
+    if any(parse_code(str(e.get("event_code") or ""))[0] == key for e in active_events):
+        await safe_reply_text(update.message, "❌ This event code is already in use (capital and small letters count as the same). Send another code:")
         return EVENT_CODE
     context.user_data["event_code"]=text
-    await safe_reply_text(update.message, "3️⃣ Reward type: Berrys or Character")
+    await safe_reply_text(update.message, "3️⃣ Reward type: Berrys, Character or Stone")
     return EVENT_REWARD_TYPE
 
 async def add_event_reward_type(update, context):
     text=update.message.text.strip().lower()
-    if text not in ("coin", "coins", "berrys", "character"):
-        await safe_reply_text(update.message, "❌ Send Berrys or Character."); return EVENT_REWARD_TYPE
-    context.user_data["event_reward_type"]="coins" if text in ("coin", "coins", "berrys") else "character"
-    await safe_reply_text(update.message, "4️⃣ Send Berrys amount:" if context.user_data["event_reward_type"]=="coins" else "4️⃣ Send character code or character name:")
+    if text not in ("coin", "coins", "berrys", "character", "stone", "stones", "special stone", "special stones"):
+        await safe_reply_text(update.message, "❌ Send Berrys, Character or Stone."); return EVENT_REWARD_TYPE
+    context.user_data["event_reward_type"]=("coins" if text in ("coin", "coins", "berrys") else "character" if text == "character" else "stones")
+    await safe_reply_text(update.message, {"coins": "4️⃣ Send Berrys amount:", "stones": "4️⃣ Send Special Stones amount:",
+                                           "character": "4️⃣ Send character code or character name:"}[context.user_data["event_reward_type"]])
     return EVENT_REWARD_VALUE
 
 async def add_event_reward_value(update, context):
@@ -7449,9 +7476,10 @@ async def add_event_reward_value(update, context):
             return EVENT_REWARD_VALUE
         context.user_data["event_reward_value"] = int(character[0])
     else:
-        if not text.isdigit() or int(text)<1:
+        amount = _positive_amount(text)
+        if amount is None:
             await safe_reply_text(update.message, "❌ Send a valid positive number."); return EVENT_REWARD_VALUE
-        context.user_data["event_reward_value"]=int(text)
+        context.user_data["event_reward_value"]=amount
     await safe_reply_text(update.message, "5️⃣ Exact trigger phrase users must type:")
     return EVENT_TRIGGER
 
@@ -7555,12 +7583,18 @@ async def event_trigger_message(update, context):
 
     granted_id = None
     coins_given = False
+    stones_given = False
     try:
         if reward_type == "coins":
             if not (await asyncio.to_thread(mongo_db.add_coins, uid, int(reward_value))):
                 raise RuntimeError("event reward user missing")
             coins_given = True
             reward = f"🪙 {reward_value} Berrys"
+        elif reward_type == "stones":
+            if not (await asyncio.to_thread(mongo_db.add_special_stones, uid, int(reward_value))):
+                raise RuntimeError("event reward user missing")
+            stones_given = True
+            reward = format_reward("stones", reward_value)
         else:
             char_row = (await asyncio.to_thread(mongo_db.get_character_by_code, str(reward_value)))
             if not char_row:
@@ -7576,6 +7610,11 @@ async def event_trigger_message(update, context):
         if coins_given:
             try:
                 (await asyncio.to_thread(mongo_db.add_coins, uid, -int(reward_value)))
+            except Exception as undo_err:
+                print("Event reward undo error:", undo_err)
+        if stones_given:
+            try:
+                (await asyncio.to_thread(mongo_db.add_special_stones, uid, -int(reward_value)))
             except Exception as undo_err:
                 print("Event reward undo error:", undo_err)
         if granted_id is not None:
@@ -7599,23 +7638,23 @@ async def end_event_start(update, context):
         return ConversationHandler.END
     _ev = (await asyncio.to_thread(_mc("events_v2").find_one, {"_id": row[0]})); r = (_ev.get("event_code"),) if _ev else None
     if not r or not r[0]:
-        await safe_reply_text(update.message, "❌ This event has no 2-digit code and cannot be manually ended. Create a new event with a code.")
+        await safe_reply_text(update.message, "❌ This event has no code and cannot be manually ended. Create a new event with a code.")
         return ConversationHandler.END
-    await safe_reply_text(update.message, "🔚 Send the 2-digit event code (00-99):")
+    await safe_reply_text(update.message, "🔚 Send the event code:")
     return END_EVENT_CODE
 
 async def end_event_confirm(update, context):
-    text = update.message.text.strip()
-    if not text.isdigit() or len(text) != 2:
-        await safe_reply_text(update.message, "❌ Event code must be exactly 2 digits (00-99). Send again:")
+    key, text, code_error = parse_code(update.message.text)
+    if code_error:
+        await safe_reply_text(update.message, f"❌ {code_error} Send the event code again:")
         return END_EVENT_CODE
     ev = (await asyncio.to_thread(_mc("events_v2").find_one, {"active": 1}, sort=[("_id", -1)]))
     if not ev:
         await safe_reply_text(update.message, "ℹ️ No active event.")
         return ConversationHandler.END
     event_id, name, code = ev["_id"], ev.get("name"), ev.get("event_code")
-    if text != (code or ""):
-        await safe_reply_text(update.message, "❌ Wrong event code. Send the correct 2-digit code:")
+    if key != parse_code(str(code or ""))[0]:
+        await safe_reply_text(update.message, "❌ Wrong event code. Send the correct code (capital and small letters do not matter):")
         return END_EVENT_CODE
     (await asyncio.to_thread(_mc("events_v2").update_one, {"_id": event_id}, {"$set": {"active": 0}}))
     _EVENT_CACHE["val"] = None
@@ -7634,6 +7673,31 @@ async def event_claim_callback(update, context):
 
 REDEEM_TYPE, REDEEM_REWARD, REDEEM_COUNT, REDEEM_EXPIRY, REDEEM_CODE = range(500,505)
 
+CODE_MAX_LENGTH = 1000      # safety ceiling only (a code is one Telegram command argument); there is no practical limit
+
+
+def parse_code(text):
+    """
+    Redeem codes and event codes: letters of ANY language and digits, mixed freely (hello123), any length from 1 character.
+    Returns (key, display, error). `key` is the case-insensitive form (Unicode NFKC + casefold) used for storage and lookup, so
+    Hello123, hello123 and HELLO123 are ONE code; `display` is the code exactly as the Owner typed it.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, None, "Send the code."
+    if len(raw) > CODE_MAX_LENGTH:
+        return None, None, f"That code is {len(raw)} characters long; the safety limit is {CODE_MAX_LENGTH}."
+    for n, ch in enumerate(raw):
+        cat = unicodedata.category(ch)
+        if not (cat[0] == "L" or cat == "Nd" or (cat[0] == "M" and n > 0)):     # letters, digits, and combining marks inside words
+            return None, None, "Use letters and digits only (any language) - no spaces, symbols or emoji."
+    return unicodedata.normalize("NFKC", raw).casefold(), raw, None
+
+
+def _positive_amount(text, limit=1_000_000_000):
+    t = (text or "").strip()
+    return int(t) if t.isascii() and t.isdigit() and 0 < int(t) <= limit else None
+
 async def add_redeem_start(update, context):
     if not is_owner(update.effective_user.id):
         await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
@@ -7642,19 +7706,19 @@ async def add_redeem_start(update, context):
     context.user_data.pop("redeem_reward", None)
     context.user_data.pop("redeem_count", None)
     context.user_data.pop("redeem_expiry", None)
-    await safe_reply_text(update.message, "1️⃣ Reward type: Character or Berrys")
+    await safe_reply_text(update.message, "1️⃣ Reward type: Character, Berrys or Stone")
     return REDEEM_TYPE
 
 async def add_redeem_type(update, context):
     text = update.message.text.strip().lower()
-    if text not in ("character", "berrys"):
-        await safe_reply_text(update.message, "❌ Send Character or Berrys.")
+    if text not in ("character", "berrys", "stone", "stones", "special stone", "special stones"):
+        await safe_reply_text(update.message, "❌ Send Character, Berrys or Stone.")
         return REDEEM_TYPE
 
-    context.user_data["redeem_type"] = "coins" if text == "berrys" else "character"
+    context.user_data["redeem_type"] = ("coins" if text == "berrys" else "character" if text == "character" else "stones")
     await safe_reply_text(update.message,
-        "2️⃣ Existing character code or name:" if context.user_data["redeem_type"] == "character"
-        else "2️⃣ Berrys amount:"
+        {"character": "2️⃣ Existing character code or name:", "coins": "2️⃣ Berrys amount:",
+         "stones": "2️⃣ Special Stones amount:"}[context.user_data["redeem_type"]]
     )
     return REDEEM_REWARD
 
@@ -7669,10 +7733,12 @@ async def add_redeem_reward(update, context):
             return REDEEM_REWARD
         value = char[0]
     else:
-        if not text.isdigit() or int(text) <= 0:
-            await safe_reply_text(update.message, "❌ Berrys amount must be positive.")
+        amount = _positive_amount(text)
+        if amount is None:
+            await safe_reply_text(update.message, "❌ " + ("Special Stones" if typ == "stones" else "Berrys") +
+                                  " amount must be a positive whole number.")
             return REDEEM_REWARD
-        value = text
+        value = str(amount)
 
     context.user_data["redeem_reward"] = value
     await safe_reply_text(update.message, "3️⃣ How many users can redeem this code? Send a positive number:")
@@ -7727,24 +7793,27 @@ async def add_redeem_expiry(update, context):
         return REDEEM_EXPIRY
 
     context.user_data["redeem_expiry"] = expiry
-    await safe_reply_text(update.message, "5️⃣ Send a unique 6-digit redeem code:")
+    await safe_reply_text(update.message,
+        "5️⃣ Send a unique redeem code.\n"
+        "Letters (any language) and digits, any length, mixed as you like - for example hello123. "
+        "Capital and small letters count as the same code.")
     return REDEEM_CODE
 
 async def add_redeem_code(update, context):
-    code = update.message.text.strip()
-    if not (code.isdigit() and len(code) == 6):
-        await safe_reply_text(update.message, "❌ Redeem code must be exactly 6 digits.")
+    code, shown, code_error = parse_code(update.message.text)
+    if code_error:
+        await safe_reply_text(update.message, f"❌ {code_error}")
         return REDEEM_CODE
 
     d = dict(context.user_data)
     try:
         (await asyncio.to_thread(_mc("redeem_codes_v2").insert_one, {
-            "_id": code, "code": code, "reward_type": d["redeem_type"], "reward_value": d["redeem_reward"],
+            "_id": code, "code": shown, "reward_type": d["redeem_type"], "reward_value": d["redeem_reward"],
             "created_at": timestamp(), "active": 1, "max_claims": d["redeem_count"],
             "expires_at": d["redeem_expiry"],
         }))
     except mongo_db.DuplicateKeyError:
-        await safe_reply_text(update.message, "❌ Redeem code already exists.")
+        await safe_reply_text(update.message, "❌ Redeem code already exists (capital and small letters count as the same code).")
         return REDEEM_CODE
     except Exception as e:
         print("Redeem creation error:", e)
@@ -7764,7 +7833,7 @@ async def add_redeem_code(update, context):
     context.user_data.clear()
     await safe_reply_text(update.message,
         f"✅ Redeem created!\n"
-        f"🎟️ {code}\n"
+        f"🎟️ {shown}\n"
         f"🎁 {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
         f"👥 Limit: {max_claims} users\n"
         f"⏳ Expiry: {expiry_text}"
@@ -7778,9 +7847,9 @@ async def redeem(update, context):
         await safe_reply_text(update.message, "Usage: /redeem CODE")
         return
 
-    code = context.args[0].strip()
-    if not (code.isdigit() and len(code) == 6):
-        await safe_reply_text(update.message, "❌ Redeem code must be exactly 6 digits.")
+    code, _shown, code_error = parse_code(context.args[0])      # case-insensitive key (Hello123 == hello123)
+    if code_error:
+        await safe_reply_text(update.message, "❌ Invalid redeem code. Codes contain only letters and digits.")
         return
 
     user_id = update.effective_user.id
@@ -7788,6 +7857,7 @@ async def redeem(update, context):
     claims = _mc("redeem_claims_v2")
     granted_id = None
     coins_given = False
+    stones_given = False
     claim_id = None
 
     try:
@@ -7800,6 +7870,7 @@ async def redeem(update, context):
         reward_value = row.get("reward_value")
         max_claims = row.get("max_claims")
         expires_at = row.get("expires_at")
+        shown = row.get("code") or code             # the code as the Owner typed it (for messages)
 
         if expires_at:
             try:
@@ -7808,7 +7879,7 @@ async def redeem(update, context):
                     await safe_reply_text(update.message, "⏰ This redeem code has expired.")
                     await notify_staff_action(
                         context,
-                        f"⏰ REDEEM CODE EXPIRED\n🎟️ Code: {code}\n⏰ Expired: {expires_at.replace('T', ' ')}\n👤 Checked by: {display_user(update.effective_user)}",
+                        f"⏰ REDEEM CODE EXPIRED\n🎟️ Code: {shown}\n⏰ Expired: {expires_at.replace('T', ' ')}\n👤 Checked by: {display_user(update.effective_user)}",
                     )
                     return
             except ValueError:
@@ -7837,6 +7908,12 @@ async def redeem(update, context):
                 await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
                 return
             coins_given = True
+        elif reward_type == "stones":
+            if not (await asyncio.to_thread(mongo_db.add_special_stones, user_id, int(reward_value))):
+                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
+                await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
+                return
+            stones_given = True
         else:
             if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(reward_value))):
                 (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
@@ -7858,6 +7935,11 @@ async def redeem(update, context):
                 (await asyncio.to_thread(mongo_db.add_coins, user_id, -int(reward_value)))
             except Exception as undo_err:
                 print("Redeem undo error:", undo_err)
+        if stones_given:
+            try:
+                (await asyncio.to_thread(mongo_db.add_special_stones, user_id, -int(reward_value)))
+            except Exception as undo_err:
+                print("Redeem undo error:", undo_err)
         if granted_id is not None:
             try:
                 (await asyncio.to_thread(mongo_db.delete_collection_by_id, granted_id))
@@ -7872,7 +7954,7 @@ async def redeem(update, context):
     )
     redeem_notification = (
         f"🎟️ REDEEM CODE USED\n"
-        f"🎟️ Code: {code}\n"
+        f"🎟️ Code: {shown}\n"
         f"🎁 Reward: {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
         f"👤 Redeemed by: {display_user(update.effective_user)}"
     )
@@ -7893,8 +7975,9 @@ async def delete_redeem(update, context):
     if len(context.args) != 1:
         await safe_reply_text(update.message, "Usage: /deleteredeem CODE")
         return
-    code = context.args[0].upper()
-    changed = (await asyncio.to_thread(_mc("redeem_codes_v2").update_one, {"_id": code}, {"$set": {"active": 0}})).matched_count
+    code, _shown, code_error = parse_code(context.args[0])
+    changed = 0 if code_error else (await asyncio.to_thread(_mc("redeem_codes_v2").update_one, {"_id": code}, {"$set": {"active": 0}})).matched_count
+    code = context.args[0]
     await safe_reply_text(update.message, "✅ Redeem code disabled." if changed else "❌ Redeem code not found.")
     if changed:
         await notify_staff_action(context, f"🛑 REDEEM CODE DISABLED\n🎟️ Code: {code}\n👤 By: {display_user(update.effective_user)}", actor_id=update.effective_user.id)
@@ -7907,7 +7990,7 @@ async def list_redeems(update, context):
     codes = _mc("redeem_codes_v2")
     claims = _mc("redeem_claims_v2")
     _code_docs = await asyncio.to_thread(lambda: list(codes.find({"active": 1}).sort("created_at", -1)))
-    rows = [(d["_id"], d.get("reward_type"), d.get("reward_value"), d.get("max_claims"), d.get("expires_at"))
+    rows = [(d.get("code") or d["_id"], d.get("reward_type"), d.get("reward_value"), d.get("max_claims"), d.get("expires_at"))
             for d in _code_docs]
 
     if not rows:
@@ -8281,31 +8364,53 @@ async def skip_conversation(update, context):
     )
     return None
 
-async def cancel_conversation(update, context):
-    if update.effective_user:
-        drop_conv_log(context, update.effective_user.id)           # a cancelled command never gets a log prompt
-    for key in (
-        "name", "recruit_names", "anime", "rarity", "worth", "code",
-        "photo_code",
-        "edit_code_original", "edit_character", "edit_name",
-        "edit_recruit_names", "edit_anime", "edit_rarity", "edit_worth",
-        "callchar_character_query",
-        "issue_text", "issue_photo",
-        "idea_text", "idea_photo",
-        "appeal_text", "appeal_photo",
-        "event_name", "event_code", "event_reward_type",
-        "event_reward_value", "event_trigger",
-        "event_end", "event_end_day", "event_end_month",
-        "event_end_year", "event_end_hour", "event_end_minute",
-        "redeem_type", "redeem_reward", "redeem_count",
-        "redeem_expiry",
-    ):
-        context.user_data.pop(key, None)
+async def cancel_everything(update, context):
+    """
+    /cancel: stop EVERYTHING this user has in progress and return short labels of what was stopped:
+    the active guided command (add/edit character, photo, issue/idea/appeal, events, redeem codes, call character,
+    /addevo, /editevo ...), a pending Customize Bot input, an active Guess-the-Number game and transfer offers the user sent
+    that nobody has answered yet. Finished actions (sales, evolutions, claims, accepted transfers) cannot be undone.
+    """
+    user = update.effective_user
+    stopped = []
+    if user is None:
+        return stopped
+    uid = user.id
+    drop_conv_log(context, uid)                      # a cancelled command never gets a log prompt
+    keys = set(context.user_data)
+    if any(k.startswith(("evo_", "eevo_")) for k in keys):
+        stopped.append("Evolution setup/edit")
+    if any(not k.startswith(("evo_", "eevo_")) for k in keys):
+        stopped.append("Active command (add/edit/photo/event/redeem/report)")
+    context.user_data.clear()
+    try:
+        if theme.cancel_input(uid):
+            stopped.append("Customize Bot input")
+    except Exception as e:
+        print("cancel: theme input error:", e)
+    try:
+        _attempts, _secret, active = (await asyncio.to_thread(get_guess_state, uid))
+        if active:
+            (await asyncio.to_thread(save_guess_state, uid, 0, None, False))
+            stopped.append("Number-guess game (no reward)")
+    except Exception as e:
+        print("cancel: guess game error:", e)
+    offers = [tid for tid, item in list(PENDING_TRANSFERS.items()) if item.get("sender") == uid]
+    for tid in offers:
+        PENDING_TRANSFERS.pop(tid, None)
+    if offers:
+        stopped.append(f"{len(offers)} pending transfer offer(s)")
+    return stopped
 
-    await safe_reply_text(
-        update.effective_message,
-        "❌ Cancelled. The active process has been stopped and its temporary data cleared."
-    )
+
+async def cancel_conversation(update, context):
+    stopped = await cancel_everything(update, context)
+    if stopped:
+        text = ("❌ Cancelled. Stopped:\n" + "\n".join(f"• {item}" for item in stopped) +
+                "\n\nAnything already finished (sales, evolutions, claims, accepted transfers) cannot be undone.")
+    else:
+        text = "❌ Cancelled. The active process has been stopped and its temporary data cleared."
+    await safe_reply_text(update.effective_message, text)
     return ConversationHandler.END
 
 # ==========================================================================
@@ -9711,6 +9816,7 @@ COMMANDS = {
     "evolution": "View all evolution recipes",
     "evolve": "Evolve a character",
     "item": "View your items (inventory)",
+    "about": "About this bot",
     "stone": "Stone leaderboard",
     "stonetask": "View your daily stone tasks",
     "claimstone": "Claim your completed task stones",
@@ -9772,7 +9878,7 @@ PUBLIC_COMMANDS = {
     "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
-    "evolution", "evolve", "item", "stone", "stonetask", "claimstone",
+    "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about",
 }
 
 def make_bot_commands(names):
@@ -10717,8 +10823,12 @@ def main():
         app.add_handler(CommandHandler(command_name, callback))
     fusion.bind(is_owner=is_owner, is_executive=is_executive, symbols=SYMBOL, conv_timeout=CONV_TIMEOUT,
                 notify=notify_staff_action, log_action=log_character_action, mark_success=mark_success,
-                safe_reply=safe_reply_text, skip_keyboard=skip_keyboard, is_skip_text=is_skip_text)
+                safe_reply=safe_reply_text, skip_keyboard=skip_keyboard, is_skip_text=is_skip_text,
+                display_user=display_user, rarity_text=rarity_text, cancel_all=cancel_conversation)
     fusion.register(app)  # stone tasks, /stone, /item, Evolution: /addevo /evolution /evolve /delevo
+    theme.bind(is_owner=is_owner, default_start_text=START_TEXT, build_help_text=build_help_text,
+               add_header=add_display_name_header)
+    theme.register(app)   # 🎨 Customize Bot callbacks, owner input handler, /about
 
     register_executive_commands(app)
     register_owner_commands(app)

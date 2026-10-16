@@ -434,6 +434,9 @@ _deps = {
     "log_action": None,               # log_character_action(code, name, user, "add")
     "mark_success": None,             # mark_success(update) for the log pipeline
     "safe_reply": None,               # async safe_reply_text(message, text, **kw)
+    "display_user": None,             # bot.display_user(user) -> "Name | ID: 123 | @username" (same as every staff notification)
+    "rarity_text": None,              # bot.rarity_text(rarity) -> "🔵 Rare"
+    "cancel_all": None,               # bot.cancel_conversation: the universal /cancel (clears EVERYTHING, replies, returns END)
     "skip_keyboard": None,            # bot.skip_keyboard() - the "⏭ Skip" reply keyboard
     "is_skip_text": lambda t: (t or "").strip().lower() in ("/skip", "⏭ skip"),
 }
@@ -472,6 +475,19 @@ async def _reply(msg, text, **kw):
 
 def _sym(rarity):
     return _deps["symbols"].get(rarity, "⭐")
+
+
+def _by(user):
+    """'Name | ID: 123 | @username' - identical to the 'By:' line of the normal character notifications."""
+    fn = _deps.get("display_user")
+    if fn:
+        return fn(user)
+    return f"{getattr(user, 'first_name', None) or 'Unknown'} | ID: {user.id} | " + (f"@{user.username}" if getattr(user, "username", None) else "No username")
+
+
+def _rarity_line(rarity):
+    fn = _deps.get("rarity_text")
+    return fn(rarity) if fn else f"{_sym(rarity)} {rarity}"
 
 
 def _is_staff_evo(uid):
@@ -894,9 +910,24 @@ async def delevo_command(update, context):
         return
     await asyncio.to_thread(delete_recipe_sync, code)
     evo = await asyncio.to_thread(_row, code)
+    base = await asyncio.to_thread(_row, recipe["base_code"])
     label = evo[1] if evo else code
     await _reply(msg, f"🗑 Evolution recipe for {label} [{code}] deleted.\n"
                       "Evolution characters users already own are not affected.")
+    try:
+        if _deps["notify"]:
+            await _deps["notify"](
+                context,
+                f"🗑 EVOLUTION RECIPE DELETED\n"
+                f"🎭 {label} [{code}]\n"
+                + (f"🏷 {_rarity_line(evo[3])}\n" if evo else "")
+                + f"🧬 Recipe: {recipe['base_qty']}× {base[1] if base else '?'} [{recipe['base_code']}] ➡️ {label} [{code}]\n"
+                f"💎 Evolution Stones: {recipe['stones']}\n"
+                f"🪙 Berries: {recipe['berries']:,}\n"
+                f"ℹ️ Evolution characters users already own were kept.\n"
+                f"👤 By: {_by(user)}", actor_id=user.id)
+    except Exception as e:
+        logger.info("delevo notification skipped: %s", e)
     if _deps["mark_success"]:
         _deps["mark_success"](update)
 
@@ -1085,9 +1116,16 @@ async def addevo_photo(update, context):
         if _deps["notify"]:
             await _deps["notify"](
                 context,
-                f"⚡ NEW EVOLUTION ADDED\n{d['evo_qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
-                f"🏷 {_sym(d['evo_rarity'])} {d['evo_rarity']}\n💎 {d['evo_stones']} Stones • 🪙 {d['evo_berries']:,} Berries\n"
-                f"👤 By: {user.id}", actor_id=user.id)
+                f"🎭 NEW EVOLUTION ADDED\n"
+                f"🎭 {evo[1]} [{evo[0]}]\n"
+                f"📺 Anime: {d['evo_anime'] or 'Not set'}\n"
+                f"🏷 {_rarity_line(d['evo_rarity'])}\n"
+                f"💰 Worth: {d['evo_worth']}\n"
+                f"📷 Photo: Added\n"
+                f"🧬 Recipe: {d['evo_qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
+                f"💎 Evolution Stones: {d['evo_stones']}\n"
+                f"🪙 Berries: {d['evo_berries']:,}\n"
+                f"👤 By: {_by(user)}", actor_id=user.id)
         if _deps["mark_success"]:
             _deps["mark_success"](update)
     except Exception as e:
@@ -1097,6 +1135,9 @@ async def addevo_photo(update, context):
 
 async def addevo_cancel(update, context):
     _clear_evo(context)
+    if _deps.get("cancel_all"):             # the bot's universal /cancel: stops EVERYTHING in progress, replies, returns END
+        await _deps["cancel_all"](update, context)
+        return -1
     if update.effective_message is not None:
         await _reply(update.effective_message, "❌ Evolution setup cancelled.")
     return -1
@@ -1475,12 +1516,20 @@ async def editevo_berries(update, context):
         if _deps["log_action"]:
             await asyncio.to_thread(_deps["log_action"], values["code"], values["name"], user, "edit")
         if _deps["notify"]:
-            old = f"🔁 Old code: {code0}\n" if code0 != values["code"] else ""
+            code_line = f"🔁 Old code: {code0}\n" if code0 != values["code"] else f"🔢 Code: {values['code']}\n"
             await _deps["notify"](
                 context,
-                f"✏️ EVOLUTION UPDATED\n{values['qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
-                f"🏷 {_sym(values['rarity'])} {values['rarity']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries\n"
-                f"{old}👤 By: {user.id}", actor_id=user.id)
+                f"✏️ EVOLUTION UPDATED\n"
+                f"🎭 {evo[1]} [{evo[0]}]\n"
+                f"📺 Anime: {values['anime'] or 'Not set'}\n"
+                f"🏷 {_rarity_line(values['rarity'])}\n"
+                f"💰 Worth: {values['worth']}\n"
+                f"📷 Photo: {'Updated' if values['photo'] else 'Unchanged'}\n"
+                f"🧬 Recipe: {values['qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
+                f"💎 Evolution Stones: {values['stones']}\n"
+                f"🪙 Berries: {values['berries']:,}\n"
+                f"{code_line}"
+                f"👤 By: {_by(user)}", actor_id=user.id)
         if _deps["mark_success"]:
             _deps["mark_success"](update)
     except Exception as e:
@@ -1498,6 +1547,9 @@ def _remove_keyboard():
 
 async def editevo_cancel(update, context):
     _clear_x(context)
+    if _deps.get("cancel_all"):
+        await _deps["cancel_all"](update, context)
+        return -1
     if update.effective_message is not None:
         await _reply(update.effective_message, "❌ Evolution edit cancelled.", reply_markup=_remove_keyboard())
     return -1

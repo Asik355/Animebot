@@ -363,6 +363,13 @@ def add_coins(user_id, amount, session=None):
 
 
 @retry_write
+def add_special_stones(user_id, amount, session=None):
+    """Atomic $inc of the Special/Evolution Stones (users.special_stones). True if the user exists. Negative amounts allowed."""
+    res = col(USERS).update_one({"_id": int(user_id)}, {"$inc": {"special_stones": int(amount)}}, session=session)
+    return res.matched_count == 1
+
+
+@retry_write
 def spend_coins(user_id, amount, session=None):
     """Atomic conditional deduct: only succeeds if balance >= amount."""
     amount = int(amount)
