@@ -15,7 +15,7 @@ Every section has its own Edit/Preview/Reset/Save controls and a full-width Back
 
 Persistence (existing MongoDB, collection `bot_settings`, one document):
     _id "theme_customization": {welcome:{text}, banner:{file_id,unique_id}, buttons:{items:[...]}, about:{text},
-                                links:{channel|group|website:{url}}, theme:{start,help}, updated_at}
+                                links:{channel|group|website:[{label,url},...]}, theme:{start,help}, updated_at}
     A section key that is missing means "built-in default". Save $sets only that section's key; Reset $unsets only it.
     The saved values are mirrored in memory (loaded at startup), so reads are free and saved settings survive restarts.
 
@@ -61,6 +61,7 @@ DEFAULT_HELP_LABEL = "📖 Help"      # the existing /start button (callback hel
 LINK_SLOTS = ("channel", "group", "website")
 LINK_LABELS = {"channel": "📢 Channel", "group": "👥 Group", "website": "🌐 Website"}
 LINK_WORDS = {"channel": "Channel", "group": "Group", "website": "Website/Social"}
+MAX_LINKS_PER_SLOT = 8               # e.g. Channel One ... Channel Eight
 
 # Telegram cannot colour inline buttons, so themes are fixed presets: a decorative frame + the emoji of the default
 # labels. "classic" is the built-in look and changes nothing.
@@ -242,24 +243,115 @@ class _HtmlChecker(HTMLParser):
         pass
 
 
+_TAGLIKE = re.compile(r"</?(?:b|strong|i|em|u|ins|s|strike|del|a|code|pre|tg-spoiler|blockquote)\b", re.I)
+
+
 def validate_text(text):
-    """-> (clean_text, None) or (None, error). Text uses Telegram HTML (<b>, <i>, <u>, <s>, <a href>, <code>, <pre>, ...)."""
-    text = (text or "").strip()
+    """
+    -> (clean_html, None) or (None, error). The Owner can simply paste the message: formatting applied in Telegram is kept
+    (the input handler passes text_html), plain text is shown exactly as typed (< > & are escaped for them), and hand-written
+    Telegram HTML (<b>, <i>, <a href>, ...) is checked. Only HTML that is clearly broken is refused.
+    """
+    text = re.sub(r"</?tg-emoji[^>]*>", "", (text or "")).strip()     # custom emoji are not available to bots: keep the plain emoji
     if not text:
         return None, "The message cannot be empty."
-    if len(text) > MAX_TEXT:
-        return None, f"That is {len(text)} characters; the limit is {MAX_TEXT}."
     checker = _HtmlChecker()
     try:
         checker.feed(text)
         checker.close()
     except Exception:
-        return None, "The formatting could not be read. Check your HTML tags."
+        checker.error_text = "The formatting could not be read. Check your HTML tags."
     if checker.error_text is None and checker.stack:
         checker.error_text = f"The tag <{checker.stack[-1]}> is never closed."
     if checker.error_text:
-        return None, checker.error_text
+        if _TAGLIKE.search(text):
+            return None, checker.error_text            # the Owner clearly wrote HTML tags and made a mistake
+        text = html.escape(text, quote=False)           # plain text: show every character literally
+    if len(text) > MAX_TEXT:
+        return None, f"That is {len(text)} characters; the limit is {MAX_TEXT}."
     return text, None
+
+
+def render_user_text(text, user):
+    """
+    Fills the user placeholders with the Telegram user's details (HTML-escaped): {first} first name, {last} last name,
+    {name} full name, {username} @username (or the name), {id}, {mention} clickable first name. Unknown {words} stay as written.
+    """
+    if not text or "{" not in text or user is None:
+        return text
+    first = getattr(user, "first_name", None) or ""
+    last = getattr(user, "last_name", None) or ""
+    full = " ".join(p for p in (first, last) if p) or "User"
+    uname = getattr(user, "username", None)
+    values = {
+        "first": first or full, "firstname": first or full, "first_name": first or full, "last": last, "lastname": last,
+        "last_name": last, "name": full, "fullname": full, "full_name": full, "user": full, "display": full,
+        "username": f"@{uname}" if uname else full, "id": str(getattr(user, "id", "")),
+    }
+
+    def repl(m):
+        key = m.group(1).lower()
+        if key == "mention":
+            return f'<a href="tg://user?id={user.id}">{html.escape(first or full, quote=False)}</a>'
+        value = values.get(key)
+        return m.group(0) if value is None else html.escape(value, quote=False)
+
+    return re.sub(r"\{(\w+)\}", repl, text)
+
+
+def _nopreview():
+    """Keyword argument that switches off the big link-preview card (a URL inside a message would otherwise expand)."""
+    try:
+        from telegram import LinkPreviewOptions
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    except Exception:
+        return {"disable_web_page_preview": True}
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s<]+")
+
+
+def _panel_html(text):
+    """
+    Panel text as Telegram HTML with every link shown as plain code text. Telegram never turns text inside <code> into a
+    link, so no big preview card (like the channel invite card) can appear in the customization panels, whatever the
+    bot library version does with the "no preview" option.
+    """
+    return _URL_IN_TEXT.sub(lambda m: f"<code>{m.group(0)}</code>", html.escape(text or "", quote=False))
+
+
+def _grid(buttons):
+    """Two buttons per row; an odd last button takes the full width (like the Add me / Commands / Website / About layout)."""
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return rows
+
+
+_TG_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_]{3,31}$")
+
+
+async def _link_title(bot, url):
+    """
+    Auto button name for a PUBLIC Telegram link (https://t.me/username): the real channel/group name, with an emoji for its
+    type. Private invite links (t.me/+...) do not reveal a name, so they return None and the Owner is asked to type one.
+    """
+    try:
+        p = urlparse(url)
+        if (p.hostname or "").lower() not in ("t.me", "telegram.me", "www.t.me"):
+            return None
+        name = p.path.strip("/").split("/")[0]
+        if not _TG_NAME.match(name):
+            return None
+        chat = await bot.get_chat("@" + name)
+        title = (getattr(chat, "title", None) or getattr(chat, "first_name", None) or "").strip()
+        if not title:
+            return None
+        kind = getattr(chat, "type", "")
+        emoji = "📢" if kind == "channel" else "👥" if kind in ("group", "supergroup") else ""
+        label = f"{emoji} {title}".strip()
+        return label if len(label) <= MAX_LABEL else label[:MAX_LABEL - 1].rstrip() + "…"
+    except Exception as e:
+        logger.info("link title lookup failed: %s", e)
+        return None
 
 
 def validate_label(text):
@@ -274,11 +366,26 @@ def validate_label(text):
 _HOST = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$")
 
 
+def _normalize_tg(text):
+    """
+    Accepts every usual way of writing a Telegram link and returns the full https://t.me/... URL:
+    https://t.me/name, t.me/name, @name, /name and plain name. Anything else (other websites) is returned as typed.
+    """
+    raw = (text or "").strip()
+    m = re.fullmatch(r"(?:https?://)?(?:www\.)?(?:t|telegram)\.me/(.+)", raw, re.I)
+    if m:
+        return "https://t.me/" + m.group(1)
+    m = re.fullmatch(r"[@/]?([A-Za-z][A-Za-z0-9_]{3,31})", raw)
+    if m:
+        return "https://t.me/" + m.group(1)
+    return raw
+
+
 def validate_url(text):
     """Only https links to a real-looking host (t.me included). -> (url, None) or (None, error)."""
-    url = (text or "").strip()
+    url = _normalize_tg(text)
     if not url or any(c.isspace() for c in url):
-        return None, "Send the link as a single https:// URL."
+        return None, "Send the link as a single https:// URL (or just @username / t.me/username for Telegram)."
     if len(url) > MAX_URL:
         return None, f"The link is too long (limit {MAX_URL} characters)."
     try:
@@ -329,33 +436,63 @@ def _themed_label(label, default_label, word, preset):
     return label
 
 
-def start_text_for(welcome_value, theme_value):
-    """-> (text, is_custom_html). Without a saved welcome this is the existing /start text, word for word."""
+_HAS_PLACEHOLDER = re.compile(r"\{(?:first|firstname|first_name|last|lastname|last_name|name|fullname|full_name|user|display|"
+                              r"username|id|mention)\}", re.I)
+
+
+def _with_greeting(text, user):
+    """
+    The Owner only pastes the message (e.g. "Welcome to Anime Bot ..."); the greeting with the reader's Telegram display
+    name is added automatically. Skipped when the Owner already wrote a {placeholder} or their own greeting.
+    """
+    if user is None or _HAS_PLACEHOLDER.search(text):
+        return text
+    first = (getattr(user, "first_name", None) or "").strip()
+    last = (getattr(user, "last_name", None) or "").strip()
+    name = " ".join(p for p in (first, last) if p) or "there"
+    return f"🌸 HEY {html.escape(name, quote=False)}! 🎉\n\n{text}"
+
+
+def start_text_for(welcome_value, theme_value, user=None):
+    """
+    -> (text, is_custom_html). Without a saved welcome this is the existing /start text, word for word.
+    With `user`, a custom welcome is returned fully personalised (automatic greeting + any {placeholders} filled in).
+    """
     custom = bool(welcome_value and welcome_value.get("text"))
     base = welcome_value["text"] if custom else _deps["default_start_text"]
+    if custom and user is not None:
+        base = render_user_text(_with_greeting(base, user), user)
     return _frame(base, _preset(theme_value, "start")), custom
+
+
+def _slot_links(links_value, slot):
+    """All links of one slot as [{"label", "url"}]. Understands the old single-link format {"url": ...} too."""
+    v = (links_value or {}).get(slot)
+    if isinstance(v, dict):
+        v = [v]
+    out = []
+    for e in (v if isinstance(v, list) else []):
+        if isinstance(e, dict) and e.get("url"):
+            out.append({"label": (e.get("label") or "").strip() or LINK_LABELS[slot], "url": e["url"]})
+    return out
 
 
 def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=False):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     preset = _preset(theme_value, "start")
-    rows = []
+    buttons = []
     for item in _button_items(buttons_value):
         if item["kind"] == "help":
             label = _themed_label(item["label"], DEFAULT_HELP_LABEL, "Help", preset)
             data = f"theme:{uid}:noop:x" if preview else f"help:{uid}:open"     # the original action, untouched
-            rows.append([InlineKeyboardButton(label, callback_data=data)])
+            buttons.append(InlineKeyboardButton(label, callback_data=data))
         else:
-            rows.append([InlineKeyboardButton(item["label"], url=item["url"])])
-    links = []
+            buttons.append(InlineKeyboardButton(item["label"], url=item["url"]))
     for slot in LINK_SLOTS:
-        link = (links_value or {}).get(slot)
-        if link and link.get("url"):
-            links.append(InlineKeyboardButton(_themed_label(LINK_LABELS[slot], LINK_LABELS[slot], LINK_WORDS[slot].split("/")[0], preset),
-                                              url=link["url"]))
-    if links:
-        rows.append(links)
-    return InlineKeyboardMarkup(rows)
+        for link in _slot_links(links_value, slot):
+            buttons.append(InlineKeyboardButton(_themed_label(link["label"], LINK_LABELS[slot], LINK_WORDS[slot].split("/")[0], preset),
+                                                url=link["url"]))
+    return InlineKeyboardMarkup(_grid(buttons))
 
 
 def decorate_help_text(text):
@@ -378,7 +515,7 @@ async def send_start(update, context):
         return False
     photo_sent = False
     try:
-        text, custom = start_text_for(_saved.get("welcome"), _saved.get("theme"))
+        text, custom = start_text_for(_saved.get("welcome"), _saved.get("theme"), user)   # greeting + {first}, {name}, ... filled in
         header = _deps.get("add_header")
         if header:
             text = header(msg, text)
@@ -396,7 +533,7 @@ async def send_start(update, context):
                 photo_sent = True
             except Exception as e:      # missing/invalid file id: fall back to the normal text-only /start
                 logger.warning("custom banner could not be sent: %s", e)
-        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse, reply_markup=keyboard)
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse, reply_markup=keyboard, **_nopreview())
         return True
     except Exception as e:
         logger.error("customized /start failed: %s", e)
@@ -411,10 +548,10 @@ async def about_command(update, context):
     if not (value and value.get("text")):
         await msg.reply_text("ℹ️ The About section has not been set up yet.")
         return
-    text = value["text"]
+    text = render_user_text(value["text"], update.effective_user)
     header = _deps.get("add_header")
     try:
-        await msg.reply_text(header(msg, text) if header else text, parse_mode="HTML")
+        await msg.reply_text(header(msg, text) if header else text, parse_mode="HTML", **_nopreview())
     except Exception as e:
         logger.warning("About text could not be sent as HTML: %s", e)
         await msg.reply_text(html.unescape(re.sub(r"<[^>]+>", "", text)))
@@ -492,11 +629,17 @@ def panel_view(uid, section, notice=""):
                 [("💾 Save", section, "save")], _back()]
     elif section == "links":
         links = _effective_links(uid)
-        listing = "\n".join(f"{LINK_LABELS[s]}: {(links.get(s) or {}).get('url') or 'not set'}" for s in LINK_SLOTS)
-        text = (f"{pre}🔗 Bot Links\n\nLink buttons shown on /start (a slot with no link is not shown).\n\n{listing}\n\n{_status(uid, section)}")
-        rows = [[("📢 Set Channel Link", section, "setchannel"), ("👥 Set Group Link", section, "setgroup")],
-                [("🌐 Set Website/Social Link", section, "setwebsite"), ("👁️ Preview Links", section, "preview")],
-                [("♻️ Reset", section, "reset"), ("💾 Save", section, "save")], _back()]
+        parts = []
+        for s_ in LINK_SLOTS:
+            entries = _slot_links(links, s_)
+            parts.append(f"{LINK_LABELS[s_]}: " + (", ".join(e["label"] for e in entries) if entries else "none"))
+        listing = "\n".join(parts)
+        text = (f"{pre}🔗 Bot Links\n\nYou can add several channels, groups or websites - each one becomes its own "
+                f"button on /start (up to {MAX_LINKS_PER_SLOT} per type).\n\n{listing}\n\n{_status(uid, section)}")
+        rows = [[("➕ Add Channel", section, "setchannel"), ("➕ Add Group", section, "setgroup")],
+                [("➕ Add Website/Social", section, "setwebsite"), ("🗑️ Remove Link", section, "remove")],
+                [("👁️ Preview Links", section, "preview"), ("♻️ Reset", section, "reset")],
+                [("💾 Save", section, "save")], _back()]
     else:  # theme
         t = _draft(uid, "theme") or _saved.get("theme") or {}
         text = (f"{pre}🎭 Bot Theme\n\nOnly /start and /help are themed. Telegram does not allow custom button colours, "
@@ -534,25 +677,25 @@ async def _answer(q, text=None, alert=False):
 async def _show(q, text, markup):
     """Edit the panel message; if Telegram refuses (e.g. nothing changed) fall back quietly."""
     try:
-        await q.edit_message_text(text, reply_markup=markup)
+        await q.edit_message_text(_panel_html(text), parse_mode="HTML", reply_markup=markup, **_nopreview())
     except Exception as e:
         if "not modified" not in str(e).lower():
             logger.info("panel edit failed, sending a new message: %s", e)
             try:
-                await q.message.reply_text(text, reply_markup=markup)
+                await q.message.reply_text(_panel_html(text), parse_mode="HTML", reply_markup=markup, **_nopreview())
             except Exception as e2:
                 logger.warning("panel send failed: %s", e2)
 
 
 async def _send_panel(message, uid, section, notice=""):
     text, markup = hub_view(uid) if section == "hub" else panel_view(uid, section, notice)
-    await message.reply_text(text, reply_markup=markup)
+    await message.reply_text(_panel_html(text), parse_mode="HTML", reply_markup=markup, **_nopreview())
 
 
 async def _send_html(message, text, markup=None, prefix=""):
     """Preview/send Telegram-HTML text; a parse error is reported instead of crashing."""
     try:
-        await message.reply_text(prefix + text, parse_mode="HTML", reply_markup=markup)
+        await message.reply_text(prefix + text, parse_mode="HTML", reply_markup=markup, **_nopreview())
         return True
     except Exception as e:
         logger.info("html preview failed: %s", e)
@@ -664,18 +807,22 @@ async def _text_section(q, context, uid, action, arg):
     if action == "edit":
         _set_await(uid, section, "text")
         await _answer(q)
-        await _show(q, *_prompt_view(uid, section, f"✏️ {prompt}\n\nTelegram HTML is supported: <b>bold</b>, <i>italic</i>, "
-                                                  f"<u>underline</u>, <s>strike</s>, <code>code</code>, <a href=\"https://...\">link</a>. "
-                                                  f"Write a literal < or & as &lt; / &amp;. Up to {MAX_TEXT} characters.\n\n"
-                                                  "Tap Cancel to keep things as they are."))
+        await _show(q, *_prompt_view(uid, section, f"✏️ {prompt}\n\nJust paste your message - the formatting you apply in Telegram "
+                                                  f"(bold, italic, links) is kept, and plain text is shown exactly as you wrote it.\n\n"
+                                                  "✅ The greeting with each user's Telegram name (HEY <name>!) is added automatically - do NOT type it. "
+                                                  "Paste only the rest of the message.\n\n"
+                                                  "Optional: to place a name yourself, write {first} • {name} • {username} • {mention} • {id} "
+                                                  "(then the automatic greeting is skipped).\n\n"
+                                                  f"Up to {MAX_TEXT} characters. Tap Cancel to keep things as they are."))
     elif action == "preview":
         await _answer(q)
         draft = _draft(uid, section) or _saved.get(section)
         if section == "welcome":
-            text, custom = start_text_for(draft, (_draft(uid, "theme") or _saved.get("theme")))
-            await _send_html(q.message, html.escape(text) if not custom else text, prefix="👁 Preview (not saved)\n\n")
+            text, custom = start_text_for(draft, (_draft(uid, "theme") or _saved.get("theme")), q.from_user)
+            text = text if custom else html.escape(text)
+            await _send_html(q.message, text, prefix="👁 Preview (not saved)\n\n")
         elif draft and draft.get("text"):
-            await _send_html(q.message, draft["text"], prefix="👁 Preview (not saved)\n\n")
+            await _send_html(q.message, render_user_text(draft["text"], q.from_user), prefix="👁 Preview (not saved)\n\n")
         else:
             await q.message.reply_text("👁 Preview: the About section has not been set up yet (default).")
     elif action == "reset":
@@ -689,7 +836,7 @@ async def _text_section(q, context, uid, action, arg):
 
 
 async def _input_text(message, uid, section, st):
-    text, error = validate_text(message.text)
+    text, error = validate_text(getattr(message, "text_html", None) or message.text)
     if error:
         await message.reply_text(f"❌ {error}\n\nYour saved version is unchanged. Send the text again, or tap Cancel on the "
                                  "message above.")
@@ -808,10 +955,12 @@ async def _buttons_section(q, context, uid, action, arg):
         if len(items) >= MAX_BUTTONS:
             await _answer(q, f"You can have at most {MAX_BUTTONS} buttons.", True)
             return
-        _set_await(uid, section, "add_label")
+        _set_await(uid, section, "add_auto")
         await _answer(q)
-        await _show(q, *_prompt_view(uid, section, f"➕ Send the LABEL for the new button (up to {MAX_LABEL} characters, "
-                                                  "emoji allowed).\n\nThe button will open a link; it cannot run bot commands."))
+        await _show(q, *_prompt_view(uid, section, "➕ Send the https:// link for the new button (for Telegram: https://t.me/...).\n\n"
+                                                  "For a public channel or group the button is named automatically with its real "
+                                                  "name. For other links I will ask you for a name.\n\n"
+                                                  "The button opens a link; it cannot run bot commands."))
     elif action == "edit":
         await _answer(q)
         await _show(q, *_pick_view(uid, section, "editsel", "✏️ Edit Button\n\nChoose the button to edit.", items))
@@ -879,11 +1028,11 @@ async def _buttons_section(q, context, uid, action, arg):
     elif action == "preview":
         await _answer(q)
         theme_value = _draft(uid, "theme") or _saved.get("theme")
-        text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value)
+        text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value, q.from_user)
         kb = start_keyboard_for(uid, {"items": items}, _effective_links(uid), theme_value, preview=True)
         try:
             await q.message.reply_text("👁 Preview (not saved)\n\n" + (text if custom else html.escape(text)),
-                                       parse_mode="HTML", reply_markup=kb)
+                                       parse_mode="HTML", reply_markup=kb, **_nopreview())
         except Exception as e:
             logger.info("start preview failed: %s", e)
             await q.message.reply_text("⚠️ Telegram could not display the preview. Check the welcome text formatting.")
@@ -917,7 +1066,7 @@ async def _advance_edit(message, uid, st, label, url, via_query=None):
         if via_query is not None:
             await _show(via_query, text, kb)
         else:
-            await message.reply_text(text, reply_markup=kb)
+            await message.reply_text(_panel_html(text), parse_mode="HTML", reply_markup=kb, **_nopreview())
         return
     items = _working_buttons(uid)
     for i in items:
@@ -937,6 +1086,39 @@ async def _advance_edit(message, uid, st, label, url, via_query=None):
 
 async def _input_buttons(message, uid, section, st):
     field = st["field"]
+    if field == "add_auto":
+        url, error = validate_url(message.text)
+        if error:
+            await message.reply_text(f"❌ {error}\n\nSend a valid link, or tap Cancel above.")
+            return
+        items = _working_buttons(uid)
+        if len(items) >= MAX_BUTTONS:
+            _awaiting.pop(uid, None)
+            await message.reply_text(f"❌ You can have at most {MAX_BUTTONS} buttons.")
+            return
+        title = await _link_title(message.get_bot(), url)
+        if title:
+            items.append({"id": _next_button_id(items), "kind": "url", "label": title, "url": url})
+            _commit_buttons(uid, items)
+            _awaiting.pop(uid, None)
+            await _send_panel(message, uid, section, f"✏️ Button “{title}” added (not saved yet) - press 💾 Save to apply.")
+            return
+        st["extra"]["url"], st["field"], st["ts"] = url, "add_name", _now()
+        await message.reply_text("✍️ I could not read a name from that link. Send the NAME for this button "
+                                 f"(up to {MAX_LABEL} characters, emoji allowed).",
+                                 reply_markup=_markup(uid, [[("❌ Cancel", section, "cancel")]]))
+        return
+    if field == "add_name":
+        label, error = validate_label(message.text)
+        if error:
+            await message.reply_text(f"❌ {error}")
+            return
+        items = _working_buttons(uid)
+        items.append({"id": _next_button_id(items), "kind": "url", "label": label, "url": st["extra"]["url"]})
+        _commit_buttons(uid, items)
+        _awaiting.pop(uid, None)
+        await _send_panel(message, uid, section, "✏️ Button added (not saved yet) - press 💾 Save to apply.")
+        return
     if field in ("add_label", "edit_label"):
         label, error = validate_label(message.text)
         if error:
@@ -968,52 +1150,98 @@ async def _input_buttons(message, uid, section, st):
 
 
 # ---- links ---------------------------------------------------------------------------------------------
+def _links_working(uid):
+    """Draft-or-saved links normalised to {slot: [{"label","url"}]}."""
+    links = _effective_links(uid)
+    return {slot: _slot_links(links, slot) for slot in LINK_SLOTS}
+
+
 async def _links_section(q, context, uid, action, arg):
     section = "links"
     if action in ("setchannel", "setgroup", "setwebsite"):
         slot = action[3:]
+        if len(_links_working(uid)[slot]) >= MAX_LINKS_PER_SLOT:
+            await _answer(q, f"You can have at most {MAX_LINKS_PER_SLOT} {LINK_WORDS[slot]} links.", True)
+            return
         _set_await(uid, section, "url", {"slot": slot})
         await _answer(q)
-        await _show(q, *_prompt_view(uid, section, f"{LINK_LABELS[slot]}\n\nSend the https:// link for the {LINK_WORDS[slot]} "
-                                                  "button (Telegram links: https://t.me/...).\nSend the word none to clear it.\n\n"
-                                                  "An invalid link never replaces a saved one."))
+        await _show(q, *_prompt_view(uid, section, f"➕ Add {LINK_WORDS[slot]}\n\nSend the https:// link (for Telegram: https://t.me/...).\n\n"
+                                                  "For a public channel or group the button is named automatically with its real name. "
+                                                  "For other links I will ask you for a name.\n\nYou can repeat this to add more."))
+    elif action == "remove":
+        work = _links_working(uid)
+        rows = [[(f"🗑️ {LINK_WORDS[slot].split('/')[0]}: {e['label']}"[:60], section, "delsel", f"{slot}-{n}")]
+                for slot in LINK_SLOTS for n, e in enumerate(work[slot])]
+        if not rows:
+            await _answer(q, "There are no links to remove.", True)
+            return
+        rows.append(_back(section))
+        await _answer(q)
+        await _show(q, "🗑️ Remove Link\n\nTap the link to remove it (pending until you press 💾 Save).", _markup(uid, rows))
+    elif action == "delsel":
+        slot, _, idx = (arg or "").partition("-")
+        work = _links_working(uid)
+        if slot not in work or not idx.isdigit() or int(idx) >= len(work[slot]):
+            await _answer(q, STALE_TEXT, True)
+            return
+        work[slot].pop(int(idx))
+        _set_draft(uid, section, work)
+        await _answer(q, "Removed (pending).")
+        await _show(q, *panel_view(uid, section, "✏️ Link removed (not saved yet) - press 💾 Save to apply."))
     elif action == "preview":
         await _answer(q)
-        links = _effective_links(uid)
+        work = _links_working(uid)
         lines = ["👁 Links preview" + (" (not saved)" if (uid, section) in _drafts else "")]
         buttons = []
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         for slot in LINK_SLOTS:
-            link = links.get(slot)
-            lines.append(f"{LINK_LABELS[slot]} → {link['url'] if link and link.get('url') else 'not set'}")
-            if link and link.get("url"):
-                buttons.append(InlineKeyboardButton(LINK_LABELS[slot], url=link["url"]))
-        await q.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup([buttons]) if buttons else None)
+            if not work[slot]:
+                lines.append(f"{LINK_LABELS[slot]}: none")
+            for e in work[slot]:
+                lines.append(f"{e['label']} → {e['url']}")
+                buttons.append(InlineKeyboardButton(e["label"], url=e["url"]))
+        await q.message.reply_text(_panel_html("\n".join(lines)), parse_mode="HTML",
+                                   reply_markup=InlineKeyboardMarkup(_grid(buttons)) if buttons else None, **_nopreview())
     elif action == "reset":
         await _ask_reset(q, uid, section, "the links")
     elif action == "resetok":
         await _do_reset(q, uid, section, arg, "The links")
     elif action == "save":
-        await _do_save(q, uid, section, lambda d: {k: v for k, v in d.items() if v and v.get("url")})
+        await _do_save(q, uid, section, lambda d: {k: [e for e in _slot_links(d, k)] for k in LINK_SLOTS if _slot_links(d, k)})
     else:
         await _answer(q, STALE_TEXT, True)
 
 
 async def _input_link(message, uid, section, st):
-    slot = st["extra"]["slot"]
+    slot, field = st["extra"]["slot"], st["field"]
     raw = (message.text or "").strip()
-    links = copy.deepcopy(_effective_links(uid))
-    if raw.lower() == "none":
-        links.pop(slot, None)
+    if field == "name":
+        label, error = validate_label(raw)
+        if error:
+            await message.reply_text(f"❌ {error}\n\nSend the button name again, or tap Cancel above.")
+            return
+        url = st["extra"]["url"]
     else:
         url, error = validate_url(raw)
         if error:
-            await message.reply_text(f"❌ {error}\n\nYour saved link is unchanged. Send a valid link, or tap Cancel above.")
+            await message.reply_text(f"❌ {error}\n\nNothing was added. Send a valid link, or tap Cancel above.")
             return
-        links[slot] = {"url": url}
-    _set_draft(uid, section, links)
+        label = await _link_title(message.get_bot(), url)
+        if label is None:
+            st["extra"]["url"], st["field"], st["ts"] = url, "name", _now()
+            await message.reply_text("✍️ I could not read a name from that link. Send the NAME for this button "
+                                     f"(up to {MAX_LABEL} characters), e.g. {LINK_WORDS[slot].split('/')[0]} One.",
+                                     reply_markup=_markup(uid, [[("❌ Cancel", section, "cancel")]]))
+            return
+    work = _links_working(uid)
+    if len(work[slot]) >= MAX_LINKS_PER_SLOT:
+        _awaiting.pop(uid, None)
+        await message.reply_text(f"❌ You can have at most {MAX_LINKS_PER_SLOT} {LINK_WORDS[slot]} links.")
+        return
+    work[slot].append({"label": label, "url": url})
+    _set_draft(uid, section, work)
     _awaiting.pop(uid, None)
-    await _send_panel(message, uid, section, "✏️ Link recorded (not saved yet). Use 👁️ Preview Links, then 💾 Save.")
+    await _send_panel(message, uid, section, f"✏️ “{label}” added (not saved yet). Add more, or use 👁️ Preview Links, then 💾 Save.")
 
 
 # ---- theme ----------------------------------------------------------------------------------------------
@@ -1048,11 +1276,11 @@ async def _theme_section(q, context, uid, action, arg):
         which = _drafts_last.get(uid, "start")
         theme_value = _draft(uid, section) or _saved.get(section)
         if which == "start":
-            text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value)
+            text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value, q.from_user)
             kb = start_keyboard_for(uid, {"items": _working_buttons(uid)}, _effective_links(uid), theme_value, preview=True)
             try:
                 await q.message.reply_text("👁 Start menu preview (not saved)\n\n" + (text if custom else html.escape(text)),
-                                           parse_mode="HTML", reply_markup=kb)
+                                           parse_mode="HTML", reply_markup=kb, **_nopreview())
             except Exception as e:
                 logger.info("theme start preview failed: %s", e)
                 await q.message.reply_text("⚠️ Telegram could not display the preview.")

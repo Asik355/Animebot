@@ -309,7 +309,15 @@ def ensure_fusion_collections():
             except Exception:   # already created by a concurrent start-up: fine
                 pass
     col(FUSION_STONE_TASKS).create_index([("day", ASCENDING)], name="day")
-    col(FUSION_EVOLUTION_RECIPES).create_index([("base_code", ASCENDING)], unique=True, name="uniq_base_code")
+    recipes = col(FUSION_EVOLUTION_RECIPES)
+    try:
+        recipes.drop_index("uniq_base_code")      # old rule (one recipe per base card): replaced by uniq_pair_key below
+    except Exception:
+        pass                                      # not there (new database or already migrated)
+    for old in list(recipes.find({"pair_key": {"$exists": False}})):    # recipes made before Different Card existed
+        recipes.update_one({"_id": old["_id"]}, {"$set": {"pair_key": _recipe_pair_key(old)}})
+    recipes.create_index([("pair_key", ASCENDING)], unique=True, name="uniq_pair_key",
+                         partialFilterExpression={"pair_key": {"$exists": True}})
 
 
 # --------------------------------------------------------------------------
@@ -682,6 +690,13 @@ def insert_character(code, name, anime, rarity, worth, photo=None, recruit_names
     invalidate_character_cache()
 
 
+def _recipe_pair_key(doc):
+    """Uniqueness key of an Evolution recipe: the base code for a Same Card recipe, 'A+B' (sorted) for a Different Card recipe."""
+    if doc.get("kind") == "pair" and doc.get("second_code"):
+        return "+".join(sorted([str(doc["base_code"]), str(doc["second_code"])]))
+    return str(doc.get("base_code"))
+
+
 def insert_evolution_character(code, name, anime, rarity, worth, photo, session=None):
     """Create an EVOLUTION character in the normal characters collection. Raises DuplicateKeyError on code/name clash.
     Caller must call invalidate_character_cache() after the surrounding transaction commits."""
@@ -721,6 +736,11 @@ def update_character_tx(session, old_code, new_code, name, anime, rarity, worth,
         col(FAVORITES).update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
         # Evolution recipes keep pointing at the renumbered character (base side and result side)
         col(FUSION_EVOLUTION_RECIPES).update_many({"base_code": old_code}, {"$set": {"base_code": new_code}}, session=session)
+        col(FUSION_EVOLUTION_RECIPES).update_many({"second_code": old_code}, {"$set": {"second_code": new_code}}, session=session)
+        for changed in list(col(FUSION_EVOLUTION_RECIPES).find({"$or": [{"base_code": new_code}, {"second_code": new_code}]},
+                                                               session=session)):
+            col(FUSION_EVOLUTION_RECIPES).update_one({"_id": changed["_id"]}, {"$set": {"pair_key": _recipe_pair_key(changed)}},
+                                                     session=session)
         recipe = col(FUSION_EVOLUTION_RECIPES).find_one({"_id": old_code}, session=session)
         if recipe:
             col(FUSION_EVOLUTION_RECIPES).delete_one({"_id": old_code}, session=session)
@@ -746,7 +766,8 @@ def delete_character(code):
         col(COLLECTIONS).delete_many({"character_code": code}, session=session)
         col(FAVORITES).delete_many({"character_code": code}, session=session)
         # a recipe whose base or result character is gone can never work: remove it
-        col(FUSION_EVOLUTION_RECIPES).delete_many({"$or": [{"_id": code}, {"base_code": code}]}, session=session)
+        col(FUSION_EVOLUTION_RECIPES).delete_many({"$or": [{"_id": code}, {"base_code": code}, {"second_code": code}]},
+                                                  session=session)
         return col(CHARACTERS).delete_one({"code": code}, session=session).deleted_count == 1
 
     try:

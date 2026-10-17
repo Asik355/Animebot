@@ -520,7 +520,59 @@ def get_recipe_sync(evo_code):
 
 
 def get_recipe_by_base_sync(base_code):
-    return _recipes().find_one({"base_code": str(base_code)})
+    """The SAME-card recipe whose base is this card (one per card). Different Card recipes are found by their pair."""
+    return _recipes().find_one({"base_code": str(base_code), "kind": {"$ne": "pair"}})
+
+
+def is_pair_recipe(recipe):
+    return (recipe or {}).get("kind") == "pair"
+
+
+def recipe_ingredients(recipe):
+    """[(code, qty), ...]: one entry for a Same Card recipe, two for a Different Card recipe."""
+    items = [(str(recipe["base_code"]), int(recipe["base_qty"]))]
+    if is_pair_recipe(recipe):
+        items.append((str(recipe["second_code"]), int(recipe["second_qty"])))
+    return items
+
+
+def pair_key(a, b=None):
+    return "+".join(sorted([str(a), str(b)])) if b is not None else str(a)
+
+
+def get_pair_recipe_sync(a, b):
+    return _recipes().find_one({"pair_key": pair_key(a, b)})
+
+
+def recipes_using_sync(code):
+    """Every recipe that uses this card as an ingredient (either side), sorted by result code."""
+    code = str(code)
+    return sorted(_recipes().find({"$or": [{"base_code": code}, {"second_code": code}]}), key=lambda r: str(r["_id"]))
+
+
+def _is_ancestor(target, codes):
+    """True if `target` is (transitively) an ingredient of any card in `codes` through the recipes."""
+    stack, seen = [str(c) for c in codes], set()
+    while stack:
+        cur = stack.pop()
+        if cur == str(target):
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        recipe = get_recipe_sync(cur)
+        if recipe:
+            stack.extend(c for c, _q in recipe_ingredients(recipe))
+    return False
+
+
+def _ingredient_text(recipe):
+    """'2× Naruto [1234]' or '1× Naruto [1234] + 1× Sasuke [1005]'."""
+    parts = []
+    for code, qty in recipe_ingredients(recipe):
+        row = _row(code)
+        parts.append(f"{qty}× {row[1] if row else '?'} [{code}]")
+    return " + ".join(parts)
 
 
 def _name_taken(name):
@@ -529,13 +581,22 @@ def _name_taken(name):
                for r in mongo_db.get_all_characters())
 
 
-def validate_recipe(base_code, base_qty, evo_code, stones, berries):
-    """Returns an error text, or None when the recipe may be created."""
+def validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code=None, second_qty=None):
+    """Returns an error text, or None when the recipe may be created. second_code makes it a Different Card recipe."""
     base_code, evo_code = str(base_code), str(evo_code)
+    pair = second_code is not None
     if not _valid_code(base_code) or _row(base_code) is None:
-        return "❌ The base character code does not exist."
+        return "❌ Card A does not exist." if pair else "❌ The base character code does not exist."
     if not isinstance(base_qty, int) or not (1 <= base_qty <= EVO_MAX_BASE_QTY):
         return f"❌ Base quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
+    if pair:
+        second_code = str(second_code)
+        if not _valid_code(second_code) or _row(second_code) is None:
+            return "❌ Card B does not exist."
+        if second_code == base_code:
+            return "❌ Card A and card B must be two different cards."
+        if not isinstance(second_qty, int) or not (1 <= second_qty <= EVO_MAX_BASE_QTY):
+            return f"❌ Card B quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
     if not isinstance(stones, int) or stones < EVO_MIN_STONES:
         return f"❌ Evolution Stones must be at least {EVO_MIN_STONES}."
     if stones > EVO_MAX_STONES:
@@ -544,37 +605,45 @@ def validate_recipe(base_code, base_qty, evo_code, stones, berries):
         return "❌ Berries cost must be a whole number (0 or more)."
     if not _valid_code(evo_code):
         return "❌ The evolution code must be exactly 4 digits (0001-9999)."
-    if evo_code == base_code:
-        return "❌ A character cannot evolve into itself (the evolution code equals the base code)."
+    if evo_code == base_code or (pair and evo_code == second_code):
+        return "❌ A character cannot evolve into itself (the evolution code equals an ingredient code)."
     if _row(evo_code) is not None:
         return "❌ That code already belongs to a character."
     if get_recipe_sync(evo_code) is not None:
         return "❌ An evolution recipe with that code already exists."
-    if get_recipe_by_base_sync(base_code) is not None:
+    if pair:
+        if get_pair_recipe_sync(base_code, second_code) is not None:
+            return "❌ That pair of cards already has an evolution recipe (conflict)."
+    elif get_recipe_by_base_sync(base_code) is not None:
         return "❌ That base character already has an evolution recipe (conflict). Use /delevo first."
     return None
 
 
-def create_evolution_sync(base_code, base_qty, name, anime, rarity, worth, stones, berries, evo_code, photo, created_by):
+def create_evolution_sync(base_code, base_qty, name, anime, rarity, worth, stones, berries, evo_code, photo, created_by,
+                          second_code=None, second_qty=None):
     """Creates the EVOLUTION character and its recipe in ONE transaction (both or neither)."""
-    err = validate_recipe(base_code, base_qty, evo_code, stones, berries)
+    err = validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code, second_qty)
     if err:
         return {"ok": False, "error": err}
     if _name_taken(name):
         return {"ok": False, "error": "❌ A character with that name already exists."}
+    pair = second_code is not None
+    recipe = {
+        "_id": str(evo_code), "evo_code": str(evo_code), "base_code": str(base_code), "base_qty": int(base_qty),
+        "kind": "pair" if pair else "same", "pair_key": pair_key(base_code, second_code if pair else None),
+        "stones": int(stones), "berries": int(berries), "created_by": int(created_by), "created_at": _stamp(),
+    }
+    if pair:
+        recipe.update({"second_code": str(second_code), "second_qty": int(second_qty)})
 
     def _work(session):
         mongo_db.insert_evolution_character(evo_code, name, anime, rarity, worth, photo, session=session)
-        _recipes().insert_one({
-            "_id": str(evo_code), "evo_code": str(evo_code), "base_code": str(base_code),
-            "base_qty": int(base_qty), "stones": int(stones), "berries": int(berries),
-            "created_by": int(created_by), "created_at": _stamp(),
-        }, session=session)
+        _recipes().insert_one(recipe, session=session)
 
     try:
         mongo_db.run_transaction(_work)
     except mongo_db.DuplicateKeyError:
-        return {"ok": False, "error": "❌ The name, code or base character already has a record. Nothing was created."}
+        return {"ok": False, "error": "❌ The name, code or card pair already has a record. Nothing was created."}
     finally:
         mongo_db.invalidate_character_cache()
     return {"ok": True}
@@ -594,9 +663,9 @@ class _EvoAbort(Exception):
 
 def evolve_sync(user_id, evo_code, receipt_key=None):
     """
-    Deterministic evolution. Everything happens in ONE transaction:
+    Deterministic evolution of a Same Card OR Different Card recipe. Everything happens in ONE transaction:
       receipt (one-click-per-card guard) -> verify recipe/characters/materials -> conditional stone+berry deduct
-      -> remove exactly base_qty base copies -> add exactly 1 Evolution character.
+      -> remove exactly the required copies of EACH ingredient card -> add exactly 1 Evolution character.
     Any shortage aborts the transaction, so nothing is consumed and nothing is half done.
     Returns {"status": "ok"|"norecipe"|"nochar"|"nobase_char"|"nouser"|"nocopies"|"nostones"|"noberries"|"dup"|"changed", ...}
     """
@@ -615,10 +684,11 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
         evo_char = chars.find_one({"code": evo_code}, session=session)
         if not evo_char or evo_char.get("char_type") != mongo_db.CHAR_TYPE_EVOLUTION:
             raise _EvoAbort("nochar")
-        base_code, qty = str(recipe["base_code"]), int(recipe["base_qty"])
+        ingredients = recipe_ingredients(recipe)
         stones, berries = int(recipe["stones"]), int(recipe["berries"])
-        if not chars.find_one({"code": base_code}, session=session):
-            raise _EvoAbort("nobase_char")
+        for code, _qty in ingredients:
+            if not chars.find_one({"code": code}, session=session):
+                raise _EvoAbort("nobase_char", code=code)
         user = users.find_one({"_id": user_id}, session=session)
         if user is None:
             raise _EvoAbort("nouser")
@@ -632,9 +702,10 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
             except mongo_db.DuplicateKeyError:
                 raise _EvoAbort("dup")
 
-        have_copies = mongo_db.count_user_copies(user_id, base_code, session=session)
-        if have_copies < qty:
-            raise _EvoAbort("nocopies", have=have_copies, need=qty)
+        for code, need in ingredients:
+            have = mongo_db.count_user_copies(user_id, code, session=session)
+            if have < need:
+                raise _EvoAbort("nocopies", have=have, need=need, code=code)
         have_stones, have_coins = int(user.get("special_stones") or 0), int(user.get("coins") or 0)
         if have_stones < stones:
             raise _EvoAbort("nostones", have=have_stones, need=stones)
@@ -649,17 +720,18 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
         state["deducted"] = (stones, berries)
 
         copies = mongo_db.col(mongo_db.COLLECTIONS)
-        for _ in range(qty):                       # exactly qty copies; extra copies stay untouched
-            doc = copies.find_one_and_delete({"user_id": user_id, "character_code": base_code}, session=session)
-            if doc is None:
-                raise _EvoAbort("changed")
-            state["deleted"].append(doc)
-        if mongo_db.count_user_copies(user_id, base_code, session=session) == 0:
-            mongo_db.col(mongo_db.FAVORITES).delete_one({"_id": user_id, "character_code": base_code}, session=session)
+        for code, need in ingredients:
+            for _ in range(need):                  # exactly `need` copies of each card; extra copies stay untouched
+                doc = copies.find_one_and_delete({"user_id": user_id, "character_code": code}, session=session)
+                if doc is None:
+                    raise _EvoAbort("changed")
+                state["deleted"].append(doc)
+            if mongo_db.count_user_copies(user_id, code, session=session) == 0:
+                mongo_db.col(mongo_db.FAVORITES).delete_one({"_id": user_id, "character_code": code}, session=session)
 
         mongo_db.add_collection(user_id, evo_code, _stamp(), session=session)   # exactly 1 result
-        return {"status": "ok", "base_code": base_code, "base_qty": qty, "stones": stones, "berries": berries,
-                "evo_code": evo_code}
+        return {"status": "ok", "base_code": ingredients[0][0], "base_qty": ingredients[0][1], "ingredients": ingredients,
+                "stones": stones, "berries": berries, "evo_code": evo_code}
 
     try:
         result = mongo_db.run_transaction(_work)
@@ -705,7 +777,8 @@ def evolve_error_text(res):
     if s == "nouser":
         return "❌ Please use /start first."
     if s == "nocopies":
-        return f"❌ You need {res['need']} copies of the base character but only have {res['have']}. Nothing was used."
+        row = _row(res["code"]) if res.get("code") else None
+        return f"❌ You need {res['need']}× {row[1] if row else 'the base character'} but only have {res['have']}. Nothing was used."
     if s == "nostones":
         return f"❌ Not enough Evolution Stones: need {res['need']}, you have {res['have']}. Nothing was used."
     if s == "noberries":
@@ -717,15 +790,22 @@ def evolve_error_text(res):
 
 # ---------------------------------------------------------------- texts
 def evolution_list_pages_sync():
-    """Pages (<= ~3800 chars) of the public /evolution list."""
+    """Pages (<= ~3800 chars) of the public /evolution list. Recipes are numbered 1, 2, 3... and the numbers continue across pages."""
     head = "⚡ Evolution List\n\n"
-    blocks = []
+    blocks, n = [], 0
     for r in sorted(_recipes().find({}), key=lambda x: str(x["_id"])):
-        base, evo = _row(r["base_code"]), _row(r["_id"])
-        if base is None or evo is None:
+        ingredients = recipe_ingredients(r)
+        rows = [_row(code) for code, _q in ingredients]
+        evo = _row(r["_id"])
+        if evo is None or any(x is None for x in rows):
             continue   # recipe whose character was deleted: not shown (and cannot be used)
-        blocks.append(f"{r['base_qty']}× {_char_label(base)}\n➡️ {_char_label(evo)}\n"
-                      f"💎 {r['stones']} Stones • 🪙 {r['berries']:,} Berries")
+        n += 1
+        lines = [f"{n}. {ingredients[0][1]}× {_char_label(rows[0])}"]
+        if len(ingredients) > 1:
+            lines.append(f"   + {ingredients[1][1]}× {_char_label(rows[1])}")
+        lines.append(f"   ➡️ {_char_label(evo)}")
+        lines.append(f"   💎 {r['stones']} Stones • 🪙 {r['berries']:,} Berries")
+        blocks.append("\n".join(lines))
     if not blocks:
         return [head + "No evolution recipes have been set up yet."]
     pages, cur = [], head
@@ -739,46 +819,56 @@ def evolution_list_pages_sync():
 
 
 def _resolve_recipe_sync(query):
-    """Find the recipe a user means: by character code or name. Typing the BASE opens its recipe; typing the RESULT opens the
-    recipe that makes it. Returns (recipe|None, error_text|None)."""
+    """Recipes a user means by a character code or name. Typing an INGREDIENT card returns every recipe that uses it;
+    typing a RESULT card returns the recipe that makes it. Returns (list_of_recipes, error_text|None)."""
     q = mongo_db.strip_evo_mark(query)
     if _valid_code(q):
         row = _row(q)
     else:
         matches = mongo_db.find_characters_by_name_parts(q)
         if len(matches) > 1:
-            return None, "❓ Several characters match that name. Please use the 4-digit code."
+            return [], "❓ Several characters match that name. Please use the 4-digit code."
         row = matches[0] if matches else None
     if row is None:
-        return None, "❌ Character not found."
-    recipe = get_recipe_by_base_sync(row[0]) or get_recipe_sync(row[0])
-    if recipe is None:
-        return None, "❌ There is no evolution recipe for that character. See /evolution."
-    return recipe, None
+        return [], "❌ Character not found."
+    recipes = recipes_using_sync(row[0])
+    if not recipes:
+        producing = get_recipe_sync(row[0])
+        recipes = [producing] if producing else []
+    if not recipes:
+        return [], "❌ There is no evolution recipe for that character. See /evolution."
+    return recipes, None
 
 
 def build_card_sync(user_id, recipe):
-    base, evo = _row(recipe["base_code"]), _row(recipe["_id"])
-    if base is None or evo is None:
+    ingredients = recipe_ingredients(recipe)
+    rows = [_row(code) for code, _q in ingredients]
+    evo = _row(recipe["_id"])
+    if evo is None or any(x is None for x in rows):
         return None
-    have = mongo_db.count_user_copies(user_id, base[0])
     stones, coins = _balances(user_id)
+    have = " • ".join(f"{r[1]} ×{mongo_db.count_user_copies(user_id, r[0])}" for r in rows)
+    if len(ingredients) == 1:
+        who = f"🧍 Base Character: {rows[0][1]} ×{ingredients[0][1]}\n"
+    else:
+        who = f"🧍 Card A: {rows[0][1]} ×{ingredients[0][1]}\n🧍 Card B: {rows[1][1]} ×{ingredients[1][1]}\n"
     return (
         "⚡ EVOLUTION\n\n"
-        f"🧍 Base Character: {base[1]} ×{recipe['base_qty']}\n"
+        f"{who}"
         f"💎 Evolution Stone: ×{recipe['stones']}\n"
         f"🪙 Berries: {recipe['berries']:,}\n\n"
         "⬇️\n\n"
         f"✨ Result: {evo[1]} ×1\n\n"
-        f"You have: {base[1]} ×{have} • 💎 {stones} • 🪙 {coins:,}"
+        f"You have: {have} • 💎 {stones} • 🪙 {coins:,}"
     )
 
 
 def success_text(res):
-    base, evo = _row(res["base_code"]), _row(res["evo_code"])
+    used = " + ".join(f"{(_row(c)[1] if _row(c) else c)} ×{q}" for c, q in res.get("ingredients") or [(res["base_code"], res["base_qty"])])
+    evo = _row(res["evo_code"])
     return (
         "✅ EVOLUTION COMPLETE!\n\n"
-        f"🧍 Used: {base[1] if base else res['base_code']} ×{res['base_qty']}\n"
+        f"🧍 Used: {used}\n"
         f"💎 Stones used: {res['stones']}\n"
         f"🪙 Berries used: {res['berries']:,}\n\n"
         f"✨ Received: {evo[1] if evo else res['evo_code']} ×1\n\n"
@@ -791,18 +881,24 @@ def _evolve_keyboard(user_id, evo_code):
     return InlineKeyboardMarkup([[InlineKeyboardButton("⚡ EVOLVE", callback_data=f"evo:go:{int(user_id)}:{evo_code}")]])
 
 
-def _pick_keyboard_sync(user_id):
-    """Buttons for every recipe whose base character the user owns at least once."""
+def _recipe_buttons_sync(user_id, recipes):
+    """One button per recipe (max 10): 'Naruto ×2 ➡️ Sage Naruto' or 'Naruto + Sasuke ➡️ Final Fight'."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = []
-    for r in sorted(_recipes().find({}), key=lambda x: str(x["_id"])):
-        base, evo = _row(r["base_code"]), _row(r["_id"])
-        if base and evo and mongo_db.count_user_copies(user_id, base[0]) > 0:
-            label = f"{base[1]} ×{r['base_qty']} ➡️ {evo[1]}"[:60]
-            rows.append([InlineKeyboardButton(label, callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
-        if len(rows) >= 10:
-            break
+    for r in recipes[:10]:
+        ingredients = recipe_ingredients(r)
+        cards, evo = [_row(c) for c, _q in ingredients], _row(r["_id"])
+        if evo and all(cards):
+            names = " + ".join(c[1] for c in cards) if len(cards) > 1 else f"{cards[0][1]} ×{ingredients[0][1]}"
+            rows.append([InlineKeyboardButton(f"{names} ➡️ {evo[1]}"[:60], callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
     return InlineKeyboardMarkup(rows) if rows else None
+
+
+def _pick_keyboard_sync(user_id):
+    """Buttons for every recipe in which the user owns at least one of the ingredient cards."""
+    usable = [r for r in sorted(_recipes().find({}), key=lambda x: str(x["_id"]))
+              if any(mongo_db.count_user_copies(user_id, c) > 0 for c, _q in recipe_ingredients(r))]
+    return _recipe_buttons_sync(user_id, usable)
 
 
 # ---------------------------------------------------------------- /evolution /evolve /delevo handlers
@@ -828,10 +924,15 @@ async def evolve_command(update, context):
         else:
             await _reply(msg, "⚡ Choose what to evolve:", reply_markup=kb)
         return
-    recipe, err = await asyncio.to_thread(_resolve_recipe_sync, query)
+    recipes, err = await asyncio.to_thread(_resolve_recipe_sync, query)
     if err:
         await _reply(msg, err)
         return
+    if len(recipes) > 1:
+        kb = await asyncio.to_thread(_recipe_buttons_sync, user.id, recipes)
+        await _reply(msg, "⚡ Several evolutions use this card. Choose one:", reply_markup=kb)
+        return
+    recipe = recipes[0]
     card = await asyncio.to_thread(build_card_sync, user.id, recipe)
     if card is None:
         await _reply(msg, "❌ This evolution is unavailable (a character was removed).")
@@ -910,8 +1011,8 @@ async def delevo_command(update, context):
         return
     await asyncio.to_thread(delete_recipe_sync, code)
     evo = await asyncio.to_thread(_row, code)
-    base = await asyncio.to_thread(_row, recipe["base_code"])
     label = evo[1] if evo else code
+    recipe_text = await asyncio.to_thread(_ingredient_text, recipe)
     await _reply(msg, f"🗑 Evolution recipe for {label} [{code}] deleted.\n"
                       "Evolution characters users already own are not affected.")
     try:
@@ -921,7 +1022,7 @@ async def delevo_command(update, context):
                 f"🗑 EVOLUTION RECIPE DELETED\n"
                 f"🎭 {label} [{code}]\n"
                 + (f"🏷 {_rarity_line(evo[3])}\n" if evo else "")
-                + f"🧬 Recipe: {recipe['base_qty']}× {base[1] if base else '?'} [{recipe['base_code']}] ➡️ {label} [{code}]\n"
+                + f"🧬 Recipe: {recipe_text} ➡️ {label} [{code}]\n"
                 f"💎 Evolution Stones: {recipe['stones']}\n"
                 f"🪙 Berries: {recipe['berries']:,}\n"
                 f"ℹ️ Evolution characters users already own were kept.\n"
@@ -954,8 +1055,9 @@ async def addevo_start(update, context):
         await _reply(msg, NOT_ALLOWED_TEXT)
         return -1
     _clear_evo(context)
-    await _reply(msg, "Enter the code of the character you want to create an evolution for:")
-    return E_BASE
+    context.user_data["evo_phase"] = "type"
+    await _reply(msg, "⚡ New Evolution\nChoose the evolution type:", reply_markup=_type_keyboard(user.id))
+    return E_TYPE
 
 
 async def addevo_base(update, context):
@@ -996,7 +1098,7 @@ async def addevo_name(update, context):
         await _reply(msg, "❌ A character with that name already exists. Send a different name.")
         return E_NAME
     context.user_data["evo_name"] = name
-    await _reply(msg, "4️⃣ Anime Name:")
+    await _reply(msg, f"{_stepno(context, 4)} Anime Name:")
     return E_ANIME
 
 
@@ -1007,7 +1109,7 @@ async def addevo_anime(update, context):
         await _reply(msg, "❌ The anime name cannot be empty.")
         return E_ANIME
     context.user_data["evo_anime"] = anime
-    await _reply(msg, "5️⃣ Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial")
+    await _reply(msg, f"{_stepno(context, 5)} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial")
     return E_RARITY
 
 
@@ -1018,7 +1120,7 @@ async def addevo_rarity(update, context):
         await _reply(msg, "❌ Invalid rarity.")
         return E_RARITY
     context.user_data["evo_rarity"] = rarity
-    await _reply(msg, "6️⃣ Worth in Berries:")
+    await _reply(msg, f"{_stepno(context, 6)} Worth in Berries:")
     return E_WORTH
 
 
@@ -1029,7 +1131,7 @@ async def addevo_worth(update, context):
         await _reply(msg, "❌ Worth must be a whole number (0 or more).")
         return E_WORTH
     context.user_data["evo_worth"] = n
-    await _reply(msg, f"7️⃣ Evolution Stones required (minimum {EVO_MIN_STONES}):")
+    await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (minimum {EVO_MIN_STONES}):")
     return E_STONES
 
 
@@ -1043,7 +1145,7 @@ async def addevo_stones(update, context):
         await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
         return E_STONES
     context.user_data["evo_stones"] = n
-    await _reply(msg, "8️⃣ Berries Cost:")
+    await _reply(msg, f"{_stepno(context, 8)} Berries Cost:")
     return E_BERRIES
 
 
@@ -1054,7 +1156,7 @@ async def addevo_berries(update, context):
         await _reply(msg, "❌ Berries cost must be a whole number (0 or more).")
         return E_BERRIES
     context.user_data["evo_berries"] = n
-    await _reply(msg, "9️⃣ Evolution Character Code (unique 4-digit code):")
+    await _reply(msg, f"{_stepno(context, 9)} Evolution Character Code (unique 4-digit code):")
     return E_CODE
 
 
@@ -1064,14 +1166,14 @@ async def addevo_code(update, context):
     if not _valid_code(code):
         await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
         return E_CODE
-    if code == context.user_data.get("evo_base"):
-        await _reply(msg, "❌ The evolution code cannot be the same as the base character (no self-evolution).")
+    if code in (context.user_data.get("evo_base"), context.user_data.get("evo_second")):
+        await _reply(msg, "❌ The evolution code cannot be the same as an ingredient character (no self-evolution).")
         return E_CODE
     if _row(code) is not None or await asyncio.to_thread(get_recipe_sync, code):
         await _reply(msg, "❌ Code already exists.")
         return E_CODE
     context.user_data["evo_code"] = code
-    await _reply(msg, "🔟 Evolution Character Photo - send the photo:")
+    await _reply(msg, f"{_stepno(context, 10)} Evolution Character Photo - send the photo:")
     return E_PHOTO
 
 
@@ -1081,7 +1183,11 @@ async def addevo_photo(update, context):
         await _reply(msg, "❌ Please send a photo (the photo is required).")
         return E_PHOTO
     d = dict(context.user_data)
-    if not all(k in d for k in _EVO_KEYS if k != "evo_base_name"):
+    pair = d.get("evo_kind") == "pair"
+    required = [k for k in _EVO_KEYS if k not in ("evo_base_name", "evo_second", "evo_second_name", "evo_qty2", "evo_kind", "evo_phase")]
+    if pair:
+        required += ["evo_second", "evo_qty2"]
+    if not all(k in d for k in required):
         _clear_evo(context)
         await _reply(msg, "❌ The setup expired. Start again with /addevo.")
         return -1
@@ -1094,7 +1200,8 @@ async def addevo_photo(update, context):
     try:
         res = await asyncio.to_thread(
             create_evolution_sync, d["evo_base"], d["evo_qty"], d["evo_name"], d["evo_anime"], d["evo_rarity"],
-            d["evo_worth"], d["evo_stones"], d["evo_berries"], d["evo_code"], photo_id, user.id)
+            d["evo_worth"], d["evo_stones"], d["evo_berries"], d["evo_code"], photo_id, user.id,
+            d.get("evo_second") if pair else None, d.get("evo_qty2") if pair else None)
     except Exception as e:
         logger.error("addevo failed: %s", e)
         _clear_evo(context)
@@ -1104,12 +1211,13 @@ async def addevo_photo(update, context):
     if not res["ok"]:
         await _reply(msg, res["error"])
         return -1
+    recipe = {"base_code": d["evo_base"], "base_qty": d["evo_qty"], "kind": "pair" if pair else "same",
+              "second_code": d.get("evo_second"), "second_qty": d.get("evo_qty2")}
     base, evo = _row(d["evo_base"]), _row(d["evo_code"])
-    await _reply(
-        msg,
-        "✅ Evolution created!\n\n"
-        f"{d['evo_qty']}× {_char_label(base)}\n➡️ {_char_label(evo)}\n"
-        f"💎 {d['evo_stones']} Stones • 🪙 {d['evo_berries']:,} Berries")
+    second = _row(d["evo_second"]) if pair else None
+    lines = f"{d['evo_qty']}× {_char_label(base)}\n" + (f"+ {d['evo_qty2']}× {_char_label(second)}\n" if pair else "")
+    await _reply(msg, "✅ Evolution created!\n\n" + lines + f"➡️ {_char_label(evo)}\n"
+                      f"💎 {d['evo_stones']} Stones • 🪙 {d['evo_berries']:,} Berries")
     try:
         if _deps["log_action"]:
             await asyncio.to_thread(_deps["log_action"], d["evo_code"], d["evo_name"], user, "add")
@@ -1122,7 +1230,7 @@ async def addevo_photo(update, context):
                 f"🏷 {_rarity_line(d['evo_rarity'])}\n"
                 f"💰 Worth: {d['evo_worth']}\n"
                 f"📷 Photo: Added\n"
-                f"🧬 Recipe: {d['evo_qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
+                f"🧬 Recipe: {_ingredient_text(recipe)} ➡️ {evo[1]} [{evo[0]}]\n"
                 f"💎 Evolution Stones: {d['evo_stones']}\n"
                 f"🪙 Berries: {d['evo_berries']:,}\n"
                 f"👤 By: {_by(user)}", actor_id=user.id)
@@ -1165,53 +1273,59 @@ def _is_skip(text):
     return bool(_deps["is_skip_text"](text))
 
 
-def _creates_cycle(base_code, evo_code):
-    """True if `evo_code` is already an ancestor of `base_code` through other recipes (A->B and B->A style loops)."""
-    cur, seen = str(base_code), set()
-    while cur not in seen:
-        seen.add(cur)
-        if cur == str(evo_code):
-            return True
-        recipe = get_recipe_sync(cur)
-        if not recipe:
-            return False
-        cur = str(recipe["base_code"])
-    return True
+def _creates_cycle(ingredient_codes, evo_code):
+    """True if `evo_code` is already an ancestor of one of the ingredient cards through other recipes (loops like A->B, B->A)."""
+    if isinstance(ingredient_codes, str):
+        ingredient_codes = [ingredient_codes]
+    return _is_ancestor(evo_code, ingredient_codes)
 
 
-def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berries):
+def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berries, second_code=None, second_qty=None):
     """Checks for /editevo (the evolution character already exists, so codes are compared against OTHER characters)."""
     base_code, new_code = str(base_code), str(new_code)
+    pair = second_code is not None
     if not _valid_code(new_code):
         return "❌ The evolution code must be exactly 4 digits (0001-9999)."
     if new_code != str(evo_code0) and (_row(new_code) is not None or get_recipe_sync(new_code) is not None):
         return "❌ That code already exists."
     if not _valid_code(base_code) or _row(base_code) is None:
-        return "❌ The base character code does not exist."
+        return "❌ Card A does not exist." if pair else "❌ The base character code does not exist."
     if base_code == new_code:
         return "❌ A character cannot evolve into itself (the base code equals the evolution code)."
     if not isinstance(base_qty, int) or not (1 <= base_qty <= EVO_MAX_BASE_QTY):
         return f"❌ Base quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
+    if pair:
+        second_code = str(second_code)
+        if not _valid_code(second_code) or _row(second_code) is None:
+            return "❌ Card B does not exist."
+        if second_code == base_code:
+            return "❌ Card A and card B must be two different cards."
+        if second_code == new_code:
+            return "❌ A character cannot evolve into itself (card B equals the evolution code)."
+        if not isinstance(second_qty, int) or not (1 <= second_qty <= EVO_MAX_BASE_QTY):
+            return f"❌ Card B quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
     if not isinstance(stones, int) or stones < EVO_MIN_STONES:
         return f"❌ Evolution Stones must be at least {EVO_MIN_STONES}."
     if stones > EVO_MAX_STONES:
         return f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}."
     if not isinstance(berries, int) or berries < 0 or berries > EVO_MAX_BERRIES:
         return "❌ Berries cost must be a whole number (0 or more)."
-    other = get_recipe_by_base_sync(base_code)
+    other = get_pair_recipe_sync(base_code, second_code) if pair else get_recipe_by_base_sync(base_code)
     if other is not None and str(other["_id"]) != str(evo_code0):
-        return "❌ That base character already has another evolution recipe (conflict)."
-    if _creates_cycle(base_code, evo_code0):
-        return "❌ That would create an evolution loop (the base already comes from this evolution)."
+        return "❌ That " + ("pair of cards" if pair else "base character") + " already has another evolution recipe (conflict)."
+    if _creates_cycle([base_code] + ([second_code] if pair else []), evo_code0):
+        return "❌ That would create an evolution loop (an ingredient already comes from this evolution)."
     return None
 
 
 def edit_evolution_sync(code0, v, edited_by):
     """
     Saves the character edit AND the recipe edit in ONE transaction (both or neither).
-    v = {name, anime, rarity, worth, photo (or None to keep), code, base, qty, stones, berries}
+    v = {name, anime, rarity, worth, photo (or None to keep), code, base, qty, stones, berries[, second, qty2]}
     """
-    err = validate_recipe_edit(code0, v["code"], v["base"], v["qty"], v["stones"], v["berries"])
+    pair = v.get("second") is not None
+    err = validate_recipe_edit(code0, v["code"], v["base"], v["qty"], v["stones"], v["berries"],
+                               v.get("second") if pair else None, v.get("qty2") if pair else None)
     if err:
         return {"ok": False, "error": err}
     if _name_taken_by_other(v["name"], code0):
@@ -1226,7 +1340,10 @@ def edit_evolution_sync(code0, v, edited_by):
             mongo_db.col(mongo_db.CHARACTERS).update_one({"code": v["code"]}, {"$set": {"photo_file_id": v["photo"]}},
                                                          session=session)
         fields = {"evo_code": v["code"], "base_code": str(v["base"]), "base_qty": int(v["qty"]),
-                  "stones": int(v["stones"]), "berries": int(v["berries"])}
+                  "stones": int(v["stones"]), "berries": int(v["berries"]), "kind": "pair" if pair else "same",
+                  "pair_key": pair_key(v["base"], v["second"] if pair else None)}
+        if pair:
+            fields.update({"second_code": str(v["second"]), "second_qty": int(v["qty2"])})
         res = _recipes().update_one({"_id": v["code"]}, {"$set": fields}, session=session)
         if res.matched_count != 1:      # recipe had been deleted with /delevo: this edit recreates it
             _recipes().insert_one({"_id": v["code"], **fields, "created_by": int(edited_by), "created_at": _stamp()},
@@ -1237,7 +1354,7 @@ def edit_evolution_sync(code0, v, edited_by):
     except _EvoAbort:
         return {"ok": False, "error": "❌ This is not an Evolution character (or it no longer exists)."}
     except mongo_db.DuplicateKeyError:
-        return {"ok": False, "error": "❌ The name, code or base character already has a record. Nothing was changed."}
+        return {"ok": False, "error": "❌ The name, code or card pair already has a record. Nothing was changed."}
     finally:
         mongo_db.invalidate_character_cache()
     return {"ok": True}
@@ -1288,6 +1405,7 @@ async def editevo_start(update, context):
     d = context.user_data
     d["eevo_code0"], d["eevo_row"] = row[0], row
     d["eevo_recipe"] = await asyncio.to_thread(get_recipe_sync, row[0])
+    d["eevo_kind"] = ("pair" if is_pair_recipe(d["eevo_recipe"]) else "same") if d["eevo_recipe"] else None
     await _reply(msg, f"✏️ Editing {row[1]} [{row[0]}] (Evolution)\n\n1️⃣ Send the new name, or tap ⏭ Skip to keep it."
                       f"\nCurrent: {mongo_db.strip_evo_mark(row[1])}", reply_markup=_skip_markup())
     return X_NAME
@@ -1389,154 +1507,6 @@ async def editevo_photo(update, context):
     return X_CODE
 
 
-async def editevo_code(update, context):
-    if not await _x_gate(update, context):
-        return -1
-    msg, d = update.effective_message, context.user_data
-    if _is_skip(msg.text):
-        d["eevo_code"] = d["eevo_code0"]
-    else:
-        code = (msg.text or "").strip()
-        if not _valid_code(code):
-            await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
-            return X_CODE
-        if code != d["eevo_code0"] and (_row(code) is not None or await asyncio.to_thread(get_recipe_sync, code)):
-            await _reply(msg, "❌ That code already exists.")
-            return X_CODE
-        d["eevo_code"] = code
-    recipe = d["eevo_recipe"]
-    cur = recipe["base_code"] if recipe else None
-    await _reply(msg, f"7️⃣ Base character code (the character that evolves into this one)"
-                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
-                 reply_markup=_skip_markup() if recipe else None)
-    return X_BASE
-
-
-async def editevo_base(update, context):
-    if not await _x_gate(update, context):
-        return -1
-    msg, d = update.effective_message, context.user_data
-    recipe = d["eevo_recipe"]
-    if recipe and _is_skip(msg.text):
-        d["eevo_base"] = str(recipe["base_code"])
-    else:
-        code = (msg.text or "").strip()
-        if not _valid_code(code) or await asyncio.to_thread(_row, code) is None:
-            await _reply(msg, "❌ That base character code does not exist.")
-            return X_BASE
-        if code == d["eevo_code"]:
-            await _reply(msg, "❌ A character cannot evolve into itself. Send a different base code.")
-            return X_BASE
-        d["eevo_base"] = code
-    cur = recipe["base_qty"] if recipe else None
-    await _reply(msg, f"8️⃣ Base character quantity required (1-{EVO_MAX_BASE_QTY})"
-                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
-                 reply_markup=_skip_markup() if recipe else None)
-    return X_QTY
-
-
-async def editevo_qty(update, context):
-    if not await _x_gate(update, context):
-        return -1
-    msg, d = update.effective_message, context.user_data
-    recipe = d["eevo_recipe"]
-    if recipe and _is_skip(msg.text):
-        d["eevo_qty"] = int(recipe["base_qty"])
-    else:
-        n = _parse_int(msg.text)
-        if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
-            await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
-            return X_QTY
-        d["eevo_qty"] = n
-    cur = recipe["stones"] if recipe else None
-    await _reply(msg, f"9️⃣ Evolution Stones required (minimum {EVO_MIN_STONES})"
-                      f"{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
-                 reply_markup=_skip_markup() if recipe else None)
-    return X_STONES
-
-
-async def editevo_stones(update, context):
-    if not await _x_gate(update, context):
-        return -1
-    msg, d = update.effective_message, context.user_data
-    recipe = d["eevo_recipe"]
-    if recipe and _is_skip(msg.text):
-        d["eevo_stones"] = int(recipe["stones"])
-    else:
-        n = _parse_int(msg.text)
-        if n is None or n < EVO_MIN_STONES:
-            await _reply(msg, f"❌ Evolution Stones must be a number of at least {EVO_MIN_STONES}.")
-            return X_STONES
-        if n > EVO_MAX_STONES:
-            await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
-            return X_STONES
-        d["eevo_stones"] = n
-    cur = recipe["berries"] if recipe else None
-    await _reply(msg, f"🔟 Berries cost{', or ⏭ Skip' if recipe else ''}.\nCurrent: {_current(cur)}",
-                 reply_markup=_skip_markup() if recipe else None)
-    return X_BERRIES
-
-
-async def editevo_berries(update, context):
-    if not await _x_gate(update, context):
-        return -1
-    msg, d = update.effective_message, context.user_data
-    recipe = d["eevo_recipe"]
-    if recipe and _is_skip(msg.text):
-        d["eevo_berries"] = int(recipe["berries"])
-    else:
-        n = _parse_int(msg.text)
-        if n is None or n > EVO_MAX_BERRIES:
-            await _reply(msg, "❌ Berries cost must be a whole number (0 or more).")
-            return X_BERRIES
-        d["eevo_berries"] = n
-    user, code0 = update.effective_user, d["eevo_code0"]
-    values = {"name": d["eevo_name"], "anime": d["eevo_anime"], "rarity": d["eevo_rarity"], "worth": d["eevo_worth"],
-              "photo": d["eevo_photo"], "code": d["eevo_code"], "base": d["eevo_base"], "qty": d["eevo_qty"],
-              "stones": d["eevo_stones"], "berries": d["eevo_berries"]}
-    try:
-        res = await asyncio.to_thread(edit_evolution_sync, code0, values, user.id)
-    except Exception as e:
-        logger.error("editevo failed: %s", e)
-        _clear_x(context)
-        await _reply(msg, "❌ Update failed. Nothing was changed. Please try again.")
-        return -1
-    _clear_x(context)
-    if not res["ok"]:
-        await _reply(msg, res["error"])
-        return -1
-    base, evo = _row(values["base"]), _row(values["code"])
-    await _reply(
-        msg,
-        "✅ Evolution edited successfully!\n\n"
-        f"{values['qty']}× {_char_label(base)}\n➡️ {_char_label(evo)}\n"
-        f"💰 Worth: {values['worth']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries",
-        reply_markup=_remove_keyboard())
-    try:
-        if _deps["log_action"]:
-            await asyncio.to_thread(_deps["log_action"], values["code"], values["name"], user, "edit")
-        if _deps["notify"]:
-            code_line = f"🔁 Old code: {code0}\n" if code0 != values["code"] else f"🔢 Code: {values['code']}\n"
-            await _deps["notify"](
-                context,
-                f"✏️ EVOLUTION UPDATED\n"
-                f"🎭 {evo[1]} [{evo[0]}]\n"
-                f"📺 Anime: {values['anime'] or 'Not set'}\n"
-                f"🏷 {_rarity_line(values['rarity'])}\n"
-                f"💰 Worth: {values['worth']}\n"
-                f"📷 Photo: {'Updated' if values['photo'] else 'Unchanged'}\n"
-                f"🧬 Recipe: {values['qty']}× {base[1]} [{base[0]}] ➡️ {evo[1]} [{evo[0]}]\n"
-                f"💎 Evolution Stones: {values['stones']}\n"
-                f"🪙 Berries: {values['berries']:,}\n"
-                f"{code_line}"
-                f"👤 By: {_by(user)}", actor_id=user.id)
-        if _deps["mark_success"]:
-            _deps["mark_success"](update)
-    except Exception as e:
-        logger.info("editevo notification skipped: %s", e)
-    return -1
-
-
 def _remove_keyboard():
     try:
         from telegram import ReplyKeyboardRemove
@@ -1626,12 +1596,395 @@ async def stone_command(update, context):
     await _reply(msg, await asyncio.to_thread(stone_leaderboard_sync, user.id))
 
 
+# ---------------------------------------------------------------- Different Card evolution: type chooser + extra steps
+E_TYPE, E_ACODE, E_AQTY, E_BCODE, E_BQTY = range(220, 225)
+X_BASE2, X_QTY2, X_KIND = range(225, 228)
+_EVO_KEYS = _EVO_KEYS + ("evo_kind", "evo_second", "evo_second_name", "evo_qty2", "evo_phase")
+_XKEYS = _XKEYS + ("eevo_kind", "eevo_second", "eevo_qty2")
+_EMOJI = ["", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+
+
+def _stepno(context, n):
+    """Step label. Same Card keeps the original 1️⃣..🔟; Different Card has two extra steps and uses 'Step N/12:'."""
+    if context.user_data.get("evo_kind") == "pair":
+        return f"Step {n + 2}/12:"
+    return _EMOJI[n]
+
+
+def _parse_kind(text):
+    t = (text or "").strip().lower()
+    if t in ("1", "s", "same", "same card"):
+        return "same"
+    if t in ("2", "d", "diff", "different", "two", "different card"):
+        return "pair"
+    return None
+
+
+def _type_keyboard(uid):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🧍 Same Card", callback_data=f"evoadd:{int(uid)}:same"),
+                                  InlineKeyboardButton("👥 Different Card", callback_data=f"evoadd:{int(uid)}:diff")]])
+
+
+def _begin_kind(context, kind):
+    """Records the chosen type and returns (first question, next state)."""
+    context.user_data["evo_kind"], context.user_data["evo_phase"] = kind, None
+    if kind == "pair":
+        return "Step 1/12: Enter the code of card A (for example Naruto):", E_ACODE
+    return "Enter the code of the character you want to create an evolution for:", E_BASE
+
+
+async def addevo_type_text(update, context):
+    msg = update.effective_message
+    if not _is_staff_evo(update.effective_user.id):
+        _clear_evo(context)
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return -1
+    kind = _parse_kind(msg.text)
+    if kind is None:
+        await _reply(msg, "❌ Choose Same Card or Different Card (or send 1 or 2).", reply_markup=_type_keyboard(update.effective_user.id))
+        return E_TYPE
+    text, state = _begin_kind(context, kind)
+    await _reply(msg, text)
+    return state
+
+
+async def addevo_type_callback(update, context):
+    """The two type buttons. Only the staff member who started /addevo can use them, and only while the setup is open."""
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return None
+    try:
+        _tag, owner, choice = (q.data or "").split(":")
+        owner = int(owner)
+    except ValueError:
+        await q.answer()
+        return None
+    if q.from_user.id != owner:
+        await q.answer("❌ This is not your setup. Use /addevo.", show_alert=True)
+        return None
+    if not _is_staff_evo(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return None
+    if context.user_data.get("evo_phase") != "type":
+        await q.answer("⚠️ This setup is no longer active. Use /addevo.", show_alert=True)
+        return None
+    kind = "pair" if choice == "diff" else "same"
+    text, state = _begin_kind(context, kind)
+    await q.answer()
+    title = "👥 Different Card" if kind == "pair" else "🧍 Same Card"
+    try:
+        await q.edit_message_text(f"{title}\n\n{text}")           # the buttons disappear, so a choice cannot be tapped twice
+    except Exception:
+        await _reply(q.message, text)
+    return state
+
+
+async def addevo_acode(update, context):
+    msg = update.effective_message
+    code = (msg.text or "").strip()
+    row = _row(code) if _valid_code(code) else None
+    if row is None:
+        await _reply(msg, "❌ That card code does not exist. Evolution setup stopped.")
+        _clear_evo(context)
+        return -1
+    context.user_data["evo_base"], context.user_data["evo_base_name"] = code, row[1]
+    await _reply(msg, f"Step 2/12: How many copies of {row[1]} are required? (usually 1; 1-{EVO_MAX_BASE_QTY})")
+    return E_AQTY
+
+
+async def addevo_aqty(update, context):
+    msg = update.effective_message
+    n = _parse_int(msg.text)
+    if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
+        await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
+        return E_AQTY
+    context.user_data["evo_qty"] = n
+    await _reply(msg, "Step 3/12: Enter the code of card B (for example Sasuke):")
+    return E_BCODE
+
+
+async def addevo_bcode(update, context):
+    msg, d = update.effective_message, context.user_data
+    code = (msg.text or "").strip()
+    row = _row(code) if _valid_code(code) else None
+    if row is None:
+        await _reply(msg, "❌ That card code does not exist. Evolution setup stopped.")
+        _clear_evo(context)
+        return -1
+    if code == d.get("evo_base"):
+        await _reply(msg, "❌ Card B must be a different card than card A. Send another code:")
+        return E_BCODE
+    if await asyncio.to_thread(get_pair_recipe_sync, d.get("evo_base"), code):
+        await _reply(msg, "❌ This pair of cards already has an evolution recipe. Evolution setup stopped.")
+        _clear_evo(context)
+        return -1
+    d["evo_second"], d["evo_second_name"] = code, row[1]
+    await _reply(msg, f"Step 4/12: How many copies of {row[1]} are required? (usually 1; 1-{EVO_MAX_BASE_QTY})")
+    return E_BQTY
+
+
+async def addevo_bqty(update, context):
+    msg = update.effective_message
+    n = _parse_int(msg.text)
+    if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
+        await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
+        return E_BQTY
+    context.user_data["evo_qty2"] = n
+    await _reply(msg, f"{_stepno(context, 3)} Evolution Character Name:")
+    return E_NAME
+
+
+# ---------------------------------------------------------------- /editevo: the recipe steps for both types
+def _xl(d, same_n, pair_n):
+    return f"Step {pair_n}/12:" if d.get("eevo_kind") == "pair" else _EMOJI[same_n]
+
+
+def _skip_hint(d):
+    return ", or ⏭ Skip" if d["eevo_recipe"] else ""
+
+
+async def _x_base_prompt(msg, d):
+    recipe = d["eevo_recipe"]
+    cur = recipe["base_code"] if recipe else None
+    if d.get("eevo_kind") == "pair":
+        text = f"{_xl(d, 7, 7)} Card A code{_skip_hint(d)}.\nCurrent: {_current(cur)}"
+    else:
+        text = (f"{_xl(d, 7, 7)} Base character code (the character that evolves into this one){_skip_hint(d)}.\n"
+                f"Current: {_current(cur)}")
+    await _reply(msg, text, reply_markup=_skip_markup() if recipe else None)
+
+
+async def editevo_code(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    if _is_skip(msg.text):
+        d["eevo_code"] = d["eevo_code0"]
+    else:
+        code = (msg.text or "").strip()
+        if not _valid_code(code):
+            await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
+            return X_CODE
+        if code != d["eevo_code0"] and (_row(code) is not None or await asyncio.to_thread(get_recipe_sync, code)):
+            await _reply(msg, "❌ That code already exists.")
+            return X_CODE
+        d["eevo_code"] = code
+    if d.get("eevo_kind") is None:           # the recipe was deleted with /delevo: say which kind to recreate
+        await _reply(msg, "This evolution has no recipe now. Which kind should it be? Send Same (copies of one card) "
+                          "or Different (two different cards).")
+        return X_KIND
+    await _x_base_prompt(msg, d)
+    return X_BASE
+
+
+async def editevo_kind(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    kind = _parse_kind(msg.text)
+    if kind is None:
+        await _reply(msg, "❌ Send Same or Different (or 1 or 2).")
+        return X_KIND
+    d["eevo_kind"] = kind
+    await _x_base_prompt(msg, d)
+    return X_BASE
+
+
+async def editevo_base(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_base"] = str(recipe["base_code"])
+    else:
+        code = (msg.text or "").strip()
+        if not _valid_code(code) or await asyncio.to_thread(_row, code) is None:
+            await _reply(msg, "❌ That " + ("card" if d.get("eevo_kind") == "pair" else "base character") + " code does not exist.")
+            return X_BASE
+        if code == d["eevo_code"]:
+            await _reply(msg, "❌ A character cannot evolve into itself. Send a different base code.")
+            return X_BASE
+        d["eevo_base"] = code
+    cur = recipe["base_qty"] if recipe else None
+    await _reply(msg, f"{_xl(d, 8, 8)} {'Card A' if d.get('eevo_kind') == 'pair' else 'Base character'} quantity required "
+                      f"(1-{EVO_MAX_BASE_QTY}){_skip_hint(d)}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_QTY
+
+
+async def editevo_qty(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_qty"] = int(recipe["base_qty"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
+            await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
+            return X_QTY
+        d["eevo_qty"] = n
+    if d.get("eevo_kind") == "pair":
+        cur = recipe.get("second_code") if recipe else None
+        await _reply(msg, f"{_xl(d, 8, 9)} Card B code{_skip_hint(d)}.\nCurrent: {_current(cur)}",
+                     reply_markup=_skip_markup() if recipe else None)
+        return X_BASE2
+    await _x_stones_prompt(msg, d)
+    return X_STONES
+
+
+async def editevo_base2(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and recipe.get("second_code") and _is_skip(msg.text):
+        d["eevo_second"] = str(recipe["second_code"])
+    else:
+        code = (msg.text or "").strip()
+        if not _valid_code(code) or await asyncio.to_thread(_row, code) is None:
+            await _reply(msg, "❌ That card code does not exist.")
+            return X_BASE2
+        if code == d["eevo_base"]:
+            await _reply(msg, "❌ Card B must be a different card than card A.")
+            return X_BASE2
+        if code == d["eevo_code"]:
+            await _reply(msg, "❌ A character cannot evolve into itself. Send a different card code.")
+            return X_BASE2
+        d["eevo_second"] = code
+    cur = recipe.get("second_qty") if recipe else None
+    await _reply(msg, f"{_xl(d, 8, 10)} Card B quantity required (1-{EVO_MAX_BASE_QTY}){_skip_hint(d)}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_QTY2
+
+
+async def editevo_qty2(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and recipe.get("second_qty") and _is_skip(msg.text):
+        d["eevo_qty2"] = int(recipe["second_qty"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or not (1 <= n <= EVO_MAX_BASE_QTY):
+            await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
+            return X_QTY2
+        d["eevo_qty2"] = n
+    await _x_stones_prompt(msg, d)
+    return X_STONES
+
+
+async def _x_stones_prompt(msg, d):
+    recipe = d["eevo_recipe"]
+    cur = recipe["stones"] if recipe else None
+    await _reply(msg, f"{_xl(d, 9, 11)} Evolution Stones required (minimum {EVO_MIN_STONES}){_skip_hint(d)}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+
+
+async def editevo_stones(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_stones"] = int(recipe["stones"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n < EVO_MIN_STONES:
+            await _reply(msg, f"❌ Evolution Stones must be a number of at least {EVO_MIN_STONES}.")
+            return X_STONES
+        if n > EVO_MAX_STONES:
+            await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
+            return X_STONES
+        d["eevo_stones"] = n
+    cur = recipe["berries"] if recipe else None
+    await _reply(msg, f"{_xl(d, 10, 12)} Berries cost{_skip_hint(d)}.\nCurrent: {_current(cur)}",
+                 reply_markup=_skip_markup() if recipe else None)
+    return X_BERRIES
+
+
+async def editevo_berries(update, context):
+    if not await _x_gate(update, context):
+        return -1
+    msg, d = update.effective_message, context.user_data
+    recipe = d["eevo_recipe"]
+    if recipe and _is_skip(msg.text):
+        d["eevo_berries"] = int(recipe["berries"])
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n > EVO_MAX_BERRIES:
+            await _reply(msg, "❌ Berries cost must be a whole number (0 or more).")
+            return X_BERRIES
+        d["eevo_berries"] = n
+    pair = d.get("eevo_kind") == "pair"
+    user, code0 = update.effective_user, d["eevo_code0"]
+    values = {"name": d["eevo_name"], "anime": d["eevo_anime"], "rarity": d["eevo_rarity"], "worth": d["eevo_worth"],
+              "photo": d["eevo_photo"], "code": d["eevo_code"], "base": d["eevo_base"], "qty": d["eevo_qty"],
+              "stones": d["eevo_stones"], "berries": d["eevo_berries"]}
+    if pair:
+        values.update({"second": d["eevo_second"], "qty2": d["eevo_qty2"]})
+    try:
+        res = await asyncio.to_thread(edit_evolution_sync, code0, values, user.id)
+    except Exception as e:
+        logger.error("editevo failed: %s", e)
+        _clear_x(context)
+        await _reply(msg, "❌ Update failed. Nothing was changed. Please try again.")
+        return -1
+    _clear_x(context)
+    if not res["ok"]:
+        await _reply(msg, res["error"])
+        return -1
+    base, evo = _row(values["base"]), _row(values["code"])
+    second = _row(values["second"]) if pair else None
+    recipe_now = {"base_code": values["base"], "base_qty": values["qty"], "kind": "pair" if pair else "same",
+                  "second_code": values.get("second"), "second_qty": values.get("qty2")}
+    lines = f"{values['qty']}× {_char_label(base)}\n" + (f"+ {values['qty2']}× {_char_label(second)}\n" if pair else "")
+    await _reply(
+        msg,
+        "✅ Evolution edited successfully!\n\n" + lines + f"➡️ {_char_label(evo)}\n"
+        f"💰 Worth: {values['worth']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries",
+        reply_markup=_remove_keyboard())
+    try:
+        if _deps["log_action"]:
+            await asyncio.to_thread(_deps["log_action"], values["code"], values["name"], user, "edit")
+        if _deps["notify"]:
+            code_line = f"🔁 Old code: {code0}\n" if code0 != values["code"] else f"🔢 Code: {values['code']}\n"
+            await _deps["notify"](
+                context,
+                f"✏️ EVOLUTION UPDATED\n"
+                f"🎭 {evo[1]} [{evo[0]}]\n"
+                f"📺 Anime: {values['anime'] or 'Not set'}\n"
+                f"🏷 {_rarity_line(values['rarity'])}\n"
+                f"💰 Worth: {values['worth']}\n"
+                f"📷 Photo: {'Updated' if values['photo'] else 'Unchanged'}\n"
+                f"🧬 Recipe: {_ingredient_text(recipe_now)} ➡️ {evo[1]} [{evo[0]}]\n"
+                f"💎 Evolution Stones: {values['stones']}\n"
+                f"🪙 Berries: {values['berries']:,}\n"
+                f"{code_line}"
+                f"👤 By: {_by(user)}", actor_id=user.id)
+        if _deps["mark_success"]:
+            _deps["mark_success"](update)
+    except Exception as e:
+        logger.info("editevo notification skipped: %s", e)
+    return -1
+
+
 def _register_evolution(app):
     from telegram.ext import (CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters)
     text = filters.TEXT & ~filters.COMMAND
     app.add_handler(ConversationHandler(
-        entry_points=[CommandHandler("addevo", addevo_start)],
+        entry_points=[CommandHandler("addevo", addevo_start),
+                      CallbackQueryHandler(addevo_type_callback, pattern=r"^evoadd:\d+:(same|diff)$")],
         states={
+            E_TYPE: [MessageHandler(text, addevo_type_text)],
+            E_ACODE: [MessageHandler(text, addevo_acode)],
+            E_AQTY: [MessageHandler(text, addevo_aqty)],
+            E_BCODE: [MessageHandler(text, addevo_bcode)],
+            E_BQTY: [MessageHandler(text, addevo_bqty)],
             E_BASE: [MessageHandler(text, addevo_base)],
             E_QTY: [MessageHandler(text, addevo_qty)],
             E_NAME: [MessageHandler(text, addevo_name)],
@@ -1656,8 +2009,11 @@ def _register_evolution(app):
             X_WORTH: [MessageHandler(text, editevo_worth)],
             X_PHOTO: [MessageHandler(filters.PHOTO, editevo_photo), MessageHandler(text, editevo_photo)],
             X_CODE: [MessageHandler(text, editevo_code)],
+            X_KIND: [MessageHandler(text, editevo_kind)],
             X_BASE: [MessageHandler(text, editevo_base)],
             X_QTY: [MessageHandler(text, editevo_qty)],
+            X_BASE2: [MessageHandler(text, editevo_base2)],
+            X_QTY2: [MessageHandler(text, editevo_qty2)],
             X_STONES: [MessageHandler(text, editevo_stones)],
             X_BERRIES: [MessageHandler(text, editevo_berries)],
         },
