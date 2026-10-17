@@ -51,7 +51,8 @@ START_SECTIONS = ("welcome", "banner", "buttons", "links", "theme")      # secti
 MAX_TEXT = 3500            # welcome / about (Telegram allows 4096; room for the name header and theme frame)
 MAX_LABEL = 30
 MAX_URL = 256
-MAX_BUTTONS = 8
+MAX_BUTTONS = 12
+MAX_PER_ROW = 4                      # buttons in one row (Telegram allows 8, but names get cut off on phones)
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 CAPTION_LIMIT = 1000       # photo captions are limited to 1024 characters
 AWAIT_TTL = 600            # seconds an Edit/Upload prompt stays active
@@ -61,6 +62,7 @@ DEFAULT_HELP_LABEL = "📖 Help"      # the existing /start button (callback hel
 LINK_SLOTS = ("channel", "group", "website")
 LINK_LABELS = {"channel": "📢 Channel", "group": "👥 Group", "website": "🌐 Website"}
 LINK_WORDS = {"channel": "Channel", "group": "Group", "website": "Website/Social"}
+LINK_PLURAL = {"channel": "Channels", "group": "Groups", "website": "Websites / Social"}
 MAX_LINKS_PER_SLOT = 8               # e.g. Channel One ... Channel Eight
 
 # Telegram cannot colour inline buttons, so themes are fixed presets: a decorative frame + the emoji of the default
@@ -418,8 +420,19 @@ def _unframe(text, preset):
     return text
 
 
+ADDGROUP_LABEL = "➕ Add me to group"
+DETAILS_LABEL = "💜 Details"
+# The /start layout shipped by default: Add me to group (full width) / Help + Details / Group + Channel.
+DEFAULT_LAYOUT = [["addgroup"], ["help", "details"], ["link_group", "link_channel"]]
+
+
 def default_buttons():
     return [{"id": "help", "kind": "help", "label": DEFAULT_HELP_LABEL}]
+
+
+def _builtin_extras():
+    return [{"id": "addgroup", "kind": "addgroup", "label": ADDGROUP_LABEL},
+            {"id": "details", "kind": "details", "label": DETAILS_LABEL}]
 
 
 def _button_items(value):
@@ -427,7 +440,30 @@ def _button_items(value):
     items = copy.deepcopy((value or {}).get("items") or default_buttons())
     if not any(i.get("kind") == "help" for i in items):
         items.insert(0, default_buttons()[0])
+    if "layout" not in (value or {}):               # not arranged yet: offer the ready-made buttons too
+        for extra in _builtin_extras():
+            if not any(i.get("kind") == extra["kind"] for i in items):
+                items.append(extra)
     return items
+
+
+def _resolve_layout(items, links_value, layout):
+    """
+    The /start rows as lists of element ids: the saved layout (or the default one) limited to buttons that exist now.
+    A button that is not in the layout yet (e.g. a newly added one) is put at the bottom, two per row.
+    Element ids: the item ids (help, addgroup, details, b1, b2, ...) and link_channel / link_group / link_website.
+    """
+    available = [i["id"] for i in items] + [f"link_{slot}" for slot in LINK_SLOTS if _slot_links(links_value, slot)]
+    base = layout if isinstance(layout, list) else DEFAULT_LAYOUT
+    rows, used = [], set()
+    for row in base:
+        r = [e for e in row if e in available and e not in used]
+        used.update(r)
+        if r:
+            rows.append(r)
+    rest = [e for e in available if e not in used]
+    rows.extend(rest[n:n + 2] for n in range(0, len(rest), 2))
+    return rows
 
 
 def _themed_label(label, default_label, word, preset):
@@ -477,22 +513,33 @@ def _slot_links(links_value, slot):
     return out
 
 
-def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=False):
+def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=False, bot_username=None):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     preset = _preset(theme_value, "start")
-    buttons = []
-    for item in _button_items(buttons_value):
-        if item["kind"] == "help":
+    items = _button_items(buttons_value)
+    elements = {}
+    for item in items:
+        kind = item["kind"]
+        if kind == "help":
             label = _themed_label(item["label"], DEFAULT_HELP_LABEL, "Help", preset)
             data = f"theme:{uid}:noop:x" if preview else f"help:{uid}:open"     # the original action, untouched
-            buttons.append(InlineKeyboardButton(label, callback_data=data))
-        else:
-            buttons.append(InlineKeyboardButton(item["label"], url=item["url"]))
+            elements[item["id"]] = InlineKeyboardButton(label, callback_data=data)
+        elif kind == "addgroup":
+            if bot_username:
+                elements[item["id"]] = InlineKeyboardButton(item["label"], url=f"https://t.me/{bot_username}?startgroup=true")
+        elif kind == "details":
+            data = f"theme:{uid}:noop:x" if preview else "tdetails"
+            elements[item["id"]] = InlineKeyboardButton(item["label"], callback_data=data)
+        elif item.get("url"):
+            elements[item["id"]] = InlineKeyboardButton(item["label"], url=item["url"])
     for slot in LINK_SLOTS:
-        for link in _slot_links(links_value, slot):
-            buttons.append(InlineKeyboardButton(_themed_label(link["label"], LINK_LABELS[slot], LINK_WORDS[slot].split("/")[0], preset),
-                                                url=link["url"]))
-    return InlineKeyboardMarkup(_grid(buttons))
+        if _slot_links(links_value, slot):          # ONE button per type; tapping it lists everything added under it
+            data = f"theme:{uid}:noop:x" if preview else f"tlinks:{slot}"
+            elements[f"link_{slot}"] = InlineKeyboardButton(
+                _themed_label(LINK_LABELS[slot], LINK_LABELS[slot], LINK_WORDS[slot].split("/")[0], preset), callback_data=data)
+    rows = _resolve_layout(items, links_value, (buttons_value or {}).get("layout"))
+    keyboard = [[elements[e] for e in row if e in elements] for row in rows]
+    return InlineKeyboardMarkup([r for r in keyboard if r])
 
 
 def decorate_help_text(text):
@@ -517,9 +564,10 @@ async def send_start(update, context):
     try:
         text, custom = start_text_for(_saved.get("welcome"), _saved.get("theme"), user)   # greeting + {first}, {name}, ... filled in
         header = _deps.get("add_header")
-        if header:
+        if header and not custom:       # a custom welcome already greets the user by name: no second "👤 Name" line
             text = header(msg, text)
-        keyboard = start_keyboard_for(user.id, _saved.get("buttons"), _saved.get("links"), _saved.get("theme"))
+        keyboard = start_keyboard_for(user.id, _saved.get("buttons"), _saved.get("links"), _saved.get("theme"),
+                                      bot_username=getattr(msg.get_bot(), "username", None))
         parse = "HTML" if custom else None
         bot, chat_id = msg.get_bot(), msg.chat_id
         banner = _saved.get("banner")
@@ -538,6 +586,59 @@ async def send_start(update, context):
     except Exception as e:
         logger.error("customized /start failed: %s", e)
         return photo_sent
+
+
+async def links_callback(update, context):
+    """Public (any user): the Channel / Group / Website button on /start -> a list of every link saved under it."""
+    q = update.callback_query
+    if q is None or q.message is None:
+        return
+    parts = (q.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    try:
+        if action == "close":
+            await q.answer()
+            await q.message.delete()
+            return
+        if action not in LINK_SLOTS:
+            await q.answer()
+            return
+        entries = _slot_links(_saved.get("links"), action)
+        if not entries:
+            await q.answer(f"No {LINK_PLURAL[action].lower()} have been added yet.", show_alert=True)
+            return
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        rows = [[InlineKeyboardButton(e["label"], url=e["url"])] for e in entries]
+        rows.append([InlineKeyboardButton("✖️ Close", callback_data="tlinks:close")])
+        await q.answer()
+        await q.message.reply_text(f"{LINK_LABELS[action]}\n\nChoose one:", reply_markup=InlineKeyboardMarkup(rows), **_nopreview())
+    except Exception as e:
+        logger.info("links list failed: %s", e)
+        try:
+            await q.answer()
+        except Exception:
+            pass
+
+
+async def details_callback(update, context):
+    """Public (any user): the Details button on /start shows the About text the Owner saved."""
+    q = update.callback_query
+    if q is None or q.message is None:
+        return
+    value = _saved.get("about")
+    try:
+        if not (value and value.get("text")):
+            await q.answer("No details have been added yet.", show_alert=True)
+            return
+        await q.answer()
+        text = render_user_text(value["text"], q.from_user)
+        try:
+            await q.message.reply_text(text, parse_mode="HTML", **_nopreview())
+        except Exception as e:
+            logger.warning("Details text could not be sent as HTML: %s", e)
+            await q.message.reply_text(html.unescape(re.sub(r"<[^>]+>", "", text)))
+    except Exception as e:
+        logger.info("details failed: %s", e)
 
 
 async def about_command(update, context):
@@ -620,10 +721,13 @@ def panel_view(uid, section, notice=""):
                 [("💾 Save", section, "save")], _back()]
     elif section == "buttons":
         items = _button_items(_draft(uid, "buttons") or _saved.get("buttons"))
-        listing = "\n".join(f"{n}. {i['label']}" + (" (built-in Help)" if i["kind"] == "help" else f" → {i['url']}")
+        notes = {"help": " (opens the Help menu)", "addgroup": " (add-to-group link, automatic)", "details": " (shows your About text)"}
+        listing = "\n".join(f"{n}. {i['label']}" + (notes[i["kind"]] if i["kind"] in notes else f" → {i['url']}")
                             for n, i in enumerate(items, 1))
-        text = (f"{pre}🔘 Start Menu Buttons\n\nButtons on your /start message:\n{listing}\n\n{_status(uid, section)}")
-        rows = [[("➕ Add Button", section, "add"), ("✏️ Edit Button", section, "edit")],
+        text = (f"{pre}🔘 Start Menu Buttons\n\nButtons on your /start message:\n{listing}\n\n"
+                f"👉 Use 🧩 Layout to choose how many buttons are in each row and which row is on top.\n\n{_status(uid, section)}")
+        rows = [[("🧩 Layout (rows and order)", section, "layout")],
+                [("➕ Add Button", section, "add"), ("✏️ Edit Button", section, "edit")],
                 [("🗑️ Delete Button", section, "delete"), ("↕️ Reorder Buttons", section, "reorder")],
                 [("👁️ Preview", section, "preview"), ("♻️ Reset", section, "reset")],
                 [("💾 Save", section, "save")], _back()]
@@ -634,8 +738,8 @@ def panel_view(uid, section, notice=""):
             entries = _slot_links(links, s_)
             parts.append(f"{LINK_LABELS[s_]}: " + (", ".join(e["label"] for e in entries) if entries else "none"))
         listing = "\n".join(parts)
-        text = (f"{pre}🔗 Bot Links\n\nYou can add several channels, groups or websites - each one becomes its own "
-                f"button on /start (up to {MAX_LINKS_PER_SLOT} per type).\n\n{listing}\n\n{_status(uid, section)}")
+        text = (f"{pre}🔗 Bot Links\n\nAdd several channels, groups or websites (up to {MAX_LINKS_PER_SLOT} each). /start shows ONE "
+                f"Channel button and ONE Group button; tapping it opens the list of everything you add here.\n\n{listing}\n\n{_status(uid, section)}")
         rows = [[("➕ Add Channel", section, "setchannel"), ("➕ Add Group", section, "setgroup")],
                 [("➕ Add Website/Social", section, "setwebsite"), ("🗑️ Remove Link", section, "remove")],
                 [("👁️ Preview Links", section, "preview"), ("♻️ Reset", section, "reset")],
@@ -923,8 +1027,22 @@ def _working_buttons(uid):
     return d["items"] if d is not None else _button_items(_saved.get("buttons"))
 
 
+def _working_layout(uid):
+    value = _draft(uid, "buttons") or _saved.get("buttons") or {}
+    return _resolve_layout(_working_buttons(uid), _effective_links(uid), value.get("layout"))
+
+
+def _working_value(uid):
+    """The buttons value as it is right now (pending changes included), for previews."""
+    return {"items": _working_buttons(uid), "layout": _working_layout(uid)}
+
+
 def _commit_buttons(uid, items):
-    _set_draft(uid, "buttons", {"items": items})
+    _set_draft(uid, "buttons", {"items": items, "layout": _working_layout(uid)})
+
+
+def _commit_layout(uid, layout):
+    _set_draft(uid, "buttons", {"items": _working_buttons(uid), "layout": layout})
 
 
 def _next_button_id(items):
@@ -936,6 +1054,129 @@ def _pick_view(uid, section, action_prefix, title, items, note=""):
     rows = [[(f"{n}. {i['label']}"[:60], section, action_prefix, i["id"])] for n, i in enumerate(items, 1)]
     rows.append(_back(section))
     return (f"{title}{note}", _markup(uid, rows))
+
+
+_layout_sel = {}          # owner id -> the button currently selected in the Layout screen
+
+LAYOUT_GUIDE = (
+    "📘 How to arrange your /start buttons\n\n"
+    "Each line of buttons is a ROW. A row with one button is full width; with two or more they share the width.\n\n"
+    "1️⃣ Tap a button name to select it (it gets a 👉).\n"
+    "2️⃣ Use ⬆️ Row up / ⬇️ Row down to move its whole row higher or lower.\n"
+    "3️⃣ Use ◀️ Left / ▶️ Right to change its place inside the row.\n"
+    "4️⃣ Tap ⬛ Own row to make it full width on a new row.\n"
+    "5️⃣ Tap 🔗 Join row above to put it side by side with the row above (up to " + str(MAX_PER_ROW) + " per row).\n\n"
+    "⚡ Shortcut: 1 / 2 / 3 per row re-arranges everything at once, then fine-tune it with the steps above.\n"
+    "♻️ Default layout goes back to: Add me to group, then Help + Details, then Group + Channel.\n\n"
+    "Finish: tap 👁️ Preview to see exactly what users get, then 💾 Save. Nothing changes for users until you Save."
+)
+
+
+def _element_labels(uid):
+    labels = {i["id"]: i["label"] for i in _working_buttons(uid)}
+    for slot in LINK_SLOTS:
+        labels[f"link_{slot}"] = LINK_LABELS[slot]
+    return labels
+
+
+def _layout_view(uid, notice=""):
+    layout = _working_layout(uid)
+    labels = _element_labels(uid)
+    sel = _layout_sel.get(uid)
+    if not any(sel in row for row in layout):
+        sel = _layout_sel.pop(uid, None) and None
+    lines = "\n".join(f"Row {n}: " + "  |  ".join(labels.get(e, e) for e in row) for n, row in enumerate(layout, 1))
+    if sel:
+        step = f"Selected: {labels.get(sel, sel)}\nStep 2: move it with the arrows below, or tap it again to unselect."
+    else:
+        step = "Step 1: tap a button below to select it. Not sure how? Tap 📘 How to use."
+    text = ((notice + "\n\n") if notice else "") + f"🧩 Button Layout\n\nThis is how /start looks now:\n{lines}\n\n{step}\n\n{_status(uid, 'buttons')}"
+    rows = [[((("👉 " if e == sel else "") + labels.get(e, e))[:30], "buttons", "lsel", e) for e in row] for row in layout]
+    if sel:
+        rows += [[("⬆️ Row up", "buttons", "lup"), ("⬇️ Row down", "buttons", "ldn")],
+                 [("◀️ Left", "buttons", "lleft"), ("▶️ Right", "buttons", "lright")],
+                 [("⬛ Own row", "buttons", "lalone"), ("🔗 Join row above", "buttons", "ljoin")]]
+    rows += [[("1 per row", "buttons", "lp1"), ("2 per row", "buttons", "lp2"), ("3 per row", "buttons", "lp3")],
+             [("📘 How to use", "buttons", "lguide"), ("♻️ Default layout", "buttons", "lreset")],
+             [("👁️ Preview", "buttons", "preview"), ("💾 Save", "buttons", "save")],
+             [("↩️ Back", "buttons", "open")]]
+    return text, _markup(uid, rows)
+
+
+async def _layout_action(q, uid, action, arg):
+    if action == "layout":
+        await _answer(q)
+        await _show(q, *_layout_view(uid))
+        return
+    if action == "lguide":
+        await _answer(q)
+        await _show(q, LAYOUT_GUIDE, _markup(uid, [[("↩️ Back to Layout", "buttons", "layout")]]))
+        return
+    layout = [list(r) for r in _working_layout(uid)]
+    sel = _layout_sel.get(uid)
+    hint = " Move more, or tap 👁️ Preview, then 💾 Save."
+    if action == "lsel":
+        if arg == sel:
+            _layout_sel.pop(uid, None)
+        else:
+            _layout_sel[uid] = arg
+        await _answer(q)
+        await _show(q, *_layout_view(uid))
+        return
+    if action in ("lp1", "lp2", "lp3"):
+        n = int(action[2])
+        flat = [e for row in layout for e in row]
+        layout = [flat[k:k + n] for k in range(0, len(flat), n)]
+        notice = f"✅ Now {n} per row." + hint
+    elif action == "lreset":
+        layout = _resolve_layout(_working_buttons(uid), _effective_links(uid), None)
+        _layout_sel.pop(uid, None)
+        notice = "✅ Default layout restored." + hint
+    else:
+        pos = next(((r, row.index(sel)) for r, row in enumerate(layout) if sel in row), None) if sel else None
+        if pos is None:
+            await _answer(q, "Step 1: tap a button name first, then use the arrows.", True)
+            return
+        r, c = pos
+        row = layout[r]
+        if action in ("lup", "ldn"):
+            j = r - 1 if action == "lup" else r + 1
+            if not 0 <= j < len(layout):
+                await _answer(q, "That row is already at the " + ("top." if action == "lup" else "bottom."), True)
+                return
+            layout[r], layout[j] = layout[j], layout[r]
+            notice = "✅ Row moved." + hint
+        elif action in ("lleft", "lright"):
+            j = c - 1 if action == "lleft" else c + 1
+            if not 0 <= j < len(row):
+                await _answer(q, "It is already the " + ("first" if action == "lleft" else "last") + " button in its row.", True)
+                return
+            row[c], row[j] = row[j], row[c]
+            notice = "✅ Button moved." + hint
+        elif action == "lalone":
+            if len(row) == 1:
+                await _answer(q, "It is already alone on its row (full width).", True)
+                return
+            row.remove(sel)
+            layout.insert(r + 1, [sel])
+            notice = "✅ Now on its own row (full width)." + hint
+        elif action == "ljoin":
+            if r == 0:
+                await _answer(q, "There is no row above. Move it down first, or use ⬆️ Row up on another row.", True)
+                return
+            if len(layout[r - 1]) >= MAX_PER_ROW:
+                await _answer(q, f"The row above is full ({MAX_PER_ROW} buttons). Move one of them to another row first.", True)
+                return
+            row.remove(sel)
+            layout[r - 1].append(sel)
+            layout = [x for x in layout if x]
+            notice = "✅ Joined the row above." + hint
+        else:
+            await _answer(q, STALE_TEXT, True)
+            return
+    _commit_layout(uid, layout)
+    await _answer(q)
+    await _show(q, *_layout_view(uid, notice))
 
 
 def _reorder_view(uid):
@@ -950,6 +1191,9 @@ def _reorder_view(uid):
 
 async def _buttons_section(q, context, uid, action, arg):
     section = "buttons"
+    if action in ("layout", "lguide", "lsel", "lup", "ldn", "lleft", "lright", "lalone", "ljoin", "lp1", "lp2", "lp3", "lreset"):
+        await _layout_action(q, uid, action, arg)
+        return
     items = _working_buttons(uid)
     if action == "add":
         if len(items) >= MAX_BUTTONS:
@@ -1029,7 +1273,8 @@ async def _buttons_section(q, context, uid, action, arg):
         await _answer(q)
         theme_value = _draft(uid, "theme") or _saved.get("theme")
         text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value, q.from_user)
-        kb = start_keyboard_for(uid, {"items": items}, _effective_links(uid), theme_value, preview=True)
+        kb = start_keyboard_for(uid, _working_value(uid), _effective_links(uid), theme_value, preview=True,
+                                bot_username=getattr(q.message.get_bot(), "username", None))
         try:
             await q.message.reply_text("👁 Preview (not saved)\n\n" + (text if custom else html.escape(text)),
                                        parse_mode="HTML", reply_markup=kb, **_nopreview())
@@ -1041,7 +1286,8 @@ async def _buttons_section(q, context, uid, action, arg):
     elif action == "resetok":
         await _do_reset(q, uid, section, arg, "The start menu buttons")
     elif action == "save":
-        await _do_save(q, uid, section, lambda d: {"items": d["items"]})
+        await _do_save(q, uid, section, lambda d: {"items": d["items"], "layout": d.get("layout") if d.get("layout") is not None
+                                                  else _resolve_layout(d["items"], _saved.get("links"), None)})
     else:
         await _answer(q, STALE_TEXT, True)
 
@@ -1277,7 +1523,8 @@ async def _theme_section(q, context, uid, action, arg):
         theme_value = _draft(uid, section) or _saved.get(section)
         if which == "start":
             text, custom = start_text_for(_draft(uid, "welcome") or _saved.get("welcome"), theme_value, q.from_user)
-            kb = start_keyboard_for(uid, {"items": _working_buttons(uid)}, _effective_links(uid), theme_value, preview=True)
+            kb = start_keyboard_for(uid, _working_value(uid), _effective_links(uid), theme_value, preview=True,
+                                    bot_username=getattr(q.message.get_bot(), "username", None))
             try:
                 await q.message.reply_text("👁 Start menu preview (not saved)\n\n" + (text if custom else html.escape(text)),
                                            parse_mode="HTML", reply_markup=kb, **_nopreview())
@@ -1348,6 +1595,8 @@ def register(app):
             return bool(sender and message.chat and message.chat.type == "private" and _is_awaiting(sender.id))
 
     app.add_handler(CallbackQueryHandler(theme_callback, pattern=r"^theme:"))
+    app.add_handler(CallbackQueryHandler(links_callback, pattern=r"^tlinks:"))
+    app.add_handler(CallbackQueryHandler(details_callback, pattern=r"^tdetails$"))
     app.add_handler(MessageHandler(_AwaitingInput() & (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
                                    theme_input))
     app.add_handler(CommandHandler("about", about_command))
