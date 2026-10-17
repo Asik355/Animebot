@@ -63,7 +63,14 @@ LINK_SLOTS = ("channel", "group", "website")
 LINK_LABELS = {"channel": "📢 Channel", "group": "👥 Group", "website": "🌐 Website"}
 LINK_WORDS = {"channel": "Channel", "group": "Group", "website": "Website/Social"}
 LINK_PLURAL = {"channel": "Channels", "group": "Groups", "website": "Websites / Social"}
-MAX_LINKS_PER_SLOT = 8               # e.g. Channel One ... Channel Eight
+MAX_LINKS_PER_SLOT = 8
+# Ready-made Group / Channel lists, used until the Owner saves their own Links (the Links panel shows them; press
+# Save once to keep them, or change them first). Saving an empty list removes them.
+DEFAULT_LINKS = {
+    "group": [{"label": "👥 Wonderland Anime gc", "url": "https://t.me/WONDERLAND_anime_gc"},
+              {"label": "👥 The Ravagers", "url": "https://t.me/The_Ravagers"}],
+    "channel": [{"label": "📢 Anime Grabber Updates", "url": "https://t.me/grab_anime_update"}],
+}               # e.g. Channel One ... Channel Eight
 
 # Telegram cannot colour inline buttons, so themes are fixed presets: a decorative frame + the emoji of the default
 # labels. "classic" is the built-in look and changes nothing.
@@ -489,6 +496,10 @@ def _with_greeting(text, user):
     return f"🌸 HEY {html.escape(name, quote=False)}! 🎉\n\n{text}"
 
 
+_NAME_LINE = re.compile(r"\A\s*👤[^\n]*\{(?:first|firstname|first_name|last|lastname|last_name|name|fullname|full_name|user|display|username|mention)\}[^\n]*\n+",
+                        re.I)
+
+
 def start_text_for(welcome_value, theme_value, user=None):
     """
     -> (text, is_custom_html). Without a saved welcome this is the existing /start text, word for word.
@@ -496,6 +507,8 @@ def start_text_for(welcome_value, theme_value, user=None):
     """
     custom = bool(welcome_value and welcome_value.get("text"))
     base = welcome_value["text"] if custom else _deps["default_start_text"]
+    if custom:
+        base = _NAME_LINE.sub("", base, count=1)       # the name is shown once, in the greeting - drop a leading "👤 ... {first} ..." line
     if custom and user is not None:
         base = render_user_text(_with_greeting(base, user), user)
     return _frame(base, _preset(theme_value, "start")), custom
@@ -566,7 +579,7 @@ async def send_start(update, context):
         header = _deps.get("add_header")
         if header and not custom:       # a custom welcome already greets the user by name: no second "👤 Name" line
             text = header(msg, text)
-        keyboard = start_keyboard_for(user.id, _saved.get("buttons"), _saved.get("links"), _saved.get("theme"),
+        keyboard = start_keyboard_for(user.id, _saved.get("buttons"), _links_saved(), _saved.get("theme"),
                                       bot_username=getattr(msg.get_bot(), "username", None))
         parse = "HTML" if custom else None
         bot, chat_id = msg.get_bot(), msg.chat_id
@@ -603,7 +616,7 @@ async def links_callback(update, context):
         if action not in LINK_SLOTS:
             await q.answer()
             return
-        entries = _slot_links(_saved.get("links"), action)
+        entries = _slot_links(_links_saved(), action)
         if not entries:
             await q.answer(f"No {LINK_PLURAL[action].lower()} have been added yet.", show_alert=True)
             return
@@ -755,9 +768,15 @@ def panel_view(uid, section, notice=""):
     return text, _markup(uid, rows)
 
 
+def _links_saved():
+    """The links users see: the saved ones, or the ready-made defaults until the Owner saves their own."""
+    value = _saved.get("links")
+    return copy.deepcopy(DEFAULT_LINKS) if value is None else value
+
+
 def _effective_links(uid):
     d = _draft(uid, "links")
-    return d if d is not None else (_saved.get("links") or {})
+    return d if d is not None else _links_saved()
 
 
 def _confirm_view(uid, section, op, question, arg=None):
@@ -1287,7 +1306,7 @@ async def _buttons_section(q, context, uid, action, arg):
         await _do_reset(q, uid, section, arg, "The start menu buttons")
     elif action == "save":
         await _do_save(q, uid, section, lambda d: {"items": d["items"], "layout": d.get("layout") if d.get("layout") is not None
-                                                  else _resolve_layout(d["items"], _saved.get("links"), None)})
+                                                  else _resolve_layout(d["items"], _links_saved(), None)})
     else:
         await _answer(q, STALE_TEXT, True)
 
