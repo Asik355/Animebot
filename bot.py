@@ -1472,7 +1472,7 @@ HELP_MODULES = {
              ("/leavegroup", "In PM: /leavegroup <group_chat_id> — remove the group and leave it"),
              ("/status", "Bot status and active spawns"),
              ("/gstats", "View bot group statistics"),
-             ("/cooldown", "View character cooldowns for this group (group only)")])),
+             ("/cooldown", "View character cooldowns for a group (in PM: all groups, or /cooldown <group_id>)")])),
         ("characters", "🎴 Characters", _help_page(
             "🎴 Characters (Owner only)",
             "Spawn, gift, discontinue and delete characters.",
@@ -2212,6 +2212,14 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
         if chat_id in active:
             return False, "❌ A character is already spawned in this chat."
 
+        # Owner /callcharacter cannot exceed the daily high-rank limit (the gap is not checked; it resets after the call).
+        if spawned_by == "owner_callchar" and character is not None and character[3] in ("Legendary", "Mythical", "Celestial"):
+            _lims = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
+            _counts = await asyncio.to_thread(_successful_global_quota_counts, None, get_high_rank_today_key())
+            if _counts.get(character[3], 0) >= _lims[character[3]]:
+                return False, (f"❌ Today's global {character[3]} limit ({_lims[character[3]]}) has been reached.\n"
+                               "Call character is not possible until the 12:00 AM IST reset.")
+
         # Evolution characters are obtained ONLY by evolving: never spawn one (checked by character type, not name/code).
         if character is not None and await asyncio.to_thread(mongo_db.is_evolution_character, character[0]):
             if not random_spawn:
@@ -2359,6 +2367,12 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
             (await asyncio.to_thread(_set_high_rarity_spacing_target, character[3]))
         release_high_rarity_spacing(app, character[3])
         release_random_spawn_reservation(app, chat_id, character_code)
+    elif spawned_by == "owner_callchar" and character[3] in ("Legendary", "Mythical", "Celestial"):
+        # Owner-called high-rank spawns count in daily totals (via history) and reset the gap like a normal one.
+        try:
+            (await asyncio.to_thread(_set_high_rarity_spacing_target, character[3]))
+        except Exception as e:
+            print("Owner call spacing error:", e)
     return True, ""
 
 async def safe_delete_message(bot, chat_id, message_id):
@@ -2753,18 +2767,11 @@ async def spawn(update, context):
         datetime.now() + timedelta(seconds=AUTO_SPAWN_INTERVAL)
     )
 
-async def cooldown(update, context):
-    """Show this group's auto-spawn/life state and up to 10 character cooldowns (Owner only)."""
-    if not is_owner(update.effective_user.id):
-        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
-        return
-    if not await require_group_spawn(update):
-        return
-    chat_id = update.effective_chat.id
+async def build_cooldown_text(app, chat_id, user_id, title=None, personal=True):
     now_dt = datetime.now()
 
     # Current character life for this exact group.
-    active = context.application.bot_data.setdefault("active_spawns", {}).get(chat_id)
+    active = app.bot_data.setdefault("active_spawns", {}).get(chat_id)
     life_text = "No character currently spawned"
     if active:
         expires = active.get("expires_at")
@@ -2775,17 +2782,17 @@ async def cooldown(update, context):
             life_text = "Character currently spawned"
 
     # Personal and group /spawn cooldowns.
-    last_calls = context.application.bot_data.setdefault("last_calls", {})
-    personal_remaining = (personal_spawn_cooldown(update.effective_user.id) - (now_dt - last_calls[update.effective_user.id]).total_seconds()
-                          if update.effective_user.id in last_calls else 0)
+    last_calls = app.bot_data.setdefault("last_calls", {})
+    personal_remaining = (personal_spawn_cooldown(user_id) - (now_dt - last_calls[user_id]).total_seconds()
+                          if user_id in last_calls else 0)
     personal_text = format_duration(personal_remaining) if personal_remaining > 0 else "Ready"
 
-    group_until = context.application.bot_data.setdefault("chat_spawn_cooldowns", {}).get(chat_id)
+    group_until = app.bot_data.setdefault("chat_spawn_cooldowns", {}).get(chat_id)
     group_remaining = (group_until - now_dt).total_seconds() if group_until else 0
     group_text = format_duration(group_remaining) if group_remaining > 0 else "Ready"
 
     # Next auto-spawn for this exact group.
-    next_auto = context.application.bot_data.setdefault("next_auto_spawn_at", {}).get(chat_id)
+    next_auto = app.bot_data.setdefault("next_auto_spawn_at", {}).get(chat_id)
     if next_auto is None:
         auto_text = "not scheduled yet"
     else:
@@ -2814,13 +2821,54 @@ async def cooldown(update, context):
         except Exception:
             continue
 
-    text = (f"⏳ <b>Spawn Cooldown</b>\n\n"
+    text = (f"⏳ <b>{html_escape(title) if title else 'Spawn Cooldown'}</b>\n\n"
             f"🤖 Auto Spawn: <b>{auto_text}</b>\n"
             f"❤️ Character Life: <b>{html_escape(life_text)}</b>\n"
-            f"👤 Your /spawn: <b>{personal_text}</b>\n"
-            f"🏠 Group /spawn: <b>{group_text}</b>\n\n"
+            + (f"👤 Your /spawn: <b>{personal_text}</b>\n" if personal else "")
+            + f"🏠 Group /spawn: <b>{group_text}</b>\n\n"
             "🎴 <b>Character Cooldowns</b>\n")
     text += "\n".join(rows) if rows else "• No character is currently on cooldown. All characters are eligible."
+    return text
+
+async def cooldown(update, context):
+    """Show a group's auto-spawn/life state and up to 10 character cooldowns (Owner only; works in PM too)."""
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
+        return
+    user_id = update.effective_user.id
+    if is_group_chat(update):
+        chat_id = update.effective_chat.id
+    else:
+        arg = (context.args[0] if getattr(context, "args", None) else "").strip()
+        if not arg.lstrip("-").isdigit():
+            # PM overview: your own /spawn cooldown + every group's cooldowns and character life.
+            app = context.application
+            groups = (await asyncio.to_thread(load_bot_groups)) or {}
+            now_dt = datetime.now()
+            last = app.bot_data.setdefault("last_calls", {}).get(user_id)
+            rem = (personal_spawn_cooldown(user_id) - (now_dt - last).total_seconds()) if last else 0
+            blocks = [f"⏳ <b>All Cooldowns</b>\n\n👤 Your /spawn: <b>{format_duration(rem) if rem > 0 else 'Ready'}</b>"]
+            if not groups:
+                blocks.append("No groups registered yet.")
+            for gid, info in groups.items():
+                if not str(gid).lstrip("-").isdigit():
+                    continue
+                gtitle = (info or {}).get("title") or (info or {}).get("username") or f"Group {gid}"
+                try:
+                    blocks.append(await build_cooldown_text(app, int(gid), user_id, title=f"{gtitle} ({gid})", personal=False))
+                except Exception as e:
+                    print("Cooldown overview error:", e)
+            chunk = ""
+            for block in blocks:
+                if chunk and len(chunk) + len(block) + 2 > 3900:
+                    await safe_reply_text(update.message, chunk, parse_mode="HTML")
+                    chunk = ""
+                chunk = f"{chunk}\n\n{block}" if chunk else block
+            if chunk:
+                await safe_reply_text(update.message, chunk, parse_mode="HTML")
+            return
+        chat_id = int(arg)
+    text = await build_cooldown_text(context.application, chat_id, user_id)
     await safe_reply_text(update.message, text, parse_mode="HTML")
 
 async def clearspawn(update, context):
@@ -2992,12 +3040,7 @@ async def callchar_group_step(update, context):
         if group_id in active:
             await safe_reply_text(update.effective_message, "❌ A character is already spawned in that group.")
             return ConversationHandler.END
-        success, reason = await spawn_reserved(group_id, context, character, "owner_callchar")
-        if not success:
-            await safe_reply_text(update.effective_message, reason)
-            return ConversationHandler.END
-        context.application.bot_data.setdefault("active_chats", set()).add(group_id)
-        await safe_reply_text(update.effective_message, f"✅ Character called successfully.\n🎭 {character[1]} [{character[0]}]\n🆔 Group ID: {group_id}")
+        await callchar_ask_confirm(update.effective_message, context, group_id, character, update.effective_user.id)
     except Exception as e:
         print("PM callchar error:", e)
         await safe_reply_text(update.effective_message, "❌ Could not call the character to that group. Check the Group ID and bot permissions.")
@@ -3040,18 +3083,79 @@ async def callchar(update, context):
         return
 
     try:
-        success, reason = await spawn_reserved(chat_id, context, character, "owner_callchar")
+        await callchar_ask_confirm(update.effective_message, context, chat_id, character, update.effective_user.id)
+    except Exception as e:
+        print("Callchar confirm prompt error:", e)
+        await tell("⚠️ Could not open the confirmation. Please try again.")
+    return ConversationHandler.END
+
+async def callchar_ask_confirm(message, context, group_id, character, owner_id):
+    """Ask the Owner to confirm before an owner call actually spawns the character."""
+    import uuid as _uuid
+    token = _uuid.uuid4().hex[:8]
+    pending = context.application.bot_data.setdefault("callchar_pending", {})
+    if len(pending) > 50:
+        pending.pop(next(iter(pending)), None)
+    pending[token] = {"group_id": int(group_id), "code": str(character[0]), "owner_id": int(owner_id)}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data=f"cc:{token}:y"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"cc:{token}:n"),
+    ]])
+    await safe_reply_text(
+        message,
+        f"⚠️ Call this character?\n🎭 {character[1]} [{character[0]}] — {character[3]}\n🆔 Group ID: {group_id}\n\nPress Confirm to spawn it, or Cancel to stop.",
+        reply_markup=keyboard,
+    )
+
+async def callchar_confirm_callback(update, context):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await deny_callback(query)
+        return
+    try:
+        _, token, choice = query.data.split(":")
+    except ValueError:
+        await query.answer()
+        return
+    info = context.application.bot_data.setdefault("callchar_pending", {}).pop(token, None)
+    if not info:
+        await query.answer("This request has expired. Use /callcharacter again.", show_alert=True)
+        try:
+            await query.edit_message_text("⌛ This call request has expired.")
+        except Exception:
+            pass
+        return
+    if choice != "y":
+        await query.answer("Cancelled")
+        try:
+            await query.edit_message_text("❌ Call cancelled. Nothing was spawned.")
+        except Exception:
+            pass
+        return
+    await query.answer("Calling…")
+    group_id = info["group_id"]
+    character = await asyncio.to_thread(get_character, info["code"])
+    if not character:
+        await query.edit_message_text("❌ Character not found.")
+        return
+    active = context.application.bot_data.setdefault("active_spawns", {})
+    if group_id in active:
+        await query.edit_message_text("❌ A character is already spawned in that group.")
+        return
+    try:
+        success, reason = await spawn_reserved(group_id, context, character, "owner_callchar")
     except Exception as e:
         print("Callchar spawn error:", e)
-        await tell("⚠️ Character could not be delivered. Please try again.")
+        await query.edit_message_text("⚠️ Character could not be delivered. Please try again.")
         return
-
     if not success:
-        await tell(reason or "⚠️ Character could not be delivered. Please try again.")
+        await query.edit_message_text(reason or "⚠️ Character could not be delivered. Please try again.")
         return
-
-    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
-    return ConversationHandler.END
+    context.application.bot_data.setdefault("active_chats", set()).add(group_id)
+    try:
+        await query.edit_message_text(f"✅ Character called successfully.\n🎭 {character[1]} [{character[0]}]\n🆔 Group ID: {group_id}")
+    except Exception:
+        pass
 
 async def add(update, context):
     (await save_user_async(update.effective_user))
@@ -7295,11 +7399,8 @@ def get_today_group_spawn_tracking():
             continue
     return tracking
 
-async def status(update, context):
-    if not is_owner(update.effective_user.id):
-        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
-        return
-    active = context.application.bot_data.setdefault("active_spawns", {})
+async def build_status_lines(app):
+    active = app.bot_data.setdefault("active_spawns", {})
     users = (await asyncio.to_thread(mongo_db.count_users))
     characters = (await asyncio.to_thread(mongo_db.count_characters))
     catches = (await asyncio.to_thread(mongo_db.count_collections))
@@ -7315,7 +7416,7 @@ async def status(update, context):
 
     # High-rank tracking is shown first and refreshed every time /status is opened.
     high_counts = (await asyncio.to_thread(_successful_global_quota_counts, None, get_high_rank_today_key()))
-    high_gap, celestial_gap = (await asyncio.to_thread(_get_random_spawn_high_rarity_gaps, context.application))
+    high_gap, celestial_gap = (await asyncio.to_thread(_get_random_spawn_high_rarity_gaps, app))
     high_target, celestial_target = (await asyncio.to_thread(_get_high_rarity_spacing_targets))
     lines += [
         "💎 High-Rank Spawn Tracking:",
@@ -7374,33 +7475,68 @@ async def status(update, context):
         for chat_id, sp in list(active.items())[:10]:
             remaining = max(0, int((sp["expires_at"] - datetime.now()).total_seconds()))
             lines.append(f"• Chat {chat_id}: {sp['name']} [{sp['rarity']}] — {format_duration(remaining)} left")
-    if update.effective_chat.type != "private":
-        chunks = []
-        current = ""
-        for line in lines:
-            while len(line) > 4000:
-                if current:
-                    chunks.append(current)
-                    current = ""
-                chunks.append(line[:4000])
-                line = line[4000:]
-            candidate = f"{current}\n{line}" if current else line
-            if len(candidate) > 4000:
+    return lines
+
+STATUS_REFRESH_MARKUP = InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="status:refresh")]])
+
+def _chunk_status_lines(lines, limit=4000):
+    chunks, current = [], ""
+    for line in lines:
+        while len(line) > limit:
+            if current:
                 chunks.append(current)
-                current = line
-            else:
-                current = candidate
-        if current:
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit:
             chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+async def status(update, context):
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+    lines = await build_status_lines(context.application)
+    chunks = _chunk_status_lines(lines)
+    if update.effective_chat.type != "private":
         try:
-            for chunk in chunks:
-                await context.bot.send_message(chat_id=update.effective_user.id, text=chunk)
+            for i, chunk in enumerate(chunks):
+                await context.bot.send_message(chat_id=update.effective_user.id, text=chunk,
+                                               reply_markup=STATUS_REFRESH_MARKUP if i == len(chunks) - 1 else None)
         except (Forbidden, BadRequest):
             await safe_reply_text(update.message, "📩 I couldn't message you privately. Open a private chat with me, press Start, then run /status again.")
             return
         await safe_reply_text(update.message, "📩 Opened in your private chat.")
         return
-    await safe_reply_text(update.message, "\n".join(lines))
+    for i, chunk in enumerate(chunks):
+        await safe_reply_text(update.message, chunk, reply_markup=STATUS_REFRESH_MARKUP if i == len(chunks) - 1 else None)
+
+async def status_refresh_callback(update, context):
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        await deny_callback(query)
+        return
+    lines = await build_status_lines(context.application)
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = _chunk_status_lines(lines)[0] + "\n… (use /status for the full list)"
+    try:
+        await query.edit_message_text(text, reply_markup=STATUS_REFRESH_MARKUP)
+        await query.answer("🔄 Refreshed")
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            await query.answer("✅ Already up to date")
+        else:
+            print("Status refresh error:", e)
+            await query.answer("⚠️ Could not refresh. Use /status.", show_alert=True)
+    except Exception as e:
+        print("Status refresh error:", e)
 
 async def event(update, context):
     (await save_user_async(update.effective_user))
@@ -9797,7 +9933,7 @@ COMMANDS = {
     "exchange": "Exchange a character for another character of the same tier",
     "guess_num": "Start a Guess the Number game",
     "nguess": "Guess a number and win 150 Berrys",
-    "cooldown": "View character cooldowns for this group",
+    "cooldown": "View character cooldowns for a group (works in PM)",
     "scout": "View the Scout list",
     "scouts": "View the Scout list",
     "cancel": "Cancel current action",
@@ -10602,6 +10738,8 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("removescout", removescout))
     app.add_handler(CommandHandler("history", history))
     app.add_handler(CommandHandler("status", status))
+    app.add_handler(CallbackQueryHandler(callchar_confirm_callback, pattern=r"^cc:[0-9a-f]{8}:[yn]$"))
+    app.add_handler(CallbackQueryHandler(status_refresh_callback, pattern=r"^status:refresh$"))
     app.add_handler(CommandHandler("gstats", gstats))
     app.add_handler(CommandHandler("approve", approve_group))
     app.add_handler(CommandHandler("removeapprove", remove_approval))

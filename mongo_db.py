@@ -1697,6 +1697,9 @@ def get_active_character_cooldowns(duration_seconds, now=None):
 SH = "spawn_history_v2"
 RANDOM_SPAWN = ["auto_spawn", "manual_spawn"]
 _RANDOM = {"$in": RANDOM_SPAWN}
+# Spawns that count toward daily totals / high-rank gaps: random spawns plus Owner /callcharacter.
+COUNTED_SPAWN = RANDOM_SPAWN + ["owner_callchar"]
+_COUNTED = {"$in": COUNTED_SPAWN}
 
 
 @retry_write
@@ -1752,7 +1755,7 @@ def sh_pending_expiry_rows():
 
 @retry_read
 def sh_recent_codes(cutoff):
-    return {str(d) for d in col(SH).distinct("character_code", {"spawned_by": _RANDOM, "spawned_at": {"$gte": cutoff}})}
+    return {str(d) for d in col(SH).distinct("character_code", {"spawned_by": _COUNTED, "spawned_at": {"$gte": cutoff}})}
 
 
 @retry_read
@@ -1771,7 +1774,7 @@ def sh_caught_random_rows(date_floor):
 
 @retry_read
 def sh_rarity_rows(date_floor, rarities):
-    cur = col(SH).find({"spawned_by": _RANDOM, "rarity": {"$in": list(rarities)}, "spawned_at": {"$gte": date_floor}},
+    cur = col(SH).find({"spawned_by": _COUNTED, "rarity": {"$in": list(rarities)}, "spawned_at": {"$gte": date_floor}},
                        {"rarity": 1, "spawned_at": 1})
     return [(d["rarity"], d["spawned_at"]) for d in cur]
 
@@ -1779,19 +1782,19 @@ def sh_rarity_rows(date_floor, rarities):
 @retry_read
 def sh_last_spawn(rarities, since):
     """Most recent random spawn (by spawned_at, then id) of the given rarities since `since`."""
-    d = col(SH).find_one({"spawned_by": _RANDOM, "rarity": {"$in": list(rarities)}, "spawned_at": {"$gte": since}},
+    d = col(SH).find_one({"spawned_by": _COUNTED, "rarity": {"$in": list(rarities)}, "spawned_at": {"$gte": since}},
                          {"spawned_at": 1}, sort=[("spawned_at", DESCENDING), ("_id", DESCENDING)])
     return (d["_id"], d["spawned_at"]) if d else None
 
 
 @retry_read
 def sh_count_random_since(since):
-    return col(SH).count_documents({"spawned_by": _RANDOM, "spawned_at": {"$gte": since}})
+    return col(SH).count_documents({"spawned_by": _COUNTED, "spawned_at": {"$gte": since}})
 
 
 @retry_read
 def sh_count_random_after(since, after_at, exclude_id):
-    return col(SH).count_documents({"spawned_by": _RANDOM, "spawned_at": {"$gte": since, "$gt": after_at},
+    return col(SH).count_documents({"spawned_by": _COUNTED, "spawned_at": {"$gte": since, "$gt": after_at},
                                     "_id": {"$ne": int(exclude_id)}})
 
 
@@ -1799,7 +1802,7 @@ def sh_count_random_after(since, after_at, exclude_id):
 def sh_chat_recent(chat_id, limit=10):
     """[(character_code, rarity, last_spawned_at)] newest first, one row per character (cooldown view)."""
     best = {}
-    for d in col(SH).find({"chat_id": int(chat_id), "spawned_by": _RANDOM}, {"character_code": 1, "rarity": 1, "spawned_at": 1}):
+    for d in col(SH).find({"chat_id": int(chat_id), "spawned_by": _COUNTED}, {"character_code": 1, "rarity": 1, "spawned_at": 1}):
         code = d["character_code"]
         if code not in best or (d.get("spawned_at") or "") >= (best[code][2] or ""):
             best[code] = (code, d.get("rarity"), d.get("spawned_at"))
@@ -1823,7 +1826,7 @@ def sh_day_rows(day_key):
 @retry_read
 def sh_day_rarity_counts(day_key):
     return {d["_id"]: int(d["n"]) for d in col(SH).aggregate([
-        {"$match": {"spawned_by": _RANDOM, "spawned_at": {"$regex": "^" + re.escape(day_key)}}},
+        {"$match": {"spawned_by": _COUNTED, "spawned_at": {"$regex": "^" + re.escape(day_key)}}},
         {"$group": {"_id": "$rarity", "n": {"$sum": 1}}}])}
 
 

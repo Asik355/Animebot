@@ -77,6 +77,9 @@ TASK_ORDER = ("catch", "epic", "legendary", "mythical", "celestial", "sell", "ad
 REWARDS = {t[0]: t[4] for t in CATCH_TASKS}
 REWARDS["sell"] = SELL_REWARD
 REWARDS["add"] = ADD_REWARD
+# Collection Add resets DAILY (02:00 AM IST); every other task resets WEEKLY (Monday 02:00 AM IST).
+DAILY_KEYS = ("add",)
+WEEKLY_KEYS = tuple(k for k in TASK_ORDER if k not in DAILY_KEYS)
 TITLES = {t[0]: f"{t[1]} {t[2]}" for t in CATCH_TASKS}
 TITLES["sell"] = "⚪🔵 Sell 15 Common + 5 Rare Characters"
 TITLES["add"] = "📚 Collection Add Task"
@@ -101,6 +104,33 @@ def current_day_key(now=None):
     ist = (now or _now()).astimezone(IST)
     day = ist.date() if ist.hour >= RESET_HOUR_IST else (ist - timedelta(days=1)).date()
     return day.isoformat()
+
+
+def current_week_key(now=None):
+    """Monday (YYYY-MM-DD) of the current IST task week; the week rolls over Monday 02:00 AM IST."""
+    day = datetime.fromisoformat(current_day_key(now)).date()
+    return (day - timedelta(days=day.weekday())).isoformat()
+
+
+def next_weekly_reset(now=None):
+    """The next Monday 02:00 AM IST moment (timezone-aware)."""
+    ist = (now or _now()).astimezone(IST)
+    monday = datetime.fromisoformat(current_week_key(now)).date() + timedelta(days=7)
+    return datetime(monday.year, monday.month, monday.day, RESET_HOUR_IST, tzinfo=IST)
+
+
+def _fmt_secs(secs):
+    secs = max(0, int(secs))
+    days, rem = divmod(secs, 86400)
+    hours, minutes = rem // 3600, (rem % 3600) // 60
+    if days == 0 and hours == 0 and minutes == 0:
+        return "less than 1m"
+    return (f"{days}d " if days else "") + f"{hours}h {minutes}m"
+
+
+def format_weekly_countdown(now=None):
+    now = now or _now()
+    return _fmt_secs((next_weekly_reset(now) - now.astimezone(IST)).total_seconds())
 
 
 def next_reset(now=None):
@@ -136,10 +166,15 @@ def _task_id(user_id, day):
     return f"{int(user_id)}:{day}"
 
 
+def _week_id(user_id, week):
+    return f"{int(user_id)}:W{week}"
+
+
 def _purge_expired(day):
     """Permanently drop previous days' tasks/targets (they can never be claimed again anyway)."""
     try:
         _tasks().delete_many({"day": {"$lt": day}})
+        _tasks().delete_many({"week": {"$lt": current_week_key()}})
         mongo_db.col(DAILY_COL).delete_many({"_id": {"$lt": day}})
     except Exception as e:
         logger.warning("stone task purge failed: %s", e)
@@ -175,14 +210,22 @@ def get_targets(day=None):
     return list(codes)
 
 
-def _bump(user_id, incs):
-    """Atomic progress increment on today's document (created on first use)."""
-    day = current_day_key()
-    _tasks().update_one(
-        {"_id": _task_id(user_id, day)},
-        {"$setOnInsert": {"user_id": int(user_id), "day": day}, "$inc": incs},
-        upsert=True,
-    )
+def _bump(user_id, daily_incs=None, weekly_incs=None):
+    """Atomic progress increments: daily doc (Collection Add) and weekly doc (all other tasks)."""
+    if daily_incs:
+        day = current_day_key()
+        _tasks().update_one(
+            {"_id": _task_id(user_id, day)},
+            {"$setOnInsert": {"user_id": int(user_id), "day": day}, "$inc": daily_incs},
+            upsert=True,
+        )
+    if weekly_incs:
+        week = current_week_key()
+        _tasks().update_one(
+            {"_id": _week_id(user_id, week)},
+            {"$setOnInsert": {"user_id": int(user_id), "week": week}, "$inc": weekly_incs},
+            upsert=True,
+        )
 
 
 def record_catch_sync(user_id, rarity, code):
@@ -191,9 +234,8 @@ def record_catch_sync(user_id, rarity, code):
     key = _RARITY_KEYS.get(str(rarity or "").strip().lower())
     if key:
         incs[f"progress.{key}"] = 1
-    if str(code) in get_targets():
-        incs["progress.add"] = 1   # caught one of today's targets via /add
-    _bump(user_id, incs)
+    daily = {"progress.add": 1} if str(code) in get_targets() else None   # caught one of today's targets via /add
+    _bump(user_id, daily, incs)
 
 
 def record_sell_sync(user_id, rarity, quantity):
@@ -202,7 +244,7 @@ def record_sell_sync(user_id, rarity, quantity):
     rarity = str(rarity or "").strip().lower()
     if quantity <= 0 or rarity not in ("common", "rare"):
         return
-    _bump(user_id, {f"progress.sell_{rarity}": quantity})
+    _bump(user_id, None, {f"progress.sell_{rarity}": quantity})
 
 
 async def record_catch(user_id, rarity, code):
@@ -224,9 +266,10 @@ async def record_sell(user_id, rarity, quantity):
 # --------------------------------------------------------------------------
 # Completion rules (single source of truth, used by the UI and by the claim filters)
 # --------------------------------------------------------------------------
-def _claim_filter(user_id, day, key):
+def _claim_filter(user_id, day, key, week=None):
     """Mongo filter that matches ONLY if the task is completed AND not yet claimed."""
-    flt = {"_id": _task_id(user_id, day), f"claimed.{key}": {"$ne": True}}
+    doc_id = _task_id(user_id, day) if key in DAILY_KEYS else _week_id(user_id, week or current_week_key())
+    flt = {"_id": doc_id, f"claimed.{key}": {"$ne": True}}
     if key == "sell":
         flt["progress.sell_common"] = {"$gte": SELL_COMMON_NEEDED}
         flt["progress.sell_rare"] = {"$gte": SELL_RARE_NEEDED}
@@ -242,6 +285,7 @@ def claim_all_sync(user_id):
     """
     user_id = int(user_id)
     day = current_day_key()
+    week = current_week_key()
     if mongo_db.col(USERS_COL).find_one({"_id": user_id}, {"_id": 1}) is None:
         return {"status": "nouser", "keys": [], "stones": 0, "balance": 0}
 
@@ -249,7 +293,7 @@ def claim_all_sync(user_id):
         keys, total = [], 0
         for key in TASK_ORDER:
             res = _tasks().update_one(
-                _claim_filter(user_id, day, key), {"$set": {f"claimed.{key}": True}}, session=session
+                _claim_filter(user_id, day, key, week), {"$set": {f"claimed.{key}": True}}, session=session
             )
             if res.modified_count == 1:          # we (and only we) flipped it -> we pay it
                 keys.append(key)
@@ -290,9 +334,12 @@ def build_view_sync(user_id, now=None):
     """The one-message /stonetask text for this user (only their own progress)."""
     now = now or _now()
     day = current_day_key(now)
-    doc = _tasks().find_one({"_id": _task_id(user_id, day)}) or {}
-    prog = doc.get("progress", {}) or {}
-    claimed = doc.get("claimed", {}) or {}
+    ddoc = _tasks().find_one({"_id": _task_id(user_id, day)}) or {}
+    wdoc = _tasks().find_one({"_id": _week_id(user_id, current_week_key(now))}) or {}
+    prog = dict(wdoc.get("progress", {}) or {})
+    prog.update(ddoc.get("progress", {}) or {})
+    claimed = dict(wdoc.get("claimed", {}) or {})
+    claimed.update(ddoc.get("claimed", {}) or {})
     targets = get_targets(day)
 
     def status(key, done):
@@ -300,7 +347,7 @@ def build_view_sync(user_id, now=None):
             return "🎁 Claimed"
         return "✅ Complete" if done else "🔒 In Progress"
 
-    lines = ["💎 TODAY'S STONE TASKS", ""]
+    lines = ["💎 STONE TASKS", "📚 Collection Add resets daily • all other tasks reset weekly", ""]
     for key in TASK_ORDER:
         reward = REWARDS[key]
         stone_word = "Stone" if reward == 1 else "Stones"
@@ -317,7 +364,7 @@ def build_view_sync(user_id, now=None):
             n = min(int(prog.get(key, 0)), NEEDED[key])
             done = n >= NEEDED[key]
             progress = f"{n}/{NEEDED[key]}"
-        lines.append(TITLES[key])
+        lines.append(TITLES[key] + (" (Daily)" if key in DAILY_KEYS else " (Weekly)"))
         if key == "add":
             lines.append(f"Target: {_target_text(targets) if targets else 'No target available today'}")
             lines.append("Catch any ONE of them with /add")
@@ -326,7 +373,8 @@ def build_view_sync(user_id, now=None):
         lines.append(status(key, done and (key != "add" or bool(targets))))
         lines.append("")
     lines.append(f"💎 Your Special Stones: {get_balance_sync(user_id)}")
-    lines.append(f"🔄 Reset in: {format_countdown(now)}")
+    lines.append(f"🔄 Collection Add resets in: {format_countdown(now)}")
+    lines.append(f"🔄 Weekly tasks reset in: {format_weekly_countdown(now)}")
     return "\n".join(lines)
 
 
@@ -335,7 +383,7 @@ def claim_text(result):
         return "❌ Please use /start first."
     if result["status"] == "nothing":
         return ("❌ No completed tasks to claim right now.\n"
-                "Finish a task first - rewards must be claimed before the 2:00 AM IST reset.")
+                "Finish a task first - rewards must be claimed before the 2:00 AM IST reset (weekly tasks: Monday).")
     lines = ["💎 STONES CLAIMED!", ""]
     for key in result["keys"]:
         lines.append(f"{TITLES[key]}: +{REWARDS[key]}")
