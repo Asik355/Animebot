@@ -2392,8 +2392,8 @@ def dt_notice_text(mission, now=None):
     return ("🎉 Mission Complete!\n\n"
             f"{mission.emoji} {mission.name}\n\n"
             f"💰 Reward: {mission.reward:,} Berrys\n\n"
-            "👇 Tap CLAIM BERRYS to collect it before the reset.\n"
-            f"⏳ Reset in: {_dt_countdown(now)}")
+            "👇 Tap CLAIM BERRYS to collect it.\n"
+            f"⌛ Unclaimed rewards expire in {_dt_countdown(now)} (daily reset).")
 
 
 def dt_claim_text(result):
@@ -2411,7 +2411,7 @@ def dt_claim_text(result):
 
 def _dt_keyboard(user_id, back=True):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    rows = [[InlineKeyboardButton("💰 CLAIM BERRYS", callback_data=f"dtask:claim:{int(user_id)}")]]
+    rows = [[InlineKeyboardButton("💰 CLAIM BERRYS", callback_data=f"dtask:claim:{int(user_id)}:{_dt_day_key()}")]]
     if back:
         cb = _dt_deps.get("back_callback") or f"dailytask:back:{int(user_id)}"
         rows.append([InlineKeyboardButton("⬅️ Back", callback_data=cb)])
@@ -2469,6 +2469,7 @@ def dt_build_view_sync(user_id, now=None):
               f"💰 Rewards Earned: {earned:,} / {TOTAL_REWARD:,} Berrys"]
     if ready:
         lines.append(f"🎁 Ready to Claim: {ready:,} Berrys")
+        lines.append("⌛ Unclaimed rewards expire at the daily reset!")
     lines += [f"🏆 Missions Completed: {done_count} / {len(MISSIONS)}",
               f"⏳ Reset in: {_dt_countdown(now)}"]
     return "\n".join(lines)
@@ -2502,6 +2503,15 @@ async def dailytask_claim_callback(update, context):
         return
     if q.from_user.id != owner_id:
         await q.answer("❌ This is not your mission list. Use /dailytask.", show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) > 3 and parts[3] != _dt_day_key():          # button from a previous daily cycle
+        await q.answer("⌛ This reward expired at the daily reset. Unclaimed rewards cannot be claimed.\n"
+                       "Use /dailytask for today's missions.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)     # remove the dead button
+        except Exception as e:
+            logger.info("expired claim button cleanup skipped: %s", e)
         return
     try:
         result = await asyncio.to_thread(dt_claim_all_sync, owner_id)
@@ -2546,5 +2556,5 @@ def _register_dailytask(app):
     from telegram.ext import CallbackQueryHandler, CommandHandler
     _dt_deps["bot"] = app.bot
     app.add_handler(CommandHandler("dailytask", dailytask_command))
-    app.add_handler(CallbackQueryHandler(dailytask_claim_callback, pattern=r"^dtask:claim:\d+$"))
+    app.add_handler(CallbackQueryHandler(dailytask_claim_callback, pattern=r"^dtask:claim:\d+(:\d{4}-\d{2}-\d{2})?$"))
     app.add_handler(CallbackQueryHandler(dailytask_back_callback, pattern=r"^dailytask:back:\d+$"))
