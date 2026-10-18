@@ -2167,21 +2167,21 @@ async def stone_remind(user_id, chat_id=None, name=None):
 MISSIONS_COL = "daily_missions"
 CURRENCY_FIELD = "coins"          # Berrys (existing users field)
 
-Mission = namedtuple("Mission", "key emoji name needed reward counter")
+Mission = namedtuple("Mission", "key emoji name task needed reward counter")
 
 MISSIONS = (
     # --- catching ---
-    Mission("beginner", "🥉", "Beginner Catcher", 4, 150, "catch"),
-    Mission("unique", "🆕", "Unique Hunter", 1, 200, "new"),
-    Mission("pro", "⚔️", "Pro Catcher", 10, 500, "catch"),
-    Mission("explorer", "🌍", "Anime Explorer", 5, 200, "series"),
-    Mission("rare", "🔵", "Rare Hunter", 7, 300, "rare"),
-    Mission("common", "⚪", "Common Hunter", 10, 300, "common"),
-    Mission("epic", "🟣", "Epic Hunter", 5, 200, "epic"),
+    Mission("beginner", "🥉", "Beginner Catcher", "Catch 4 characters", 4, 150, "catch"),
+    Mission("unique", "🆕", "Unique Hunter", "Catch 1 previously unowned character", 1, 200, "new"),
+    Mission("pro", "⚔️", "Pro Catcher", "Catch 10 characters", 10, 500, "catch"),
+    Mission("explorer", "🌍", "Anime Explorer", "Catch characters from 5 different anime series", 5, 200, "series"),
+    Mission("rare", "🔵", "Rare Hunter", "Catch 7 Rare characters", 7, 300, "rare"),
+    Mission("common", "⚪", "Common Hunter", "Catch 10 Common characters", 10, 300, "common"),
+    Mission("epic", "🟣", "Epic Hunter", "Catch 5 Epic characters", 5, 200, "epic"),
     # --- shop ---
-    Mission("buy_legendary", "💎", "Legendary Buyer", 1, 200, "shop_legendary"),
-    Mission("buy_mythical", "🔮", "Mythical Buyer", 1, 200, "shop_mythical"),
-    Mission("shopper", "🛍️", "Shopping Expert", 3, 200, "shop_any"),
+    Mission("buy_legendary", "💎", "Legendary Buyer", "Purchase 1 Legendary character from the shop", 1, 200, "shop_legendary"),
+    Mission("buy_mythical", "🔮", "Mythical Buyer", "Purchase 1 Mythical character from the shop", 1, 200, "shop_mythical"),
+    Mission("shopper", "🛍️", "Shopping Expert", "Purchase 3 shop items", 3, 200, "shop_any"),
 )
 TOTAL_REWARD = sum(m.reward for m in MISSIONS)      # 2,450
 assert TOTAL_REWARD == 2450 and len(MISSIONS) == 10
@@ -2390,7 +2390,8 @@ def dt_record_purchase_sync(user_id, rarity, quantity=1, event_id=None):
 # --------------------------------------------------------------------------
 def dt_notice_text(mission, now=None):
     return ("🎉 Mission Complete!\n\n"
-            f"{mission.emoji} {mission.name}\n\n"
+            f"{mission.emoji} {mission.name}\n"
+            f"✔️ {mission.task}\n\n"
             f"💰 Reward: {mission.reward:,} Berrys\n\n"
             "👇 Tap CLAIM BERRYS to collect it.\n"
             f"⌛ Unclaimed rewards expire in {_dt_countdown(now)} (daily reset).")
@@ -2455,7 +2456,7 @@ def dt_build_view_sync(user_id, now=None):
     for m in MISSIONS:
         value = _dt_value(progress, m)
         n = min(value, m.needed)
-        lines += [f"{m.emoji} {m.name}", f"Progress: {n}/{m.needed}", f"Reward: {m.reward:,} Berrys"]
+        lines += [f"{m.emoji} {m.name}", f"Task: {m.task}", f"Progress: {n}/{m.needed}", f"Reward: {m.reward:,} Berrys"]
         if claimed.get(m.key):
             earned += m.reward
             done_count += 1
