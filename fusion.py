@@ -26,6 +26,9 @@ Evolution system (same file, second half): /addevo (Owner+Executive), /evolution
 `evolution_recipes` (one recipe per base character, _id = evolution character code). Evolution Stones = the same
 `users.special_stones` field the stone tasks pay into. See the "EVOLUTION SYSTEM" section below.
 
+Stone task reminders (stone_remind) + Daily Missions (/dailytask) are the last sections of this file: separate system, independent of /daily and of the stone tasks.
+    Hooks: dt_record_catch(...) in add(), dt_record_purchase(...) in the shop. See the DAILY MISSIONS section.
+
 Claiming:
     claim_all() is the ONLY claim logic; the button and /claimstone both call it. For each
     completed task it runs one conditional update ("completed AND not yet claimed" -> claimed).
@@ -37,6 +40,7 @@ Claiming:
 import asyncio
 import logging
 import random
+from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
 import mongo_db
@@ -458,6 +462,7 @@ async def stone_claim_callback(update, context):
 def _register_stone(app):
     """Attach /stonetask, /claimstone and the single claim button to the application."""
     from telegram.ext import CallbackQueryHandler, CommandHandler
+    _stone_deps["bot"] = app.bot     # used by stone_remind() to announce completed tasks
     app.add_handler(CommandHandler("stonetask", stonetask_command))
     app.add_handler(CommandHandler("claimstone", claimstone_command))
     app.add_handler(CallbackQueryHandler(stone_claim_callback, pattern=r"^stone:claim:\d+$"))
@@ -467,6 +472,7 @@ def register(app):
     """Attach every Fusion handler (stone tasks + Evolution). Call fusion.bind(...) first."""
     _register_stone(app)
     _register_evolution(app)
+    _register_dailytask(app)
 
 
 # ==========================================================================
@@ -2075,3 +2081,470 @@ def _register_evolution(app):
     app.add_handler(CommandHandler("item", item_command))
     app.add_handler(CommandHandler("stone", stone_command))
     app.add_handler(CallbackQueryHandler(evolve_callback, pattern=r"^evo:(go|pick):\d+:\d{4}$"))
+
+
+# ==========================================================================
+# STONE TASK COMPLETION REMINDERS
+# ==========================================================================
+# When a stone task becomes claimable, the player gets ONE message per task with the existing 💎 CLAIM STONE button
+# (the same button/handler as /stonetask, so claiming works exactly the same). Each task is announced once per period
+# through a "notified.<task>" flag on the task document. Nothing about progress, rewards or claiming changes.
+# bot.py hook (after the catch / sell reply):  await fusion.stone_remind(user_id, chat_id=..., name=...)
+_stone_deps = {"bot": None}      # set by _register_stone(app)
+
+
+async def _notify_user(bot, user_id, text, reply_markup=None, chat_id=None, name=None):
+    """Stateless sender: the player's private chat first; if that is impossible, the chat where it happened."""
+    if bot is None:
+        return False
+    try:
+        await bot.send_message(chat_id=int(user_id), text=text, reply_markup=reply_markup)
+        return True
+    except Exception as e:      # e.g. the player never opened a private chat with the bot
+        logger.info("notification DM skipped: %s", e)
+    if chat_id and int(chat_id) != int(user_id):
+        try:
+            await bot.send_message(chat_id=int(chat_id), text=(f"👤 {name}\n\n" if name else "") + text,
+                                   reply_markup=reply_markup)
+            return True
+        except Exception as e:
+            logger.info("notification chat fallback skipped: %s", e)
+    return False
+
+
+def stone_ready_sync(user_id):
+    """Stone tasks that are completed, not yet claimed and not yet announced. Marks them announced (once per period)."""
+    user_id = int(user_id)
+    day, week = current_day_key(), current_week_key()
+    keys = []
+    for key in TASK_ORDER:
+        flt = _claim_filter(user_id, day, key, week)        # completed AND not claimed (same rule the claim uses)
+        flt[f"notified.{key}"] = {"$ne": True}
+        if _tasks().update_one(flt, {"$set": {f"notified.{key}": True}}).modified_count == 1:
+            keys.append(key)
+    return keys
+
+
+def stone_reminder_text(key, now=None):
+    now = now or _now()
+    reward = REWARDS[key]
+    reset = (f"Daily reset in {format_countdown(now)}" if key in DAILY_KEYS
+             else f"Weekly reset in {format_weekly_countdown(now)}")
+    return ("💎 STONE TASK COMPLETE!\n\n"
+            f"{TITLES[key]}\n"
+            f"Reward: 💎 {reward} {'Stone' if reward == 1 else 'Stones'}\n\n"
+            "👇 Tap CLAIM STONE to collect it before the reset.\n"
+            f"⏳ {reset}")
+
+
+async def stone_remind(user_id, chat_id=None, name=None):
+    """Never raises: a reminder problem must not break /add or /sell."""
+    try:
+        keys = await asyncio.to_thread(stone_ready_sync, user_id)
+        for key in keys:
+            await _notify_user(_stone_deps["bot"], user_id, stone_reminder_text(key), _keyboard(user_id), chat_id, name)
+    except Exception as e:
+        logger.error("stone task reminder failed: %s", e)
+
+
+# ==========================================================================
+# DAILY MISSIONS (/dailytask)
+# ==========================================================================
+# Separate from the stone tasks above and from the existing /daily command (login streak), which is NOT touched.
+# Works like the stone tasks: finish a mission -> you get ONE message with a 💰 CLAIM BERRYS button -> claiming pays
+# the Berrys (also available from the button under /dailytask). Unclaimed rewards expire at the daily reset.
+# bot.py hooks (all functions here are prefixed dt_ / _dt_ so nothing above is overridden):
+#     await fusion.dt_record_catch(user_id, rarity, code, event_id=..., chat_id=..., name=...)      # end of add(), after the catch reply
+#     await fusion.dt_record_purchase(user_id, rarity, qty, event_id=..., chat_id=..., name=...)    # shop buy handler, ONLY after a successful purchase
+#     (chat_id/name are optional: used only if the player cannot be messaged privately)
+#     fusion.bind_dailytask(back_callback="<your menu's Back callback_data>")   # optional
+# /dailytask + its buttons are registered by fusion.register(app) (through _register_dailytask).
+# 10 missions, max 2,450 Berrys per daily cycle. Reset 02:00 AM IST on its own clock (_dt_day_key), independent of the stone tasks.
+# Storage: collection "daily_missions" (one doc per user per task day) + users.coins (Berrys).
+#     progress.*  counters   claimed.<mission>  paid flag   notified.<mission>  announced flag   events  duplicate-event guard
+# Each mission is paid once through a conditional "not yet claimed" flip inside one transaction.
+
+MISSIONS_COL = "daily_missions"
+CURRENCY_FIELD = "coins"          # Berrys (existing users field)
+
+Mission = namedtuple("Mission", "key emoji name needed reward counter")
+
+MISSIONS = (
+    # --- catching ---
+    Mission("beginner", "🥉", "Beginner Catcher", 4, 150, "catch"),
+    Mission("unique", "🆕", "Unique Hunter", 1, 200, "new"),
+    Mission("pro", "⚔️", "Pro Catcher", 10, 500, "catch"),
+    Mission("explorer", "🌍", "Anime Explorer", 5, 200, "series"),
+    Mission("rare", "🔵", "Rare Hunter", 7, 300, "rare"),
+    Mission("common", "⚪", "Common Hunter", 10, 300, "common"),
+    Mission("epic", "🟣", "Epic Hunter", 5, 200, "epic"),
+    # --- shop ---
+    Mission("buy_legendary", "💎", "Legendary Buyer", 1, 200, "shop_legendary"),
+    Mission("buy_mythical", "🔮", "Mythical Buyer", 1, 200, "shop_mythical"),
+    Mission("shopper", "🛍️", "Shopping Expert", 3, 200, "shop_any"),
+)
+TOTAL_REWARD = sum(m.reward for m in MISSIONS)      # 2,450
+assert TOTAL_REWARD == 2450 and len(MISSIONS) == 10
+
+_CATCH_RARITY_COUNTERS = ("common", "rare", "epic")   # only these rarities have a catching mission
+_SHOP_RARITY_COUNTERS = ("legendary", "mythical")
+
+# Daily missions have their OWN reset clock (02:00 AM IST). It does not use the stone tasks' current_day_key /
+# format_countdown / RESET_HOUR_IST, so changing or breaking one system can never move or break the other.
+_DT_IST = timezone(timedelta(hours=5, minutes=30))
+_DT_RESET_HOUR_IST = 2
+
+
+def _dt_day_key(now=None):
+    """Daily-mission 'task day' (YYYY-MM-DD, IST, 02:00 AM cutoff)."""
+    ist = (now or datetime.now(timezone.utc)).astimezone(_DT_IST)
+    day = ist.date() if ist.hour >= _DT_RESET_HOUR_IST else (ist - timedelta(days=1)).date()
+    return day.isoformat()
+
+
+def _dt_countdown(now=None):
+    """'7h 25m' until the next daily-mission reset."""
+    now = now or datetime.now(timezone.utc)
+    ist = now.astimezone(_DT_IST)
+    reset = ist.replace(hour=_DT_RESET_HOUR_IST, minute=0, second=0, microsecond=0)
+    if ist >= reset:
+        reset += timedelta(days=1)
+    secs = max(0, int((reset - ist).total_seconds()))
+    hours, minutes = secs // 3600, (secs % 3600) // 60
+    return "less than 1m" if hours == 0 and minutes == 0 else f"{hours}h {minutes}m"
+
+
+_dt_deps = {
+    "bot": None,             # set by _register_dailytask(app); used to send the completion messages
+    "back_callback": None,   # optional: callback_data of the existing menu's "⬅️ Back" button
+}
+_dt_state = {"purged_day": None}
+
+
+def bind_dailytask(**kwargs):
+    """Optional: fusion.bind_dailytask(back_callback="your_menu_callback") makes ⬅️ Back open your existing menu.
+    Without it, ⬅️ Back simply closes the /dailytask message."""
+    _dt_deps.update({k: v for k, v in kwargs.items() if v is not None})
+
+
+# --------------------------------------------------------------------------
+# Database helpers (blocking - always call through asyncio.to_thread from handlers)
+# --------------------------------------------------------------------------
+def _dt_col():
+    return mongo_db.col(MISSIONS_COL)
+
+
+def _dt_doc_id(user_id, day):
+    return f"{int(user_id)}:{day}"
+
+
+def _dt_purge_expired(day):
+    """Drop previous days' mission documents once per process per day (they can never be claimed again)."""
+    if _dt_state["purged_day"] == day:
+        return
+    try:
+        _dt_col().delete_many({"day": {"$lt": day}})
+        _dt_state["purged_day"] = day
+    except Exception as e:
+        logger.warning("daily mission purge failed: %s", e)
+
+
+def _dt_value(progress, mission):
+    """Current progress number for a mission (Anime Explorer counts DISTINCT anime series)."""
+    if mission.counter == "series":
+        return len(progress.get("series") or [])
+    return int(progress.get(mission.counter, 0) or 0)
+
+
+def _dt_bump(user_id, incs, series=None, event_id=None):
+    """
+    Atomic progress update. With an event_id the same event can never count twice: the filter requires that
+    the id is not stored yet, and a replay then fails with a duplicate-key error on the upsert (-> ignored).
+    Returns False when the event was a duplicate.
+    """
+    day = _dt_day_key()
+    _dt_purge_expired(day)
+    doc_id = _dt_doc_id(user_id, day)
+    flt = {"_id": doc_id}
+    update = {"$setOnInsert": {"user_id": int(user_id), "day": day}}
+    if incs:
+        update["$inc"] = incs
+    add = {}
+    if series:
+        add["progress.series"] = series
+    if event_id:
+        flt["events"] = {"$ne": str(event_id)}
+        add["events"] = str(event_id)
+    if add:
+        update["$addToSet"] = add
+    try:
+        _dt_col().update_one(flt, update, upsert=True)
+    except mongo_db.DuplicateKeyError:
+        return False
+    return True
+
+
+def dt_notices_sync(user_id):
+    """
+    Missions that are completed, not yet claimed and not yet announced. Each one is marked announced with a conditional
+    update, so a mission is announced exactly once per daily cycle even if several catches/purchases race.
+    """
+    user_id = int(user_id)
+    doc_id = _dt_doc_id(user_id, _dt_day_key())
+    doc = _dt_col().find_one({"_id": doc_id})
+    if not doc:
+        return []
+    progress, claimed, notified = doc.get("progress") or {}, doc.get("claimed") or {}, doc.get("notified") or {}
+    out = []
+    for m in MISSIONS:
+        if claimed.get(m.key) or notified.get(m.key) or _dt_value(progress, m) < m.needed:
+            continue
+        res = _dt_col().update_one({"_id": doc_id, f"notified.{m.key}": {"$ne": True}},
+                                   {"$set": {f"notified.{m.key}": True}})
+        if res.modified_count == 1:
+            out.append(m)
+    return out
+
+
+def dt_balance_sync(user_id):
+    doc = mongo_db.col(USERS_COL).find_one({"_id": int(user_id)}, {CURRENCY_FIELD: 1})
+    return int((doc or {}).get(CURRENCY_FIELD) or 0)
+
+
+def dt_claim_all_sync(user_id):
+    """
+    Shared claim logic for the CLAIM BERRYS button. Pays every completed-but-unclaimed mission of today exactly once.
+    Returns {"status": "ok"|"nothing"|"nouser", "missions": [Mission...], "berrys": int, "balance": int}.
+    """
+    user_id = int(user_id)
+    if mongo_db.col(USERS_COL).find_one({"_id": user_id}, {"_id": 1}) is None:
+        return {"status": "nouser", "missions": [], "berrys": 0, "balance": 0}
+    doc_id = _dt_doc_id(user_id, _dt_day_key())
+    doc = _dt_col().find_one({"_id": doc_id}) or {}
+    progress, claimed = doc.get("progress") or {}, doc.get("claimed") or {}
+    due = [m for m in MISSIONS if not claimed.get(m.key) and _dt_value(progress, m) >= m.needed]
+    if not due:
+        return {"status": "nothing", "missions": [], "berrys": 0, "balance": dt_balance_sync(user_id)}
+
+    def _work(session):
+        paid, total = [], 0
+        for m in due:
+            res = _dt_col().update_one(
+                {"_id": doc_id, f"claimed.{m.key}": {"$ne": True}},
+                {"$set": {f"claimed.{m.key}": True}}, session=session)
+            if res.modified_count == 1:          # we (and only we) flipped it -> we pay it
+                paid.append(m)
+                total += m.reward
+        if total:
+            res = mongo_db.col(USERS_COL).update_one(
+                {"_id": user_id}, {"$inc": {CURRENCY_FIELD: total}}, session=session)
+            if res.matched_count != 1:
+                raise RuntimeError("berry payout failed: user missing")   # aborts the transaction
+        return paid, total
+
+    paid, total = mongo_db.run_transaction(_work)
+    return {"status": "ok" if paid else "nothing", "missions": paid, "berrys": total,
+            "balance": dt_balance_sync(user_id)}
+
+
+def dt_record_catch_sync(user_id, rarity, code, event_id=None, is_new=None):
+    """
+    Called after a SUCCESSFUL /add catch (the copy must already be saved; failed catches never reach this).
+    Returns the missions that just became claimable (to announce).
+    is_new: pass True/False if bot.py already knows the character was unowned; otherwise it is derived from the
+    number of copies the player owns after the catch (exactly 1 -> it was genuinely new).
+    """
+    row = mongo_db.get_character_by_code(code)       # (code, name, anime, rarity, worth, photo, ...)
+    if row is None:
+        return []
+    incs = {"progress.catch": 1}
+    key = str(rarity or row[3] or "").strip().lower()
+    if key in _CATCH_RARITY_COUNTERS:
+        incs[f"progress.{key}"] = 1
+    if is_new is None:
+        is_new = mongo_db.count_user_copies(user_id, code) <= 1
+    if is_new:
+        incs["progress.new"] = 1
+    anime = str(row[2] or "").strip().casefold()
+    if not _dt_bump(user_id, incs, series=anime or None, event_id=event_id):
+        return []                                    # duplicate event: no progress, nothing to announce
+    return dt_notices_sync(user_id)
+
+
+def dt_record_purchase_sync(user_id, rarity, quantity=1, event_id=None):
+    """Called ONLY after a successful shop purchase of a character (cancelled/failed purchases never reach this)."""
+    quantity = int(quantity)
+    if quantity <= 0:
+        return []
+    incs = {"progress.shop_any": quantity}
+    key = str(rarity or "").strip().lower()
+    if key in _SHOP_RARITY_COUNTERS:
+        incs[f"progress.shop_{key}"] = quantity
+    if not _dt_bump(user_id, incs, event_id=event_id):
+        return []
+    return dt_notices_sync(user_id)
+
+
+# --------------------------------------------------------------------------
+# Texts, buttons, notifications
+# --------------------------------------------------------------------------
+def dt_notice_text(mission, now=None):
+    return ("🎉 Mission Complete!\n\n"
+            f"{mission.emoji} {mission.name}\n\n"
+            f"💰 Reward: {mission.reward:,} Berrys\n\n"
+            "👇 Tap CLAIM BERRYS to collect it before the reset.\n"
+            f"⏳ Reset in: {_dt_countdown(now)}")
+
+
+def dt_claim_text(result):
+    if result["status"] == "nouser":
+        return "❌ Please use /start first."
+    if result["status"] == "nothing":
+        return ("❌ No completed missions to claim right now.\n"
+                "Finish a mission first - rewards must be claimed before the 2:00 AM IST reset.")
+    lines = ["💰 BERRYS CLAIMED!", ""]
+    for m in result["missions"]:
+        lines.append(f"{m.emoji} {m.name}: +{m.reward:,} Berrys added to your balance!")
+    lines += ["", f"Total: +{result['berrys']:,} Berrys", f"Your Berrys: {result['balance']:,}"]
+    return "\n".join(lines)
+
+
+def _dt_keyboard(user_id, back=True):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = [[InlineKeyboardButton("💰 CLAIM BERRYS", callback_data=f"dtask:claim:{int(user_id)}")]]
+    if back:
+        cb = _dt_deps.get("back_callback") or f"dailytask:back:{int(user_id)}"
+        rows.append([InlineKeyboardButton("⬅️ Back", callback_data=cb)])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _dt_notify(user_id, missions, bot=None, chat_id=None, name=None):
+    """One message (with the CLAIM BERRYS button) per mission that just became claimable."""
+    if not missions:
+        return
+    bot = bot or _dt_deps.get("bot")
+    for m in missions:
+        await _notify_user(bot, user_id, dt_notice_text(m), _dt_keyboard(user_id, back=False), chat_id, name)
+
+
+async def dt_record_catch(user_id, rarity, code, event_id=None, is_new=None, chat_id=None, name=None):
+    """Never raises: a mission problem must not break /add."""
+    try:
+        missions = await asyncio.to_thread(dt_record_catch_sync, user_id, rarity, code, event_id, is_new)
+        await _dt_notify(user_id, missions, chat_id=chat_id, name=name)
+    except Exception as e:
+        logger.error("daily mission catch tracking failed: %s", e)
+
+
+async def dt_record_purchase(user_id, rarity, quantity=1, event_id=None, chat_id=None, name=None):
+    """Never raises: a mission problem must not break the shop."""
+    try:
+        missions = await asyncio.to_thread(dt_record_purchase_sync, user_id, rarity, quantity, event_id)
+        await _dt_notify(user_id, missions, chat_id=chat_id, name=name)
+    except Exception as e:
+        logger.error("daily mission purchase tracking failed: %s", e)
+
+
+def dt_build_view_sync(user_id, now=None):
+    """The /dailytask text for this user (plain numeric progress, no progress bars)."""
+    day = _dt_day_key(now)
+    doc = _dt_col().find_one({"_id": _dt_doc_id(user_id, day)}) or {}
+    progress, claimed = doc.get("progress") or {}, doc.get("claimed") or {}
+    lines = ["🎯 DAILY TASKS", ""]
+    earned = ready = done_count = 0
+    for m in MISSIONS:
+        value = _dt_value(progress, m)
+        n = min(value, m.needed)
+        lines += [f"{m.emoji} {m.name}", f"Progress: {n}/{m.needed}", f"Reward: {m.reward:,} Berrys"]
+        if claimed.get(m.key):
+            earned += m.reward
+            done_count += 1
+            lines.append("🎁 Claimed")
+        elif value >= m.needed:
+            ready += m.reward
+            done_count += 1
+            lines.append("✅ Completed - tap CLAIM BERRYS!")
+        lines.append("")
+    lines += ["━━━━━━━━━━━━━━", "",
+              f"💰 Rewards Earned: {earned:,} / {TOTAL_REWARD:,} Berrys"]
+    if ready:
+        lines.append(f"🎁 Ready to Claim: {ready:,} Berrys")
+    lines += [f"🏆 Missions Completed: {done_count} / {len(MISSIONS)}",
+              f"⏳ Reset in: {_dt_countdown(now)}"]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Telegram handlers (telegram imports are lazy, like the stone handlers)
+# --------------------------------------------------------------------------
+async def dailytask_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None or user.is_bot:
+        return
+    try:
+        await asyncio.to_thread(dt_notices_sync, user.id)    # the list itself shows what is ready: mark as seen
+        text = await asyncio.to_thread(dt_build_view_sync, user.id)
+    except Exception as e:
+        logger.error("/dailytask failed: %s", e)
+        await msg.reply_text("❌ Could not load your daily missions. Please try again.")
+        return
+    await msg.reply_text(text, reply_markup=_dt_keyboard(user.id))
+
+
+async def dailytask_claim_callback(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    try:
+        owner_id = int(q.data.split(":")[2])
+    except (IndexError, ValueError):
+        await q.answer()
+        return
+    if q.from_user.id != owner_id:
+        await q.answer("❌ This is not your mission list. Use /dailytask.", show_alert=True)
+        return
+    try:
+        result = await asyncio.to_thread(dt_claim_all_sync, owner_id)
+    except Exception as e:
+        logger.error("daily mission claim failed: %s", e)
+        await q.answer("❌ Could not claim right now. Please try again.", show_alert=True)
+        return
+    if result["status"] == "ok":
+        await q.answer(f"💰 +{result['berrys']:,} Berrys claimed!")
+        try:
+            await q.message.reply_text(dt_claim_text(result))
+            text = await asyncio.to_thread(dt_build_view_sync, owner_id)
+            await q.edit_message_text(text, reply_markup=_dt_keyboard(owner_id))
+        except Exception as e:   # e.g. "message is not modified" - the claim itself already succeeded
+            logger.info("daily mission view refresh skipped: %s", e)
+    else:
+        await q.answer(dt_claim_text(result), show_alert=True)
+
+
+async def dailytask_back_callback(update, context):
+    """Default ⬅️ Back: closes the missions message (only for its owner). Replaced by bind_dailytask(back_callback=...)."""
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    try:
+        owner_id = int(q.data.split(":")[2])
+    except (IndexError, ValueError):
+        await q.answer()
+        return
+    if q.from_user.id != owner_id:
+        await q.answer("❌ This is not your mission list. Use /dailytask.", show_alert=True)
+        return
+    await q.answer()
+    try:
+        await q.message.delete()
+    except Exception as e:
+        logger.info("dailytask back skipped: %s", e)
+
+
+def _register_dailytask(app):
+    """Attach /dailytask, its CLAIM BERRYS button and its Back button. Does not register, replace or touch /daily."""
+    from telegram.ext import CallbackQueryHandler, CommandHandler
+    _dt_deps["bot"] = app.bot
+    app.add_handler(CommandHandler("dailytask", dailytask_command))
+    app.add_handler(CallbackQueryHandler(dailytask_claim_callback, pattern=r"^dtask:claim:\d+$"))
+    app.add_handler(CallbackQueryHandler(dailytask_back_callback, pattern=r"^dailytask:back:\d+$"))

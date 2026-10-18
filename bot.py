@@ -1333,6 +1333,7 @@ def _build_help_text_raw():
         "/spawn — Spawn a character in the group\n"
         "/add — Catch the spawned character\n"
         "/daily — Claim your daily reward\n"
+        "/dailytask — View your daily missions and earn Berrys\n"
         "/sell <code/name> [quantity] — Sell a character\n"
         "/transfer <code/name> — Transfer a character by replying to a user\n"
         "/exchange <your_code> <their_code> — Exchange same-tier characters by replying to a user\n\n"
@@ -3293,6 +3294,12 @@ async def add(update, context):
         f"Tier: {caught_rarity} {caught_symbol}\n"
         f"Worth: {caught_spawn['worth']} Berrys\n"
     )
+    _who = berry_display_name(update.effective_user)
+    await fusion.stone_remind(user_id, chat_id=chat_id, name=_who)  # "stone task complete - claim it" message (never raises)
+    await fusion.dt_record_catch(
+        user_id, caught_rarity, caught_spawn["code"],
+        event_id=(f"catch:{caught_spawn['history_id']}" if caught_spawn.get("history_id") else None),
+        chat_id=chat_id, name=_who)  # daily mission progress + "mission complete - claim it" message (never raises)
 
 async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
     rows = (await asyncio.to_thread(mongo_db.get_collection_summary, user_id))
@@ -4040,6 +4047,10 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.edit_reply_markup(reply_markup=keyboard)
         except Exception as e:
             print("Shop bought-button update error:", e)
+        await fusion.dt_record_purchase(
+            owner_id, rarity, 1, event_id=f"shop:{key}:{page}",
+            chat_id=query.message.chat_id if query.message else None,
+            name=berry_display_name(query.from_user))  # daily mission progress (never raises)
         return
 
     if action == "bought":
@@ -4354,6 +4365,8 @@ async def sell(update, context):
     await safe_reply_text(update.message,
         f"💸 Sold {name} [{code}] x{quantity}!\n💰 +{total_value} Berrys"
     )
+    await fusion.stone_remind(update.effective_user.id, chat_id=update.effective_chat.id,
+                              name=berry_display_name(update.effective_user))  # "stone task complete - claim it" message (never raises)
 
 PENDING_TRANSFERS = {}
 PENDING_EXCHANGES = {}
@@ -9917,6 +9930,7 @@ COMMANDS = {
     "myfav": "Set favourite character",
     "mystats": "View your stats",
     "daily": "Claim daily reward",
+    "dailytask": "View your daily missions",
     "characters": "List characters",
     "view": "View a character",
     "check": "Check character details and owners",
@@ -10014,7 +10028,7 @@ PUBLIC_COMMANDS = {
     "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
-    "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about",
+    "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about", "dailytask",
 }
 
 def make_bot_commands(names):
