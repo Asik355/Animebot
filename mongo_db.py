@@ -1828,12 +1828,16 @@ def sh_last_spawn(rarities, since):
 
 @retry_read
 def sh_count_random_since(since):
-    return col(SH).count_documents({"spawned_by": _COUNTED, "spawned_at": {"$gte": since}})
+    # Gap counting: only spawns that were successfully caught (added to a collection) count.
+    return col(SH).count_documents({"spawned_by": _COUNTED, "caught_by": {"$ne": None}, "spawned_at": {"$gte": since}})
 
 
 @retry_read
 def sh_count_random_after(since, after_at, exclude_id):
-    return col(SH).count_documents({"spawned_by": _COUNTED, "spawned_at": {"$gte": since, "$gt": after_at},
+    # Gap counting: only caught spawns made after the last high-rank spawn count (the high-rank spawn itself
+    # resets the gap whether or not it was caught).
+    return col(SH).count_documents({"spawned_by": _COUNTED, "caught_by": {"$ne": None},
+                                    "spawned_at": {"$gte": since, "$gt": after_at},
                                     "_id": {"$ne": int(exclude_id)}})
 
 
