@@ -620,6 +620,16 @@ def _is_ancestor(target, codes):
     return False
 
 
+FUSION_SYMBOL_SAME = "🌟"   # same character fused (two or more copies of one card)
+FUSION_SYMBOL_DIFF = "💫"   # two different characters fused
+
+
+def fusion_symbol(recipe_or_kind):
+    """Fusion type symbol from a recipe (or its kind string): 💫 for pair (different cards), 🌟 for same."""
+    kind = recipe_or_kind if isinstance(recipe_or_kind, str) else (recipe_or_kind or {}).get("kind")
+    return FUSION_SYMBOL_DIFF if kind == "pair" else FUSION_SYMBOL_SAME
+
+
 def _ingredient_text(recipe):
     """'2× Naruto [1234]' or '1× Naruto [1234] + 1× Sasuke [1005]'."""
     parts = []
@@ -854,7 +864,7 @@ def evolution_list_pages_sync():
         if evo is None or any(x is None for x in rows):
             continue   # recipe whose character was deleted: not shown (and cannot be used)
         n += 1
-        lines = [f"{n}. {ingredients[0][1]}× {_char_label(rows[0])}"]
+        lines = [f"{n}. {fusion_symbol(r)} {ingredients[0][1]}× {_char_label(rows[0])}"]
         if len(ingredients) > 1:
             lines.append(f"   + {ingredients[1][1]}× {_char_label(rows[1])}")
         lines.append(f"   ➡️ {_char_label(evo)}")
@@ -903,9 +913,10 @@ def build_card_sync(user_id, recipe):
     stones, coins = _balances(user_id)
     have = " • ".join(f"{r[1]} ×{mongo_db.count_user_copies(user_id, r[0])}" for r in rows)
     if len(ingredients) == 1:
-        who = f"🧍 Base Character: {rows[0][1]} ×{ingredients[0][1]}\n"
+        who = f"{fusion_symbol(recipe)} Base Character: {rows[0][1]} ×{ingredients[0][1]}\n"
     else:
-        who = f"🧍 Card A: {rows[0][1]} ×{ingredients[0][1]}\n🧍 Card B: {rows[1][1]} ×{ingredients[1][1]}\n"
+        sym = fusion_symbol(recipe)
+        who = f"{sym} Card A: {rows[0][1]} ×{ingredients[0][1]}\n{sym} Card B: {rows[1][1]} ×{ingredients[1][1]}\n"
     return (
         "⚡ EVOLUTION\n\n"
         f"{who}"
@@ -922,7 +933,7 @@ def success_text(res):
     evo = _row(res["evo_code"])
     return (
         "✅ EVOLUTION COMPLETE!\n\n"
-        f"🧍 Used: {used}\n"
+        f"{FUSION_SYMBOL_DIFF if len(res.get('ingredients') or []) > 1 else FUSION_SYMBOL_SAME} Used: {used}\n"
         f"💎 Stones used: {res['stones']}\n"
         f"🪙 Berries used: {res['berries']:,}\n\n"
         f"✨ Received: {evo[1] if evo else res['evo_code']} ×1\n\n"
@@ -944,7 +955,7 @@ def _recipe_buttons_sync(user_id, recipes):
         cards, evo = [_row(c) for c, _q in ingredients], _row(r["_id"])
         if evo and all(cards):
             names = " + ".join(c[1] for c in cards) if len(cards) > 1 else f"{cards[0][1]} ×{ingredients[0][1]}"
-            rows.append([InlineKeyboardButton(f"{names} ➡️ {evo[1]}"[:60], callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
+            rows.append([InlineKeyboardButton(f"{fusion_symbol(r)} {names} ➡️ {evo[1]}"[:60], callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -1076,7 +1087,7 @@ async def delevo_command(update, context):
                 f"🗑 EVOLUTION RECIPE DELETED\n"
                 f"🎭 {label} [{code}]\n"
                 + (f"🏷 {_rarity_line(evo[3])}\n" if evo else "")
-                + f"🧬 Recipe: {recipe_text} ➡️ {label} [{code}]\n"
+                + f"🧬 Recipe: {fusion_symbol(recipe)} {recipe_text} ➡️ {label} [{code}]\n"
                 f"💎 Evolution Stones: {recipe['stones']}\n"
                 f"🪙 Berries: {recipe['berries']:,}\n"
                 f"ℹ️ Evolution characters users already own were kept.\n"
@@ -1270,7 +1281,7 @@ async def addevo_photo(update, context):
     base, evo = _row(d["evo_base"]), _row(d["evo_code"])
     second = _row(d["evo_second"]) if pair else None
     lines = f"{d['evo_qty']}× {_char_label(base)}\n" + (f"+ {d['evo_qty2']}× {_char_label(second)}\n" if pair else "")
-    await _reply(msg, "✅ Evolution created!\n\n" + lines + f"➡️ {_char_label(evo)}\n"
+    await _reply(msg, "✅ Evolution created!\n\n" + f"{fusion_symbol(recipe)} " + lines + f"➡️ {_char_label(evo)}\n"
                       f"💎 {d['evo_stones']} Stones • 🪙 {d['evo_berries']:,} Berries")
     try:
         if _deps["log_action"]:
@@ -1284,7 +1295,7 @@ async def addevo_photo(update, context):
                 f"🏷 {_rarity_line(d['evo_rarity'])}\n"
                 f"💰 Worth: {d['evo_worth']}\n"
                 f"📷 Photo: Added\n"
-                f"🧬 Recipe: {_ingredient_text(recipe)} ➡️ {evo[1]} [{evo[0]}]\n"
+                f"🧬 Recipe: {fusion_symbol(recipe)} {_ingredient_text(recipe)} ➡️ {evo[1]} [{evo[0]}]\n"
                 f"💎 Evolution Stones: {d['evo_stones']}\n"
                 f"🪙 Berries: {d['evo_berries']:,}\n"
                 f"👤 By: {_by(user)}", actor_id=user.id)
@@ -1676,8 +1687,8 @@ def _parse_kind(text):
 
 def _type_keyboard(uid):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🧍 Same Card", callback_data=f"evoadd:{int(uid)}:same"),
-                                  InlineKeyboardButton("👥 Different Card", callback_data=f"evoadd:{int(uid)}:diff")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Same Card", callback_data=f"evoadd:{int(uid)}:same"),
+                                  InlineKeyboardButton("💫 Different Card", callback_data=f"evoadd:{int(uid)}:diff")]])
 
 
 def _begin_kind(context, kind):
@@ -1726,7 +1737,7 @@ async def addevo_type_callback(update, context):
     kind = "pair" if choice == "diff" else "same"
     text, state = _begin_kind(context, kind)
     await q.answer()
-    title = "👥 Different Card" if kind == "pair" else "🧍 Same Card"
+    title = "💫 Different Card" if kind == "pair" else "🌟 Same Card"
     try:
         await q.edit_message_text(f"{title}\n\n{text}")           # the buttons disappear, so a choice cannot be tapped twice
     except Exception:
@@ -1999,7 +2010,7 @@ async def editevo_berries(update, context):
     lines = f"{values['qty']}× {_char_label(base)}\n" + (f"+ {values['qty2']}× {_char_label(second)}\n" if pair else "")
     await _reply(
         msg,
-        "✅ Evolution edited successfully!\n\n" + lines + f"➡️ {_char_label(evo)}\n"
+        "✅ Evolution edited successfully!\n\n" + f"{fusion_symbol(recipe_now)} " + lines + f"➡️ {_char_label(evo)}\n"
         f"💰 Worth: {values['worth']}\n💎 {values['stones']} Stones • 🪙 {values['berries']:,} Berries",
         reply_markup=_remove_keyboard())
     try:
@@ -2015,7 +2026,7 @@ async def editevo_berries(update, context):
                 f"🏷 {_rarity_line(values['rarity'])}\n"
                 f"💰 Worth: {values['worth']}\n"
                 f"📷 Photo: {'Updated' if values['photo'] else 'Unchanged'}\n"
-                f"🧬 Recipe: {_ingredient_text(recipe_now)} ➡️ {evo[1]} [{evo[0]}]\n"
+                f"🧬 Recipe: {fusion_symbol(recipe_now)} {_ingredient_text(recipe_now)} ➡️ {evo[1]} [{evo[0]}]\n"
                 f"💎 Evolution Stones: {values['stones']}\n"
                 f"🪙 Berries: {values['berries']:,}\n"
                 f"{code_line}"

@@ -1393,7 +1393,7 @@ def _addedit_page(role):
          + (". Evolution characters can't be edited here - use /editevo" if staff_evo else "")),
     ]
     if staff_evo:
-        entries.append(("/addevo", "Add an Evolution (guided, PM only): choose 🧍 Same Card (copies of one card) or 👥 Different Card (two different cards), then the cards, quantities, name, anime, rarity, worth, "
+        entries.append(("/addevo", "Add an Evolution (guided, PM only): choose 🌟 Same Card (copies of one card) or 💫 Different Card (two different cards), then the cards, quantities, name, anime, rarity, worth, "
                                    "Evolution Stones (min 10), Berrys cost, code, photo"))
         entries.append(("/editevo <code/name>", "Edit an Evolution character AND its recipe (guided, PM only): name, anime, rarity, "
                                                 "worth, photo, code, base character, quantity, Evolution Stones, Berrys cost. "
