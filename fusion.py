@@ -553,7 +553,7 @@ def _row(code):
 
 
 def _char_label(row):
-    """'🔵 Rare Naruto (1234)' - row[1] already carries the ⚡ for Evolution characters."""
+    """'🔵 Rare Naruto (1234)' - row[1] already carries the 🌟/💫 mark for Evolution characters."""
     return f"{_sym(row[3])} {row[3]} {row[1]} ({row[0]})"
 
 
@@ -855,7 +855,7 @@ def evolve_error_text(res):
 # ---------------------------------------------------------------- texts
 def evolution_list_pages_sync():
     """Pages (<= ~3800 chars) of the public /evolution list. Recipes are numbered 1, 2, 3... and the numbers continue across pages."""
-    head = "⚡ Evolution List\n\n"
+    head = "Evolution List\n\n"
     blocks, n = [], 0
     for r in sorted(_recipes().find({}), key=lambda x: str(x["_id"])):
         ingredients = recipe_ingredients(r)
@@ -918,7 +918,7 @@ def build_card_sync(user_id, recipe):
         sym = fusion_symbol(recipe)
         who = f"{sym} Card A: {rows[0][1]} ×{ingredients[0][1]}\n{sym} Card B: {rows[1][1]} ×{ingredients[1][1]}\n"
     return (
-        "⚡ EVOLUTION\n\n"
+        "EVOLUTION\n\n"
         f"{who}"
         f"💎 Evolution Stone: ×{recipe['stones']}\n"
         f"🪙 Berries: {recipe['berries']:,}\n\n"
@@ -943,7 +943,7 @@ def success_text(res):
 
 def _evolve_keyboard(user_id, evo_code):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⚡ EVOLVE", callback_data=f"evo:go:{int(user_id)}:{evo_code}")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("EVOLVE", callback_data=f"evo:go:{int(user_id)}:{evo_code}")]])
 
 
 def _recipe_buttons_sync(user_id, recipes):
@@ -984,10 +984,10 @@ async def evolve_command(update, context):
     if not query:
         kb = await asyncio.to_thread(_pick_keyboard_sync, user.id)
         if kb is None:
-            await _reply(msg, "⚡ You don't own a character that can evolve right now.\nSee /evolution for every recipe, "
+            await _reply(msg, "You don't own a character that can evolve right now.\nSee /evolution for every recipe, "
                               "or use /evolve <code or name>.")
         else:
-            await _reply(msg, "⚡ Choose what to evolve:", reply_markup=kb)
+            await _reply(msg, "Choose what to evolve:", reply_markup=kb)
         return
     recipes, err = await asyncio.to_thread(_resolve_recipe_sync, query)
     if err:
@@ -995,7 +995,7 @@ async def evolve_command(update, context):
         return
     if len(recipes) > 1:
         kb = await asyncio.to_thread(_recipe_buttons_sync, user.id, recipes)
-        await _reply(msg, "⚡ Several evolutions use this card. Choose one:", reply_markup=kb)
+        await _reply(msg, "Several evolutions use this card. Choose one:", reply_markup=kb)
         return
     recipe = recipes[0]
     card = await asyncio.to_thread(build_card_sync, user.id, recipe)
@@ -1044,7 +1044,7 @@ async def evolve_callback(update, context):
     if res["status"] != "ok":
         await q.answer(evolve_error_text(res), show_alert=True)
         return
-    await q.answer("⚡ Evolution complete!")
+    await q.answer("Evolution complete!")
     text = success_text(res)
     try:
         await q.edit_message_text(text)       # card (and its button) replaced by the result
@@ -1121,7 +1121,7 @@ async def addevo_start(update, context):
         return -1
     _clear_evo(context)
     context.user_data["evo_phase"] = "type"
-    await _reply(msg, "⚡ New Evolution\nChoose the evolution type:", reply_markup=_type_keyboard(user.id))
+    await _reply(msg, "New Evolution\nChoose the evolution type:", reply_markup=_type_keyboard(user.id))
     return E_TYPE
 
 

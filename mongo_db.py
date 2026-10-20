@@ -472,36 +472,75 @@ _char_lock = threading.Lock()
 def invalidate_character_cache():
     with _char_lock:
         _char_cache["docs"] = None
+        _evo_kind_cache["map"] = None
 
 
 # ---- Character type (NORMAL / EVOLUTION) --------------------------------------------------------------
 # Existing characters have no `char_type` field and are NORMAL. Evolution characters are created by /addevo with
-# char_type = "EVOLUTION". The lightning mark is DISPLAY ONLY: it is added in _row()/display_name() and is never
+# char_type = "EVOLUTION". The 🌟/💫 mark (formerly ⚡) is DISPLAY ONLY: it is added in _row()/display_name() and is never
 # stored in the character's name (every write path strips it).
 CHAR_TYPE_NORMAL = "NORMAL"
 CHAR_TYPE_EVOLUTION = "EVOLUTION"
-EVO_MARK = "\u26a1"   # lightning
+EVO_MARK = "\u26a1"   # legacy lightning mark: still stripped from names, no longer displayed
+EVO_MARK_SAME = "\U0001F31F"   # 🌟 Evolution made from a Same Card recipe
+EVO_MARK_DIFF = "\U0001F4AB"   # 💫 Evolution made from a Different Card recipe
+_EVO_TAIL_MARKS = (EVO_MARK_SAME, EVO_MARK_DIFF)
+
+# {evolution code: recipe kind}, refreshed with the character cache. Only used to pick the display symbol.
+_evo_kind_cache = {"map": None, "ts": 0.0}
+
+
+def _evo_kinds():
+    now = time.monotonic()
+    with _char_lock:
+        cached = _evo_kind_cache["map"]
+        if cached is not None and now - _evo_kind_cache["ts"] < CHAR_CACHE_TTL:
+            return cached
+    try:
+        fresh = {str(d["_id"]): d.get("kind") for d in col("evolution_recipes").find({}, {"kind": 1})}
+    except PyMongoError:
+        return cached if cached is not None else {}
+    with _char_lock:
+        _evo_kind_cache["map"] = fresh
+        _evo_kind_cache["ts"] = time.monotonic()
+    return fresh
 
 
 def strip_evo_mark(name):
-    """Remove every lightning mark (also the emoji-variant form) so a mark is never saved, and never doubled.
-    A name without a mark is returned exactly as given."""
+    """Remove every mark (the legacy lightning, also its emoji-variant form, and a trailing 🌟/💫) so a mark is never
+    saved, and never doubled. A name without a mark is returned exactly as given."""
     text = str(name or "")
-    if EVO_MARK not in text:
-        return text
-    return " ".join(text.replace(EVO_MARK + "\ufe0f", " ").replace(EVO_MARK, " ").split())
+    changed = False
+    if EVO_MARK in text:
+        text = text.replace(EVO_MARK + "\ufe0f", " ").replace(EVO_MARK, " ")
+        changed = True
+    while True:
+        t = text.rstrip()
+        hit = next((m for m in _EVO_TAIL_MARKS if t.endswith(m) or t.endswith(m + "\ufe0f")), None)
+        if hit is None:
+            break
+        text = t[: t.rindex(hit)]
+        changed = True
+    return " ".join(text.split()) if changed else text
 
 
-def display_name(name, char_type=None):
-    """Reusable display rule: EVOLUTION -> 'Name ⚡' (exactly one mark); NORMAL -> 'Name'."""
+def display_name(name, char_type=None, code=None):
+    """Reusable display rule: EVOLUTION -> 'Name 💫' (different-card recipe) or 'Name 🌟' (same-card recipe), exactly one
+    mark; NORMAL -> 'Name'."""
     if char_type == CHAR_TYPE_EVOLUTION:
         base = strip_evo_mark(name)
-        return f"{base} {EVO_MARK}" if base else name
+        mark = EVO_MARK_DIFF if _evo_kinds().get(str(code)) == "pair" else EVO_MARK_SAME
+        return f"{base} {mark}" if base else name
     return name
 
 
+def evolution_mark(code):
+    """The fusion symbol of an Evolution character by code: 💫 (Different Card recipe) or 🌟 (Same Card recipe)."""
+    return EVO_MARK_DIFF if _evo_kinds().get(str(code)) == "pair" else EVO_MARK_SAME
+
+
 def _row(d):
-    return (d["code"], display_name(d.get("name"), d.get("char_type")), d.get("anime"), d.get("rarity"),
+    return (d["code"], display_name(d.get("name"), d.get("char_type"), d.get("code")), d.get("anime"), d.get("rarity"),
             d.get("worth"), d.get("photo_file_id"))
 
 
@@ -563,7 +602,7 @@ def is_evolution_character(code):
 
 def get_character_names(codes):
     wanted = {str(c) for c in codes}
-    return {d["code"]: display_name(d.get("name"), d.get("char_type")) for d in _chars() if d["code"] in wanted}
+    return {d["code"]: display_name(d.get("name"), d.get("char_type"), d.get("code")) for d in _chars() if d["code"] in wanted}
 
 
 def find_characters_by_name_parts(query):
@@ -869,7 +908,7 @@ def get_collection_summary(user_id):
     for d in _chars():
         s = stats.get(d["code"])
         if s:
-            rows.append((d["code"], display_name(d.get("name"), d.get("char_type")), d.get("anime"), d.get("rarity"),
+            rows.append((d["code"], display_name(d.get("name"), d.get("char_type"), d.get("code")), d.get("anime"), d.get("rarity"),
                          d.get("photo_file_id"), int(s["qty"]), s.get("last")))
     return rows
 

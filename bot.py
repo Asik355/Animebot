@@ -1348,7 +1348,7 @@ def _build_help_text_raw():
         "/redeem <code> — Redeem a code\n\n"
         "🛒 Shop\n"
         "/shop — Open your personal character shop\n\n"
-        "⚡ Evolution\n"
+        "🌟💫 Evolution\n"
         "/evolution — View all evolution recipes\n"
         "/evolve [code/name] — Evolve a character (needs base characters, Evolution Stones and Berrys)\n\n"
         "💎 Stones & Items\n"
@@ -2945,7 +2945,7 @@ async def character_selection_callback(update, context):
         return
     if action == "edit":
         if await asyncio.to_thread(mongo_db.is_evolution_character, code):   # normal characters only
-            await query.edit_message_text("⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+            await query.edit_message_text(f"{mongo_db.evolution_mark(code)} This is an Evolution character. Evolution characters are edited with /editevo.")
             return ConversationHandler.END
         context.user_data["edit_code_original"] = code
         context.user_data["edit_character"] = character
@@ -5138,7 +5138,7 @@ async def addphoto(update, context):
         await safe_reply_text(update.message, "❌ Character not found.")
         return
     if await asyncio.to_thread(mongo_db.is_evolution_character, character[0]):
-        await safe_reply_text(update.message, "⚡ This is an Evolution character. Change its photo with /editevo.")
+        await safe_reply_text(update.message, f"{mongo_db.evolution_mark(character[0])} This is an Evolution character. Change its photo with /editevo.")
         return
 
     context.user_data["photo_code"] = character[0]
@@ -5158,7 +5158,7 @@ async def receive_photo(update, context):
 
     if await asyncio.to_thread(mongo_db.is_evolution_character, code):    # still guarded at save time
         context.user_data.pop("photo_code", None)
-        await safe_reply_text(update.message, "⚡ This is an Evolution character. Change its photo with /editevo.")
+        await safe_reply_text(update.message, f"{mongo_db.evolution_mark(code)} This is an Evolution character. Change its photo with /editevo.")
         return
     try:
         updated = (await asyncio.to_thread(mongo_db.update_character_photo, code, update.message.photo[-1].file_id))
@@ -5199,7 +5199,7 @@ async def editcharacter(update, context):
         matches = (await asyncio.to_thread(find_characters_by_name_parts, query))
         normal_matches = [m for m in matches if not mongo_db.is_evolution_character(m[0])]
         if matches and not normal_matches:
-            await safe_reply_text(update.message, "⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+            await safe_reply_text(update.message, f"{mongo_db.evolution_mark(matches[0][0])} This is an Evolution character. Evolution characters are edited with /editevo.")
             return ConversationHandler.END
         if len(matches) > 1 and len(normal_matches) == 1:
             character = normal_matches[0]      # the other match is an Evolution character: edit the normal one
@@ -5224,7 +5224,7 @@ async def editcharacter(update, context):
         return ConversationHandler.END
     code = character[0]
     if await asyncio.to_thread(mongo_db.is_evolution_character, code):    # /edit and /editcharacter: NORMAL characters only
-        await safe_reply_text(update.message, "⚡ This is an Evolution character. Evolution characters are edited with /editevo.")
+        await safe_reply_text(update.message, f"{mongo_db.evolution_mark(code)} This is an Evolution character. Evolution characters are edited with /editevo.")
         return ConversationHandler.END
     context.user_data["edit_code_original"] = code
     context.user_data["edit_character"] = character
