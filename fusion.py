@@ -645,6 +645,21 @@ def _name_taken(name):
                for r in mongo_db.get_all_characters())
 
 
+HEAVENLY_RARITY = "Heavenly"                          # fusion-only top tier (symbol 🧿 lives in bot.SYMBOL)
+HEAVENLY_INGREDIENT_RARITIES = ("Celestial", "Mythical")
+
+
+def heavenly_error(rarity, codes):
+    """A Heavenly evolution may only be made from Celestial or Mythical characters. Returns an error text or None."""
+    if str(rarity or "").title() != HEAVENLY_RARITY:
+        return None
+    for code in codes:
+        row = _row(str(code))
+        if row is None or str(row[3]) not in HEAVENLY_INGREDIENT_RARITIES:
+            return "❌ Heavenly evolutions can only use Celestial or Mythical characters."
+    return None
+
+
 def validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code=None, second_qty=None):
     """Returns an error text, or None when the recipe may be created. second_code makes it a Different Card recipe."""
     base_code, evo_code = str(base_code), str(evo_code)
@@ -686,7 +701,8 @@ def validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code=
 def create_evolution_sync(base_code, base_qty, name, anime, rarity, worth, stones, berries, evo_code, photo, created_by,
                           second_code=None, second_qty=None):
     """Creates the EVOLUTION character and its recipe in ONE transaction (both or neither)."""
-    err = validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code, second_qty)
+    err = (validate_recipe(base_code, base_qty, evo_code, stones, berries, second_code, second_qty)
+           or heavenly_error(rarity, [base_code] + ([second_code] if second_code is not None else [])))
     if err:
         return {"ok": False, "error": err}
     if _name_taken(name):
@@ -1174,7 +1190,7 @@ async def addevo_anime(update, context):
         await _reply(msg, "❌ The anime name cannot be empty.")
         return E_ANIME
     context.user_data["evo_anime"] = anime
-    await _reply(msg, f"{_stepno(context, 5)} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial")
+    await _reply(msg, f"{_stepno(context, 5)} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial / Heavenly")
     return E_RARITY
 
 
@@ -1390,7 +1406,8 @@ def edit_evolution_sync(code0, v, edited_by):
     """
     pair = v.get("second") is not None
     err = validate_recipe_edit(code0, v["code"], v["base"], v["qty"], v["stones"], v["berries"],
-                               v.get("second") if pair else None, v.get("qty2") if pair else None)
+                               v.get("second") if pair else None, v.get("qty2") if pair else None) \
+        or heavenly_error(v["rarity"], [v["base"]] + ([v["second"]] if pair else []))
     if err:
         return {"ok": False, "error": err}
     if _name_taken_by_other(v["name"], code0):
@@ -1519,7 +1536,7 @@ async def editevo_anime(update, context):
             await _reply(msg, "❌ The anime name cannot be empty.")
             return X_ANIME
         d["eevo_anime"] = anime
-    await _reply(msg, f"3️⃣ Rarity (Common / Rare / Epic / Legendary / Mythical / Celestial), or ⏭ Skip.\n"
+    await _reply(msg, f"3️⃣ Rarity (Common / Rare / Epic / Legendary / Mythical / Celestial / Heavenly), or ⏭ Skip.\n"
                       f"Current: {d['eevo_row'][3]}", reply_markup=_skip_markup())
     return X_RARITY
 

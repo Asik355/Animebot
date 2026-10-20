@@ -1021,6 +1021,7 @@ SYMBOL = {
     "Legendary": "💎",
     "Mythical": "🔮",
     "Celestial": "💠",
+    "Heavenly": "🧿",   # fusion-only tier: never spawns, only /addevo and /editevo may use it
 }
 
 WORTH = {
@@ -3307,12 +3308,13 @@ async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
         rows = [r for r in rows if r[3] == rarity]
 
     rarity_order = {
-        "Celestial": 0,
-        "Mythical": 1,
-        "Legendary": 2,
-        "Epic": 3,
-        "Rare": 4,
-        "Common": 5,
+        "Heavenly": 0,
+        "Celestial": 1,
+        "Mythical": 2,
+        "Legendary": 3,
+        "Epic": 4,
+        "Rare": 5,
+        "Common": 6,
     }
 
     if sort_mode == "time":
@@ -3336,7 +3338,7 @@ def clear_favorite(user_id):
     mongo_db.clear_favorite(user_id)
 
 # Tier menu (🔹 Tier button): highest tier first. Callback mode format: <sort>[~<Rarity>], e.g. "name~Epic".
-COLLECTION_TIERS = ("Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
+COLLECTION_TIERS = ("Heavenly", "Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
 COLLECTION_SORTS = {"tier", "time", "name", "qty"}
 
 
@@ -4989,7 +4991,7 @@ async def addcharacter_rarity(update, context):
         return ADD_WORTH
     rarity = text.title()
 
-    if rarity not in SYMBOL:
+    if rarity not in SYMBOL or rarity == "Heavenly":
         await safe_reply_text(update.message, "❌ Invalid rarity.")
         return ADD_RARITY
 
@@ -5280,7 +5282,7 @@ async def edit_rarity(update, context):
         rarity = context.user_data["edit_character"][3]
     else:
         rarity = text.title()
-        if rarity not in SYMBOL:
+        if rarity not in SYMBOL or rarity == "Heavenly":
             await safe_reply_text(update.message, "❌ Invalid rarity.")
             return EDIT_RARITY
     context.user_data["edit_rarity"] = rarity
