@@ -16,7 +16,7 @@ Every section has its own Edit/Preview/Reset/Save controls and a full-width Back
 
 Persistence (existing MongoDB, collection `bot_settings`, one document):
     _id "theme_customization": {welcome:{text}, banner:{file_id,unique_id}, buttons:{items:[...]}, about:{text},
-                                links:{channel|group|website:[{label,url},...]}, theme:{start,help}, description:{text,short}, updated_at}
+                                links:{channel|group|website:[{label,url},...]}, theme:{start,help}, description:{text}, updated_at}
     A section key that is missing means "built-in default". Save $sets only that section's key; Reset $unsets only it.
     The saved values are mirrored in memory (loaded at startup), so reads are free and saved settings survive restarts.
 
@@ -51,9 +51,9 @@ START_SECTIONS = ("welcome", "banner", "buttons", "links", "theme")      # secti
 
 MAX_TEXT = 3500            # welcome / about (Telegram allows 4096; room for the name header and theme frame)
 MAX_LABEL = 30
-MAX_DESC = 512             # Telegram: bot description (plain text, shown when the chat is empty)
-MIN_DESC = 10              # shortest text accepted for the description and the short description
-MAX_SHORT_DESC = 120       # Telegram: short description (the line on the bot profile)
+MAX_DESC = 120             # ONE description text. Telegram's profile line ("short description") holds at most 120
+                           # characters, so that is the limit; the same text is also used as the empty-chat description.
+MIN_DESC = 10              # shortest text accepted for the description
 MAX_URL = 256
 MAX_BUTTONS = 12
 MAX_PER_ROW = 4                      # buttons in one row (Telegram allows 8, but names get cut off on phones)
@@ -763,11 +763,10 @@ def panel_view(uid, section, notice=""):
                 [("👁️ Preview Links", section, "preview"), ("♻️ Reset", section, "reset")],
                 [("💾 Save", section, "save")], _back()]
     elif section == "description":
-        text = (f"{pre}📄 Bot Description\n\nThe text people see when they open your bot for the first time "
-                f"(plain text, {MIN_DESC}-{MAX_DESC} characters) and the short line on the bot's profile "
-                f"({MIN_DESC}-{MAX_SHORT_DESC} characters).\n\n{_description_summary(uid)}\n\n{_status(uid, section)}")
+        text = (f"{pre}📄 Bot Description\n\nThe text shown in the \"Description\" row of your bot's profile page "
+                f"(plain text, {MIN_DESC}-{MAX_DESC} characters). The same text is also shown on the empty chat screen "
+                f"before someone presses Start.\n\n{_description_summary(uid)}\n\n{_status(uid, section)}")
         rows = [[("✏️ Edit", section, "edit"), ("👁️ Preview", section, "preview")],
-                [("✏️ Edit Short Description", section, "editshort")],
                 [("♻️ Reset", section, "reset"), ("💾 Save", section, "save")], _back()]
     else:  # theme
         t = _draft(uid, "theme") or _saved.get("theme") or {}
@@ -1521,123 +1520,141 @@ async def _input_link(message, uid, section, st):
     await _send_panel(message, uid, section, f"✏️ “{label}” added (not saved yet). Add more, or use 👁️ Preview Links, then 💾 Save.")
 
 
-# ---- description (Telegram bot description + short description) -----------------------------------------------
-_DESC_FIELDS = {
-    "text": ("description", MAX_DESC, "DESCRIPTION", "the description"),
-    "short": ("short description", MAX_SHORT_DESC, "SHORT DESCRIPTION (the line on the bot's profile)", "the short description"),
-}
+# ---- description (ONE text -> the bot's profile line AND its empty-chat description) -------------------------
+def _tg_len(text):
+    """Length the way Telegram counts it (UTF-16 units: an emoji can count as 2), so the counter never lies."""
+    return len((text or "").encode("utf-16-le")) // 2
 
 
-def validate_description(text, limit, what):
+def validate_description(text, limit=MAX_DESC, what="description"):
     """Plain text only (Telegram does not render HTML here). -> (clean, None) or (None, error)."""
     t = (text or "").replace("\r\n", "\n").strip()
     if not t:
         return None, "Send the text as a normal message (plain text, not empty)."
-    if len(t) < MIN_DESC:
-        return None, f"That is only {len(t)} characters; the {what} must be at least {MIN_DESC}."
-    if len(t) > limit:
-        return None, f"That is {len(t)} characters; the limit for the {what} is {limit}."
+    n = _tg_len(t)
+    if n < MIN_DESC:
+        return None, f"That is only {n} characters; the {what} must be at least {MIN_DESC}."
+    if n > limit:
+        return None, (f"That is {n} characters; the limit for the {what} is {limit} "
+                      f"(Telegram counts an emoji as 2). Please shorten it by {n - limit}.")
     return t, None
 
 
 def _description_value(uid):
-    return {**(_saved.get("description") or {}), **(_draft(uid, "description") or {})}
+    """The text being worked on: the pending draft if there is one, else the saved text."""
+    d = _draft(uid, "description")
+    if d is not None:
+        return d.get("text") or ""
+    return (_saved.get("description") or {}).get("text") or ""
 
 
 def _description_summary(uid):
-    v = _description_value(uid)
-    out = []
-    for key, (what, limit, _, _) in _DESC_FIELDS.items():
-        t = v.get(key)
-        out.append(f"{what.capitalize()}: " + (f"{len(t)}/{limit} characters" if t else "not set"))
-    return "\n".join(out)
+    t = _description_value(uid)
+    return "Description: " + (f"{_tg_len(t)}/{MAX_DESC} characters" if t else "not set")
 
 
-async def _tg_set_description(bot, key, value):
-    """Set (or, with an empty value, clear) one description field on Telegram. Raises on failure."""
-    if key == "text":
-        await bot.set_my_description(description=value or "")
-    else:
-        await bot.set_my_short_description(short_description=value or "")
+def _norm(s):
+    return " ".join((s or "").split())
 
 
-async def _sync_description(bot, new, old, keys):
+async def _read_description(bot):
+    """What Telegram currently shows: (profile line, empty-chat description). Raises on failure."""
+    short = await bot.get_my_short_description()
+    long_ = await bot.get_my_description()
+    return (getattr(short, "short_description", "") or ""), (getattr(long_, "description", "") or "")
+
+
+async def _tg_apply(bot, text):
+    """Set (or, with an empty value, clear) BOTH places on Telegram from one text. Raises on failure."""
+    await bot.set_my_short_description(short_description=text or "")
+    await bot.set_my_description(description=text or "")
+
+
+async def _sync_description(bot, new_text, old_text):
     """
-    Make Telegram match `new` for the given fields. If any call fails, the fields already changed are put back to `old`
-    and the error text is returned (None = everything applied).
+    Make Telegram show `new_text` (None/"" = cleared) and CHECK it by reading it back. On any failure Telegram is put
+    back to what it showed before and the error text is returned (None = applied and verified).
     """
-    done = []
     try:
-        for key in keys:
-            await _tg_set_description(bot, key, new.get(key))
-            done.append(key)
+        before = await _read_description(bot)
+    except Exception as e:
+        logger.warning("could not read the current description: %s", e)
+        before = None
+    try:
+        await _tg_apply(bot, new_text)
+        short, long_ = await _read_description(bot)
+        want = _norm(new_text)
+        if _norm(short) != want or _norm(long_) != want:
+            raise RuntimeError("Telegram did not keep the text (it shows something different after saving)")
         return None
     except Exception as e:
         logger.error("set description failed: %s", e)
-        for key in done:
-            try:
-                await _tg_set_description(bot, key, old.get(key))
-            except Exception as e2:
-                logger.error("could not restore the previous %s: %s", key, e2)
+        try:
+            if before is not None:
+                await bot.set_my_short_description(short_description=before[0])
+                await bot.set_my_description(description=before[1])
+            else:
+                await _tg_apply(bot, old_text)
+        except Exception as e2:
+            logger.error("could not restore the previous description: %s", e2)
         return str(e) or e.__class__.__name__
 
 
 async def apply_saved_description(bot):
     """Called at startup: push the saved description to Telegram again when it differs. Never raises."""
-    value = _saved.get("description") or {}
-    for key in ("text", "short"):
-        want = value.get(key)
-        if not want:
-            continue
-        try:
-            cur = await (bot.get_my_description() if key == "text" else bot.get_my_short_description())
-            have = getattr(cur, "description" if key == "text" else "short_description", None) or ""
-            if have != want:
-                await _tg_set_description(bot, key, want)
-                logger.info("bot %s restored from the database", _DESC_FIELDS[key][0])
-        except Exception as e:
-            logger.warning("could not apply the saved bot %s: %s", _DESC_FIELDS[key][0], e)
+    want = (_saved.get("description") or {}).get("text")
+    if not want:
+        return
+    try:
+        short, long_ = await _read_description(bot)
+        if _norm(short) != _norm(want):
+            await bot.set_my_short_description(short_description=want)
+        if _norm(long_) != _norm(want):
+            await bot.set_my_description(description=want)
+        logger.info("bot description checked against the database")
+    except Exception as e:
+        logger.warning("could not apply the saved bot description: %s", e)
 
 
 async def _description_section(q, context, uid, action, arg):
     section = "description"
     bot = context.bot
-    if action in ("edit", "editshort"):
-        key = "text" if action == "edit" else "short"
-        _, limit, title, _ = _DESC_FIELDS[key]
-        _set_await(uid, section, key)
+    if action == "edit":
+        _set_await(uid, section, "text")
         await _answer(q)
-        await _show(q, *_prompt_view(uid, section, f"✏️ Send the new {title}.\n\nPlain text only (no HTML) - {MIN_DESC} to {limit} characters. "
+        await _show(q, *_prompt_view(uid, section, f"✏️ Send the new description.\n\nPlain text only (no HTML) - {MIN_DESC} to {MAX_DESC} "
+                                                  "characters (an emoji counts as 2). It is shown in the Description row of the bot's profile. "
                                                   "Nothing is saved until you press 💾 Save.\n\nTap Cancel to keep things as they are."))
     elif action == "preview":
         await _answer(q)
-        v = _description_value(uid)
-        if not v.get("text") and not v.get("short"):
+        t = _description_value(uid)
+        if not t:
             await q.message.reply_text("👁 Preview: no description is set.")
             return
         pending = " (not saved)" if (uid, section) in _drafts else ""
         await q.message.reply_text(
-            f"👁 Preview{pending}\n\n📄 Description:\n{v.get('text') or '(not set)'}\n\n"
-            f"📝 Short description:\n{v.get('short') or '(not set)'}", **_nopreview())
+            f"👁 Preview{pending} - exactly as Telegram shows it ({_tg_len(t)}/{MAX_DESC})\n\n"
+            f"On the bot's profile (Description row):\n{t}\n\n"
+            f"On the empty chat screen:\n{t}", **_nopreview())
     elif action == "save":
         draft = _draft(uid, section)
-        if not draft:
+        if not draft or not draft.get("text"):
             await _answer(q, "Nothing to save - there are no pending changes.", True)
             return
         old = dict(_saved.get(section) or {})
-        new = {**old, **draft}
-        keys = [k for k in ("text", "short") if k in draft]
-        err = await _sync_description(bot, new, old, keys)         # Telegram first: if it refuses, nothing is stored
+        new = {"text": draft["text"]}
+        err = await _sync_description(bot, new["text"], old.get("text"))   # Telegram first, then verified by reading it back
         if err:
             await _answer(q, f"❌ Telegram refused it: {err[:120]}. Nothing was changed.", True)
             return
-        if not await _persist(section, new):                       # database failed: put Telegram back as it was
-            await _sync_description(bot, old, new, keys)
+        if not await _persist(section, new):                               # database failed: put Telegram back as it was
+            await _sync_description(bot, old.get("text"), new["text"])
             await _answer(q, "❌ Could not save (database problem). Nothing was changed - your pending text was kept.", True)
             return
         _clear_draft(uid, section)
         await _answer(q, "💾 Saved.")
-        await _show(q, *panel_view(uid, section, "✅ Saved and applied on Telegram."))
+        await _show(q, *panel_view(uid, section, "✅ Saved, applied on Telegram and checked. If you still see the old text, "
+                                                 "close and reopen Telegram (it caches bot profiles)."))
     elif action == "reset":
         await _ask_reset(q, uid, section, "the description")
     elif action == "resetok":
@@ -1645,12 +1662,12 @@ async def _description_section(q, context, uid, action, arg):
             await _answer(q, STALE_TEXT, True)
             return
         old = dict(_saved.get(section) or {})
-        err = await _sync_description(bot, {}, old, ("text", "short"))
+        err = await _sync_description(bot, "", old.get("text"))
         if err:
             await _answer(q, f"❌ Telegram refused it: {err[:120]}. Nothing was changed.", True)
             return
         if not await _persist(section, None):
-            await _sync_description(bot, old, {}, ("text", "short"))
+            await _sync_description(bot, old.get("text"), "")
             await _answer(q, "❌ Could not reset (database problem). Nothing was changed.", True)
             return
         _clear_draft(uid, section)
@@ -1661,18 +1678,14 @@ async def _description_section(q, context, uid, action, arg):
 
 
 async def _input_description(message, uid, section, st):
-    key = st["field"]
-    if key not in _DESC_FIELDS:
+    if st["field"] != "text":
         _awaiting.pop(uid, None)
         return
-    what, limit, _, _ = _DESC_FIELDS[key]
-    text, error = validate_description(message.text, limit, what)
+    text, error = validate_description(message.text)
     if error:
         await message.reply_text(f"❌ {error}\n\nYour saved version is unchanged. Send the text again, or tap Cancel on the message above.")
         return
-    d = dict(_draft(uid, section) or {})
-    d[key] = text
-    _set_draft(uid, section, d)
+    _set_draft(uid, section, {"text": text})
     _awaiting.pop(uid, None)
     await _send_panel(message, uid, section, "✏️ Pending change recorded (not saved yet). Use 👁️ Preview, then 💾 Save.")
 
