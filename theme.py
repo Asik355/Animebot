@@ -52,6 +52,7 @@ START_SECTIONS = ("welcome", "banner", "buttons", "links", "theme")      # secti
 MAX_TEXT = 3500            # welcome / about (Telegram allows 4096; room for the name header and theme frame)
 MAX_LABEL = 30
 MAX_DESC = 512             # Telegram: bot description (plain text, shown when the chat is empty)
+MIN_DESC = 10              # shortest text accepted for the description and the short description
 MAX_SHORT_DESC = 120       # Telegram: short description (the line on the bot profile)
 MAX_URL = 256
 MAX_BUTTONS = 12
@@ -763,8 +764,8 @@ def panel_view(uid, section, notice=""):
                 [("💾 Save", section, "save")], _back()]
     elif section == "description":
         text = (f"{pre}📄 Bot Description\n\nThe text people see when they open your bot for the first time "
-                f"(plain text, up to {MAX_DESC} characters) and the short line on the bot's profile "
-                f"(up to {MAX_SHORT_DESC} characters).\n\n{_description_summary(uid)}\n\n{_status(uid, section)}")
+                f"(plain text, {MIN_DESC}-{MAX_DESC} characters) and the short line on the bot's profile "
+                f"({MIN_DESC}-{MAX_SHORT_DESC} characters).\n\n{_description_summary(uid)}\n\n{_status(uid, section)}")
         rows = [[("✏️ Edit", section, "edit"), ("👁️ Preview", section, "preview")],
                 [("✏️ Edit Short Description", section, "editshort")],
                 [("♻️ Reset", section, "reset"), ("💾 Save", section, "save")], _back()]
@@ -1532,6 +1533,8 @@ def validate_description(text, limit, what):
     t = (text or "").replace("\r\n", "\n").strip()
     if not t:
         return None, "Send the text as a normal message (plain text, not empty)."
+    if len(t) < MIN_DESC:
+        return None, f"That is only {len(t)} characters; the {what} must be at least {MIN_DESC}."
     if len(t) > limit:
         return None, f"That is {len(t)} characters; the limit for the {what} is {limit}."
     return t, None
@@ -1604,7 +1607,7 @@ async def _description_section(q, context, uid, action, arg):
         _, limit, title, _ = _DESC_FIELDS[key]
         _set_await(uid, section, key)
         await _answer(q)
-        await _show(q, *_prompt_view(uid, section, f"✏️ Send the new {title}.\n\nPlain text only (no HTML) - up to {limit} characters. "
+        await _show(q, *_prompt_view(uid, section, f"✏️ Send the new {title}.\n\nPlain text only (no HTML) - {MIN_DESC} to {limit} characters. "
                                                   "Nothing is saved until you press 💾 Save.\n\nTap Cancel to keep things as they are."))
     elif action == "preview":
         await _answer(q)
