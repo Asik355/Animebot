@@ -5,17 +5,18 @@ theme.py - Bot Theme Customization (Owner only)
 Self-contained module. bot.py only needs:
     import theme
     theme.bind(is_owner=..., default_start_text=..., add_header=..., build_help_text=...)   # in main(), before register
-    theme.register(app)                                                                    # in main()
+    theme.register(app)                                                                    # in main(); also re-applies the saved
+                                                                                           # bot description after every restart
     await theme.send_start(update, context)   # in start(): returns False when nothing is customized -> original code runs
     theme.decorate_help_text(text)            # in build_help_text()
 
-Entry point: Owner Commands (/help) -> [🎨 Customize Bot] -> hub with six sections:
-    📝 Welcome   🖼️ Banner   🔘 Start Menu   📖 About Bot   🔗 Links   🎭 Theme
+Entry point: Owner Commands (/help) -> [🎨 Customize Bot] -> hub with seven sections:
+    📝 Welcome   🖼️ Banner   🔘 Start Menu   📖 About Bot   🔗 Links   🎭 Theme   📄 Description
 Every section has its own Edit/Preview/Reset/Save controls and a full-width Back.
 
 Persistence (existing MongoDB, collection `bot_settings`, one document):
     _id "theme_customization": {welcome:{text}, banner:{file_id,unique_id}, buttons:{items:[...]}, about:{text},
-                                links:{channel|group|website:[{label,url},...]}, theme:{start,help}, updated_at}
+                                links:{channel|group|website:[{label,url},...]}, theme:{start,help}, description:{text,short}, updated_at}
     A section key that is missing means "built-in default". Save $sets only that section's key; Reset $unsets only it.
     The saved values are mirrored in memory (loaded at startup), so reads are free and saved settings survive restarts.
 
@@ -45,11 +46,13 @@ logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------------- configuration
 SETTINGS_ID = "theme_customization"
-SECTIONS = ("welcome", "banner", "buttons", "about", "links", "theme")
+SECTIONS = ("welcome", "banner", "buttons", "about", "links", "theme", "description")
 START_SECTIONS = ("welcome", "banner", "buttons", "links", "theme")      # sections that change /start
 
 MAX_TEXT = 3500            # welcome / about (Telegram allows 4096; room for the name header and theme frame)
 MAX_LABEL = 30
+MAX_DESC = 512             # Telegram: bot description (plain text, shown when the chat is empty)
+MAX_SHORT_DESC = 120       # Telegram: short description (the line on the bot profile)
 MAX_URL = 256
 MAX_BUTTONS = 12
 MAX_PER_ROW = 4                      # buttons in one row (Telegram allows 8, but names get cut off on phones)
@@ -700,6 +703,7 @@ def hub_view(uid):
         [("📝 Welcome", "welcome", "open"), ("🖼️ Banner", "banner", "open")],
         [("🔘 Start Menu", "buttons", "open"), ("📖 About Bot", "about", "open")],
         [("🔗 Links", "links", "open"), ("🎭 Theme", "theme", "open")],
+        [("📄 Description", "description", "open")],
     ])
     rows = list(base.inline_keyboard) + [[_owner_menu_back(uid)]]
     unsaved = sorted(s for s in SECTIONS if (uid, s) in _drafts)
@@ -757,6 +761,13 @@ def panel_view(uid, section, notice=""):
                 [("➕ Add Website/Social", section, "setwebsite"), ("🗑️ Remove Link", section, "remove")],
                 [("👁️ Preview Links", section, "preview"), ("♻️ Reset", section, "reset")],
                 [("💾 Save", section, "save")], _back()]
+    elif section == "description":
+        text = (f"{pre}📄 Bot Description\n\nThe text people see when they open your bot for the first time "
+                f"(plain text, up to {MAX_DESC} characters) and the short line on the bot's profile "
+                f"(up to {MAX_SHORT_DESC} characters).\n\n{_description_summary(uid)}\n\n{_status(uid, section)}")
+        rows = [[("✏️ Edit", section, "edit"), ("👁️ Preview", section, "preview")],
+                [("✏️ Edit Short Description", section, "editshort")],
+                [("♻️ Reset", section, "reset"), ("💾 Save", section, "save")], _back()]
     else:  # theme
         t = _draft(uid, "theme") or _saved.get("theme") or {}
         text = (f"{pre}🎭 Bot Theme\n\nOnly /start and /help are themed. Telegram does not allow custom button colours, "
@@ -1509,6 +1520,160 @@ async def _input_link(message, uid, section, st):
     await _send_panel(message, uid, section, f"✏️ “{label}” added (not saved yet). Add more, or use 👁️ Preview Links, then 💾 Save.")
 
 
+# ---- description (Telegram bot description + short description) -----------------------------------------------
+_DESC_FIELDS = {
+    "text": ("description", MAX_DESC, "DESCRIPTION", "the description"),
+    "short": ("short description", MAX_SHORT_DESC, "SHORT DESCRIPTION (the line on the bot's profile)", "the short description"),
+}
+
+
+def validate_description(text, limit, what):
+    """Plain text only (Telegram does not render HTML here). -> (clean, None) or (None, error)."""
+    t = (text or "").replace("\r\n", "\n").strip()
+    if not t:
+        return None, "Send the text as a normal message (plain text, not empty)."
+    if len(t) > limit:
+        return None, f"That is {len(t)} characters; the limit for the {what} is {limit}."
+    return t, None
+
+
+def _description_value(uid):
+    return {**(_saved.get("description") or {}), **(_draft(uid, "description") or {})}
+
+
+def _description_summary(uid):
+    v = _description_value(uid)
+    out = []
+    for key, (what, limit, _, _) in _DESC_FIELDS.items():
+        t = v.get(key)
+        out.append(f"{what.capitalize()}: " + (f"{len(t)}/{limit} characters" if t else "not set"))
+    return "\n".join(out)
+
+
+async def _tg_set_description(bot, key, value):
+    """Set (or, with an empty value, clear) one description field on Telegram. Raises on failure."""
+    if key == "text":
+        await bot.set_my_description(description=value or "")
+    else:
+        await bot.set_my_short_description(short_description=value or "")
+
+
+async def _sync_description(bot, new, old, keys):
+    """
+    Make Telegram match `new` for the given fields. If any call fails, the fields already changed are put back to `old`
+    and the error text is returned (None = everything applied).
+    """
+    done = []
+    try:
+        for key in keys:
+            await _tg_set_description(bot, key, new.get(key))
+            done.append(key)
+        return None
+    except Exception as e:
+        logger.error("set description failed: %s", e)
+        for key in done:
+            try:
+                await _tg_set_description(bot, key, old.get(key))
+            except Exception as e2:
+                logger.error("could not restore the previous %s: %s", key, e2)
+        return str(e) or e.__class__.__name__
+
+
+async def apply_saved_description(bot):
+    """Called at startup: push the saved description to Telegram again when it differs. Never raises."""
+    value = _saved.get("description") or {}
+    for key in ("text", "short"):
+        want = value.get(key)
+        if not want:
+            continue
+        try:
+            cur = await (bot.get_my_description() if key == "text" else bot.get_my_short_description())
+            have = getattr(cur, "description" if key == "text" else "short_description", None) or ""
+            if have != want:
+                await _tg_set_description(bot, key, want)
+                logger.info("bot %s restored from the database", _DESC_FIELDS[key][0])
+        except Exception as e:
+            logger.warning("could not apply the saved bot %s: %s", _DESC_FIELDS[key][0], e)
+
+
+async def _description_section(q, context, uid, action, arg):
+    section = "description"
+    bot = context.bot
+    if action in ("edit", "editshort"):
+        key = "text" if action == "edit" else "short"
+        _, limit, title, _ = _DESC_FIELDS[key]
+        _set_await(uid, section, key)
+        await _answer(q)
+        await _show(q, *_prompt_view(uid, section, f"✏️ Send the new {title}.\n\nPlain text only (no HTML) - up to {limit} characters. "
+                                                  "Nothing is saved until you press 💾 Save.\n\nTap Cancel to keep things as they are."))
+    elif action == "preview":
+        await _answer(q)
+        v = _description_value(uid)
+        if not v.get("text") and not v.get("short"):
+            await q.message.reply_text("👁 Preview: no description is set.")
+            return
+        pending = " (not saved)" if (uid, section) in _drafts else ""
+        await q.message.reply_text(
+            f"👁 Preview{pending}\n\n📄 Description:\n{v.get('text') or '(not set)'}\n\n"
+            f"📝 Short description:\n{v.get('short') or '(not set)'}", **_nopreview())
+    elif action == "save":
+        draft = _draft(uid, section)
+        if not draft:
+            await _answer(q, "Nothing to save - there are no pending changes.", True)
+            return
+        old = dict(_saved.get(section) or {})
+        new = {**old, **draft}
+        keys = [k for k in ("text", "short") if k in draft]
+        err = await _sync_description(bot, new, old, keys)         # Telegram first: if it refuses, nothing is stored
+        if err:
+            await _answer(q, f"❌ Telegram refused it: {err[:120]}. Nothing was changed.", True)
+            return
+        if not await _persist(section, new):                       # database failed: put Telegram back as it was
+            await _sync_description(bot, old, new, keys)
+            await _answer(q, "❌ Could not save (database problem). Nothing was changed - your pending text was kept.", True)
+            return
+        _clear_draft(uid, section)
+        await _answer(q, "💾 Saved.")
+        await _show(q, *panel_view(uid, section, "✅ Saved and applied on Telegram."))
+    elif action == "reset":
+        await _ask_reset(q, uid, section, "the description")
+    elif action == "resetok":
+        if _pop_confirm(arg, uid, section, "reset") is None:
+            await _answer(q, STALE_TEXT, True)
+            return
+        old = dict(_saved.get(section) or {})
+        err = await _sync_description(bot, {}, old, ("text", "short"))
+        if err:
+            await _answer(q, f"❌ Telegram refused it: {err[:120]}. Nothing was changed.", True)
+            return
+        if not await _persist(section, None):
+            await _sync_description(bot, old, {}, ("text", "short"))
+            await _answer(q, "❌ Could not reset (database problem). Nothing was changed.", True)
+            return
+        _clear_draft(uid, section)
+        await _answer(q, "♻️ Reset.")
+        await _show(q, *panel_view(uid, section, "✅ The description was cleared and removed from Telegram."))
+    else:
+        await _answer(q, STALE_TEXT, True)
+
+
+async def _input_description(message, uid, section, st):
+    key = st["field"]
+    if key not in _DESC_FIELDS:
+        _awaiting.pop(uid, None)
+        return
+    what, limit, _, _ = _DESC_FIELDS[key]
+    text, error = validate_description(message.text, limit, what)
+    if error:
+        await message.reply_text(f"❌ {error}\n\nYour saved version is unchanged. Send the text again, or tap Cancel on the message above.")
+        return
+    d = dict(_draft(uid, section) or {})
+    d[key] = text
+    _set_draft(uid, section, d)
+    _awaiting.pop(uid, None)
+    await _send_panel(message, uid, section, "✏️ Pending change recorded (not saved yet). Use 👁️ Preview, then 💾 Save.")
+
+
 # ---- theme ----------------------------------------------------------------------------------------------
 async def _theme_section(q, context, uid, action, arg):
     section = "theme"
@@ -1569,7 +1734,7 @@ _drafts_last = {}       # owner -> "start"/"help": which menu Preview shows
 
 _SECTION_HANDLERS = {
     "welcome": _text_section, "about": _text_section, "banner": _banner_section,
-    "buttons": _buttons_section, "links": _links_section, "theme": _theme_section,
+    "buttons": _buttons_section, "links": _links_section, "theme": _theme_section, "description": _description_section,
 }
 
 
@@ -1596,6 +1761,8 @@ async def theme_input(update, context):
             await _input_buttons(msg, user.id, section, st)
         elif section == "links":
             await _input_link(msg, user.id, section, st)
+        elif section == "description":
+            await _input_description(msg, user.id, section, st)
     except Exception as e:
         logger.error("theme input failed: %s", e)
         await msg.reply_text("⚠️ Something went wrong. Nothing was saved. Please reopen the menu.")
@@ -1620,3 +1787,13 @@ def register(app):
                                    theme_input))
     app.add_handler(CommandHandler("about", about_command))
     load_settings()
+
+    # Restart fix: after every start, push the saved description to Telegram again (only when it differs).
+    previous = getattr(app, "post_init", None)
+
+    async def _post_init(application):
+        if previous is not None:
+            await previous(application)
+        await apply_saved_description(application.bot)
+
+    app.post_init = _post_init
