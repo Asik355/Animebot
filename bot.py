@@ -112,6 +112,7 @@ ITEMS_PER_PAGE = 5
 import mongo_db
 import fusion  # Special Stone Daily Task System
 import theme   # Bot Theme Customization (Owner: /help -> Owner Commands -> 🎨 Customize Bot)
+import badge_banner  # Character badges + profile banners (all logic lives in badge_banner.py)
 
 
 def _mc(name):
@@ -1357,6 +1358,7 @@ def _build_help_text_raw():
         "/claimstone — Claim the stones of your completed tasks\n"
         "/stone — Stone leaderboard\n"
         "/item — View your items (personal inventory)\n\n"
+        + badge_banner.PUBLIC_HELP_SECTION +
         "📜 Rules\n"
         "/rules — View the bot usage rules (/rules noformat for raw text)\n\n"
         "👥 Staff\n"
@@ -1578,6 +1580,7 @@ def _module_button(label, callback_data):
 # Add & Edit shows in all three role menus; the Owner and Executive pages also list the Evolution commands.
 HELP_MODULES["owner"].append(("addedit", "🎴 Add & Edit", _addedit_page("owner")))
 HELP_MODULES["executive"].append(("addedit", "🎴 Add & Edit", _addedit_page("executive")))
+HELP_MODULES["executive"].append(badge_banner.help_module())      # 🏅 Badges (copied into the Owner menu by the loop below)
 
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Please run /help to open your own menu."
 # Executive and Scout modules stay in their own menus AND are copied (same text) into the Owner menu.
@@ -1659,7 +1662,8 @@ def staff_help_keyboard(user_id):
         rows.append([_module_button("🔭 Scout Commands", f"help:{user_id}:scout")])
     elif is_scout(user_id):
         rows.append([_module_button("🔭 Scout Commands", f"help:{user_id}:scout")])
-    return InlineKeyboardMarkup(rows) if rows else None
+    rows.append(badge_banner.help_button_row(user_id))      # 🏅 Badges & Banners: every member gets this button
+    return InlineKeyboardMarkup(rows)
 
 def start_help_keyboard(user_id):
     return InlineKeyboardMarkup([
@@ -3689,7 +3693,7 @@ async def mystats(update, context):
     guess_earned = int(guess_doc.get("guess_reward_total") or 0) if guess_doc.get("guess_reward_day") == shop_rotation_key() else 0
     guess_remaining = max(0, GUESS_REWARD_CAP - guess_earned)
 
-    await safe_reply_text(update.message,
+    await badge_banner.send_mystats(update, context,
         f"👤 {update.effective_user.first_name}\n\n"
         f"🛡 Role: {(await asyncio.to_thread(staff_role, update.effective_user.id))}\n"
         f"💰 Berrys: {coins}\n"
@@ -3704,7 +3708,7 @@ async def mystats(update, context):
         f"🎯 Number Guess (daily cap)\n"
         f"🎁 Earned today: {guess_earned} ⦵\n"
         f"📊 Remaining: {guess_remaining} ⦵"
-    , parse_mode="HTML")
+    )
 
 SHOP_RARITIES = ("Common", "Rare", "Legendary", "Mythical")
 SHOP_REFRESH_COST = 100
@@ -5478,6 +5482,7 @@ def purge_user_data(user_id):
         _mc("shop_v3").delete_many({"user_id": uid}, session=session)
         _mc("shop_purchases_v2").delete_many({"user_id": uid}, session=session)
         _mc("shop_free_refresh_v1").delete_one({"_id": uid}, session=session)
+        badge_banner.purge_user(uid, session)        # badge claims + equipped banner
         removed = _mc(mongo_db.USERS).delete_one({"_id": uid}, session=session).deleted_count
         return copies, removed
     return mongo_db.run_transaction(_work)
@@ -5670,6 +5675,7 @@ def _archive_user_data(uid):
             (mongo_db.FAVORITES, {"_id": uid}), (mongo_db.NOTIFICATIONS, {"_id": uid}),
             ("shop_v3", {"user_id": uid}), ("shop_purchases_v2", {"user_id": uid}),
             ("shop_free_refresh_v1", {"_id": uid})]
+    spec += [(name, {key: uid}) for name, key in badge_banner.USER_DATA_SPEC]      # badge claims + equipped banner
     data = {name: list(_mc(name).find(flt)) for name, flt in spec}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     doc = {"archived_at": stamp, "user_id": uid,
@@ -5900,7 +5906,7 @@ async def _dacct_answer(q, text=None, alert=False):
 # Same collections (and the same ownership keys) that purge_user_data removes / _archive_user_data saves.
 _RESTORE_SPEC = ((mongo_db.USERS, "_id"), (mongo_db.COLLECTIONS, "user_id"), (mongo_db.FAVORITES, "_id"),
                  (mongo_db.NOTIFICATIONS, "_id"), ("shop_v3", "user_id"), ("shop_purchases_v2", "user_id"),
-                 ("shop_free_refresh_v1", "_id"))
+                 ("shop_free_refresh_v1", "_id")) + badge_banner.USER_DATA_SPEC
 # Review bookkeeping that must never come back with a restored profile (it would leave the user stuck in "deleting").
 _RESTORE_STRIP_USER_FIELDS = ("deleted_review", "deleted_review_at", "deleted_review_reason",
                               "deleted_review_token", "deleted_review_confirm_at", "missing_strikes")
@@ -6203,6 +6209,7 @@ def _move_user_data(plan, old, new):
                         nd["_id"] = new
                         _mc(name).insert_one(nd, session=session)
                         inserted.append((name, new))
+            badge_banner.move_user_data(data, new, session, inserted)      # badge claims + equipped banner (never overwrites)
             res = _mc(mongo_db.USERS).update_one({"_id": new}, {"$set": carry}, session=session)
             if not res.matched_count:
                 raise ValueError("the new account disappeared")
@@ -10023,8 +10030,9 @@ COMMANDS = {
     "unlogmap": "Owner: remove a command's log mapping (/unlogmap <command>)",
     "logmappings": "Owner: list command -> log category mappings",
 }
+COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 
-PUBLIC_COMMANDS = {
+PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
@@ -10034,7 +10042,7 @@ PUBLIC_COMMANDS = {
 }
 
 def make_bot_commands(names):
-    return [BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS]
+    return badge_banner.fit_command_menu([BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS])   # Telegram: max 100
 
 async def refresh_group_command_menu(bot, chat_id, user_id):
     from telegram import BotCommandScopeChatMember
@@ -10667,7 +10675,7 @@ EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict", "restrictions",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory", "addmessage",
     "btransfer", "unbtransfer", "setrules",
-}
+} | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
 }
@@ -10983,6 +10991,9 @@ def main():
     theme.bind(is_owner=is_owner, default_start_text=START_TEXT, build_help_text=build_help_text,
                add_header=add_display_name_header)
     theme.register(app)   # 🎨 Customize Bot callbacks, owner input handler, /about
+    badge_banner.bind(is_owner=is_owner, is_executive=is_executive, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text,
+                      cancel_all=cancel_conversation, mark_success=mark_success, items_per_page=ITEMS_PER_PAGE)
+    badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner /listbanners
 
     register_executive_commands(app)
     register_owner_commands(app)
