@@ -30,7 +30,7 @@ import re
 import secrets
 import threading
 from datetime import datetime, timedelta, timezone
-from html import escape as _esc
+from html import escape as _esc, unescape as _unesc
 
 import mongo_db
 from pymongo import ASCENDING
@@ -525,10 +525,23 @@ def move_user_data(data, new, session, inserted):
 # Messaging helpers
 # ==========================================================================
 async def _reply(msg, text, **kw):
+    """Send through bot.py's safe_reply_text. If Telegram rejects the HTML (should not happen: every dynamic value is
+    escaped), resend the same text as plain text so the member always gets an answer."""
     fn = _deps.get("safe_reply")
-    if fn:
-        return await fn(msg, text, **kw)
-    return await msg.reply_text(text, **kw)
+    send = fn if fn else (lambda m, t, **k: m.reply_text(t, **k))
+    try:
+        return await send(msg, text, **kw)
+    except Exception as e:
+        if kw.get("parse_mode") and "parse entities" in str(e).lower():
+            logger.warning("badge_banner: HTML rejected, resending as plain text: %s", e)
+            plain = dict(kw)
+            plain.pop("parse_mode", None)
+            return await send(msg, _unhtml(text), **plain)
+        raise
+
+
+def _unhtml(text):
+    return _unesc(re.sub(r"</?[a-z]+[^>]*>", "", str(text)))
 
 
 def _chunks(text, limit=4000):
@@ -709,7 +722,7 @@ def _banner_page_html(rows, page, uid, dropped=None):
             req.append(f"{mark} {_label(str(c), r['names'])}")
         lines.append("   Needs: " + (", ".join(req) or "—"))
         lines.append("")
-    lines.append("Equip an unlocked banner with /usebanner <code>.")
+    lines.append("Equip an unlocked banner with /usebanner &lt;code&gt;.")     # HTML mode: a raw <code> is a Telegram tag and breaks the message
     return "\n".join(lines), _pager("bb:bp", uid, page, pages)
 
 
