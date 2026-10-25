@@ -60,6 +60,7 @@ USER_BANNERS = "user_banners_v1"
 
 BANNER_NAME_MAX = 40
 BANNER_MAX_CHARACTERS = 10
+BANNER_MAX_CODE = 999         # banner codes are always exactly 3 digits (001-999)
 PICKER_MAX = 10
 CAPTION_LIMIT = 1024          # Telegram photo caption limit
 MYSTATS_TIER_NAMES_MAX = 12   # names shown per tier inside /mystats (the full list is behind 🏅 View Badges)
@@ -181,7 +182,7 @@ def normalize_char_code(value):
 def normalize_banner_code(value):
     """'1' -> '001', '001' -> '001'; anything else -> None."""
     v = str(value or "").strip()
-    if v.isdigit() and int(v) >= 1:
+    if v.isdigit() and 1 <= int(v) <= BANNER_MAX_CODE:
         return str(int(v)).zfill(3)
     return None
 
@@ -455,6 +456,8 @@ def create_banner(draft, creator_id):
     now = _stamp()
     for _ in range(8):
         n = mongo_db.next_sequence(BANNERS)         # atomic counter: a code is never handed out twice or reused
+        if n > BANNER_MAX_CODE:                     # codes must stay 3 digits
+            return {"status": "full"}
         code = str(n).zfill(3)
         try:
             _col(BANNERS).insert_one({
@@ -713,17 +716,37 @@ def _banner_page_html(rows, page, uid, dropped=None):
         lines.append("No banners exist yet.")
     for i, r in enumerate(rows[page * per:(page + 1) * per], page * per + 1):
         b = r["banner"]
-        state = "🔓 Unlocked" if r["unlocked"] else "🔒 Locked"
-        eq = "  ⭐ EQUIPPED" if r["equipped"] else ""
-        lines.append(f"{i}. {_esc(b['name'])} — {b['_id']}\n   {state}{eq}")
-        req = []
-        for c in b.get("required_codes") or []:
-            mark = "✅" if str(c) in r["owned"] else "❌"
-            req.append(f"{mark} {_label(str(c), r['names'])}")
-        lines.append("   Needs: " + (", ".join(req) or "—"))
-        lines.append("")
-    lines.append("Equip an unlocked banner with /usebanner &lt;code&gt;.")     # HTML mode: a raw <code> is a Telegram tag and breaks the message
+        state = "🔓" if r["unlocked"] else "🔒"
+        eq = " ⭐" if r["equipped"] else ""
+        lines.append(f"{i}. {_esc(b['name'])} — {b['_id']} {state}{eq}")
+    lines.append("")
+    lines.append("See a banner's details with /banner &lt;code&gt; (example: /banner 001).")     # HTML mode: a raw <code> is a Telegram tag and breaks the message
+    lines.append("Equip an unlocked banner with /usebanner &lt;code&gt;.")
     return "\n".join(lines), _pager("bb:bp", uid, page, pages)
+
+
+def _banner_detail(uid, code):
+    """(html, banner or None) for /banner <code>: status plus the required characters (✅ owned / ❌ missing)."""
+    banner = get_banner(code)
+    if banner is None:
+        return None, None
+    owned = owned_codes(uid)
+    names = _names({str(c) for c in banner.get("required_codes") or []})
+    unlocked = is_unlocked(banner, owned)
+    eq_doc = _col(USER_BANNERS).find_one({"_id": int(uid)})
+    equipped = bool(unlocked and eq_doc and eq_doc.get("banner_code") == banner["_id"])
+    lines = [f"🎌 {_esc(banner['name'])}", f"Code: {banner['_id']}",
+             "Status: " + ("🔓 Unlocked" if unlocked else "🔒 Locked") + ("  ⭐ EQUIPPED" if equipped else ""),
+             "", "Required characters:"]
+    for c in banner.get("required_codes") or []:
+        mark = "✅" if str(c) in owned else "❌"
+        lines.append(f"{mark} {_label(str(c), names)}")
+    lines.append("")
+    if unlocked and not equipped:
+        lines.append(f"Equip it with /usebanner {banner['_id']}")
+    elif not unlocked:
+        lines.append("Own all the characters above to unlock it.")
+    return "\n".join(lines), banner
 
 
 def _banner_view(uid, page, dropped=None):
@@ -738,6 +761,35 @@ def _banner_view_with_check(uid, page):
 
 async def banner_command(update, context):
     uid = update.effective_user.id
+    arg = (context.args[0] if context.args else "").strip()
+    if arg:                                             # /banner 001 -> details of that banner
+        code = normalize_banner_code(arg)
+        if code is None:
+            await _reply(update.effective_message, "❌ Invalid banner code. Use a 3-digit code from /banner, e.g. /banner 001")
+            return
+        try:
+            _b, _dropped = await asyncio.to_thread(get_equipped, uid)    # lazy auto-unequip first
+            text, banner = await asyncio.to_thread(_banner_detail, uid, code)
+        except Exception as e:
+            logger.error("banner detail failed: %s", e)
+            await _reply(update.effective_message, "❌ Could not load that banner right now. Please try again.")
+            return
+        if banner is None:
+            await _reply(update.effective_message, "❌ No banner with that code. See /banner.")
+            return
+        if banner.get("photo_file_id") and len(text) <= CAPTION_LIMIT:
+            try:
+                msg = update.effective_message
+                thread = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+                await context.bot.send_photo(chat_id=msg.chat_id, photo=banner["photo_file_id"], caption=text,
+                                             parse_mode="HTML", message_thread_id=thread)
+                _ok(update)
+                return
+            except Exception as e:
+                logger.info("banner detail photo failed: %s", e)
+        await _reply(update.effective_message, text, parse_mode="HTML")
+        _ok(update)
+        return
     try:
         text, kb = await asyncio.to_thread(_banner_view_with_check, uid, 0)
     except Exception as e:
@@ -924,6 +976,8 @@ async def addbanner_confirm(update, context):
     elif res["status"] == "invalid":
         await _edit(q, "❌ Nothing was created - the data is no longer valid:\n" + "\n".join(res["problems"]) +
                     "\n\nRun /addbanner again.")
+    elif res["status"] == "full":
+        await _edit(q, f"❌ All banner codes (001-{BANNER_MAX_CODE}) are used. Delete a banner first.")
     else:
         await _edit(q, "❌ Could not allocate a banner code. Nothing was created. Please try again.")
     return -1
@@ -1210,7 +1264,7 @@ PUBLIC_HELP_SECTION = (
     "🏅 Badges & Banners\n"
     "/badges — View badge tiers and your badges\n"
     "/claimbadge <code/name> — Claim the highest badge you qualify for\n"
-    "/banner — View your banners\n"
+    "/banner [code] — List banners, or see one banner's details\n"
     "/usebanner <code> — Equip a banner you have unlocked\n\n"
 )
 
@@ -1249,7 +1303,8 @@ def member_help_text():
         "Badges are permanent, even if you later sell or trade the copies.", "",
         "🎌 Banners",
         "A banner is a profile picture that unlocks when you own ALL of its required characters.",
-        "• /banner - see every banner, what it needs and what is unlocked",
+        "• /banner - list of banners with their 3-digit codes (🔓 unlocked / 🔒 locked)",
+        "• /banner <code> - details of one banner and the characters it needs (example: /banner 001)",
         "• /usebanner <code> - equip an unlocked banner (/usebanner off removes it)",
         "Your banner shows on top of /mystats. If you lose a required character it is unequipped, "
         "and it comes back when you own the character again.", "",
