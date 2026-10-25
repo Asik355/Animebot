@@ -10993,7 +10993,7 @@ def main():
     theme.register(app)   # 🎨 Customize Bot callbacks, owner input handler, /about
     badge_banner.bind(is_owner=is_owner, is_executive=is_executive, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text,
                       cancel_all=cancel_conversation, mark_success=mark_success, items_per_page=ITEMS_PER_PAGE)
-    badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner /listbanners
+    badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner
 
     register_executive_commands(app)
     register_owner_commands(app)
