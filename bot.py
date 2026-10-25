@@ -634,10 +634,10 @@ async def approve_group(update, context):
         return
     chat = update.effective_chat
     if chat.type in ("group", "supergroup"):
-        if context.args:
-            await safe_reply_text(update.message, "Usage: /approve")
+        if len(context.args) > 1 or (context.args and not context.args[0].lstrip("-").isdigit()):
+            await safe_reply_text(update.message, "Usage: /approve  or  /approve <group_chat_id>")
             return
-        chat_id = chat.id
+        chat_id = int(context.args[0]) if context.args else chat.id
     else:
         if len(context.args) != 1 or not context.args[0].lstrip("-").isdigit():
             await safe_reply_text(update.message, "Usage in Owner DM: /approve <group_chat_id>")
@@ -654,7 +654,9 @@ async def approve_group(update, context):
     # Confirmation goes to the exact group that was just approved, only after the approval was saved.
     group_notified = (saved is not False) and (await send_group_approved_confirmation(context, chat_id))
     if chat.type in ("group", "supergroup"):
-        if not group_notified:  # the confirmation above already answers in the group; fall back to the old reply
+        if chat_id != chat.id:
+            await safe_reply_text(update.message, f"✅ Group {chat_id} successfully approved.")
+        elif not group_notified:  # the confirmation above already answers in the group; fall back to the old reply
             await safe_reply_text(update.message, "✅ Group successfully approved by the Owner.\n🤖 The bot is now active in this group.")
     else:
         dm_text = f"✅ Group {chat_id} successfully approved.\n🤖 The bot is now active in that group."
@@ -972,7 +974,7 @@ async def track_bot_membership(update, context):
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
                             f"🆔 Group ID: {group_id_html(chat.id)}\n"
                             f"👤 Requested by: {html_escape(added_by_text)}\n\n"
-                            f"Approve with: /approve {html_escape(str(chat.id))}"
+                            f"Approve with: <code>/approve {html_escape(str(chat.id))}</code>"
                         ),
                         parse_mode="HTML",
                     )
@@ -2836,46 +2838,101 @@ async def build_cooldown_text(app, chat_id, user_id, title=None, personal=True):
     text += "\n".join(rows) if rows else "• No character is currently on cooldown. All characters are eligible."
     return text
 
+SILENT_OWNER_COMMANDS = {"cooldown", "cd"}   # Owner only; anyone else is ignored completely (no reply at all)
+
+
+def cooldown_refresh_markup(target):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data=f"cd:r:{target}")]])
+
+
+async def build_cooldown_chunks(app, user_id, target):
+    """HTML text chunks for /cooldown. target = 'all' (PM overview) or a group chat id."""
+    if target != "all":
+        return [await build_cooldown_text(app, int(target), user_id)]
+    # PM overview: your own /spawn cooldown + the cooldowns and character life of groups with an active spawn.
+    groups = (await asyncio.to_thread(load_bot_groups)) or {}
+    now_dt = datetime.now()
+    last = app.bot_data.setdefault("last_calls", {}).get(user_id)
+    rem = (personal_spawn_cooldown(user_id) - (now_dt - last).total_seconds()) if last else 0
+    blocks = [f"⏳ <b>All Cooldowns</b>\n\n👤 Your /spawn: <b>{format_duration(rem) if rem > 0 else 'Ready'}</b>"]
+    if not groups:
+        blocks.append("No groups registered yet.")
+    active_spawns = app.bot_data.setdefault("active_spawns", {})
+    shown = 0
+    for gid, info in groups.items():
+        if not str(gid).lstrip("-").isdigit():
+            continue
+        if int(gid) not in active_spawns:
+            continue  # only groups with an active spawned character
+        shown += 1
+        gtitle = (info or {}).get("title") or (info or {}).get("username") or f"Group {gid}"
+        try:
+            blocks.append(await build_cooldown_text(app, int(gid), user_id, title=f"{gtitle} ({gid})", personal=False))
+        except Exception as e:
+            print("Cooldown overview error:", e)
+    if groups and not shown:
+        blocks.append("No group has an active character spawn right now.")
+    chunks = []
+    chunk = ""
+    for block in blocks:
+        if chunk and len(chunk) + len(block) + 2 > 3900:
+            chunks.append(chunk)
+            chunk = ""
+        chunk = f"{chunk}\n\n{block}" if chunk else block
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
 async def cooldown(update, context):
-    """Show a group's auto-spawn/life state and up to 10 character cooldowns (Owner only; works in PM too)."""
+    """Show a group's auto-spawn/life state and character cooldowns (/cooldown or /cd; Owner only, anyone else is ignored)."""
     if not is_owner(update.effective_user.id):
-        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
         return
     user_id = update.effective_user.id
     if is_group_chat(update):
-        chat_id = update.effective_chat.id
+        target = str(update.effective_chat.id)
     else:
         arg = (context.args[0] if getattr(context, "args", None) else "").strip()
-        if not arg.lstrip("-").isdigit():
-            # PM overview: your own /spawn cooldown + every group's cooldowns and character life.
-            app = context.application
-            groups = (await asyncio.to_thread(load_bot_groups)) or {}
-            now_dt = datetime.now()
-            last = app.bot_data.setdefault("last_calls", {}).get(user_id)
-            rem = (personal_spawn_cooldown(user_id) - (now_dt - last).total_seconds()) if last else 0
-            blocks = [f"⏳ <b>All Cooldowns</b>\n\n👤 Your /spawn: <b>{format_duration(rem) if rem > 0 else 'Ready'}</b>"]
-            if not groups:
-                blocks.append("No groups registered yet.")
-            for gid, info in groups.items():
-                if not str(gid).lstrip("-").isdigit():
-                    continue
-                gtitle = (info or {}).get("title") or (info or {}).get("username") or f"Group {gid}"
-                try:
-                    blocks.append(await build_cooldown_text(app, int(gid), user_id, title=f"{gtitle} ({gid})", personal=False))
-                except Exception as e:
-                    print("Cooldown overview error:", e)
-            chunk = ""
-            for block in blocks:
-                if chunk and len(chunk) + len(block) + 2 > 3900:
-                    await safe_reply_text(update.message, chunk, parse_mode="HTML")
-                    chunk = ""
-                chunk = f"{chunk}\n\n{block}" if chunk else block
-            if chunk:
-                await safe_reply_text(update.message, chunk, parse_mode="HTML")
+        target = str(int(arg)) if arg.lstrip("-").isdigit() else "all"
+    chunks = await build_cooldown_chunks(context.application, user_id, target)
+    for i, chunk in enumerate(chunks):
+        await safe_reply_text(update.message, chunk, parse_mode="HTML",
+                              reply_markup=cooldown_refresh_markup(target) if i == len(chunks) - 1 else None)
+
+
+async def cooldown_refresh_callback(update, context):
+    """🔄 Refresh button of /cooldown: rebuilds the status in place. Anyone but the Owner is ignored silently."""
+    query = update.callback_query
+    if not is_owner(query.from_user.id):
+        try:
+            await query.answer()
+        except Exception:
+            pass
+        return
+    target = (query.data or "")[len("cd:r:"):]
+    try:
+        chunks = await build_cooldown_chunks(context.application, query.from_user.id, target)
+        if len(chunks) != 1:
+            await query.answer("Too many groups to refresh in one message. Send /cooldown again.", show_alert=True)
             return
-        chat_id = int(arg)
-    text = await build_cooldown_text(context.application, chat_id, user_id)
-    await safe_reply_text(update.message, text, parse_mode="HTML")
+        first = (getattr(query.from_user, "first_name", None) or "").strip()
+        last = (getattr(query.from_user, "last_name", None) or "").strip()
+        name = " ".join(p for p in (first, last) if p) or "Unknown"
+        await query.edit_message_text(f"👤 {html_escape(name)}\n\n{chunks[0]}", parse_mode="HTML",
+                                      reply_markup=cooldown_refresh_markup(target))
+        await query.answer("🔄 Refreshed")
+    except BadRequest as e:
+        if "not modified" in str(e).lower():
+            await query.answer("✅ Already up to date")
+        else:
+            print("Cooldown refresh error:", e)
+            await query.answer("⚠️ Could not refresh. Send /cooldown again.", show_alert=True)
+    except Exception as e:
+        print("Cooldown refresh error:", e)
+        try:
+            await query.answer("⚠️ Could not refresh. Send /cooldown again.", show_alert=True)
+        except Exception:
+            pass
 
 async def clearspawn(update, context):
     (await save_user_async(update.effective_user))
@@ -8600,7 +8657,7 @@ LOG_CATEGORY_OF = {cmd: cat for cat, (_t, _d, cmds) in LOG_CATEGORIES.items() fo
 # Owner "Category A": logged to the log channel automatically, no confirmation.
 OWNER_AUTO_LOG_CATEGORIES = {"character"}
 # Never logged in any way (no log entry, no security entry, no prompt) - /callcharacter is Owner-only and silent.
-SILENT_LOG_COMMANDS = {"callcharacter"}
+SILENT_LOG_COMMANDS = {"callcharacter", "cooldown", "cd"}
 # When the OWNER runs one of these, the log is held and the Owner is asked Yes/No first (whatever the category).
 OWNER_CONFIRM_LOG_COMMANDS = {"addredeem", "redeem"}
 # Multi-step (ConversationHandler) commands: the Owner's Yes/No prompt is held back until the LAST step succeeds
@@ -10290,6 +10347,9 @@ async def block_unapproved_group(update, context):
     text = (msg.text or "") if msg else ""
     command_name, _args = _parse_command(text, getattr(context.bot, "username", None))
 
+    if command_name in SILENT_OWNER_COMMANDS and not (update.effective_user and is_owner(update.effective_user.id)):
+        raise ApplicationHandlerStop         # /cooldown and /cd: anyone but the Owner is ignored, no reply at all
+
     if not chat or chat.type not in ("group", "supergroup"):
         if command_name:
             restricted = await get_restricted_message(update)
@@ -10736,7 +10796,7 @@ OWNER_COMMANDS = {
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
     "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "removechar", "boton",
-    "status", "gstats", "cooldown", "notifications", "notificationoff", "notificationon",
+    "status", "gstats", "cooldown", "cd", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
@@ -10764,6 +10824,7 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CallbackQueryHandler(callchar_confirm_callback, pattern=r"^cc:[0-9a-f]{8}:[yn]$"))
     app.add_handler(CallbackQueryHandler(status_refresh_callback, pattern=r"^status:refresh$"))
+    app.add_handler(CallbackQueryHandler(cooldown_refresh_callback, pattern=r"^cd:r:(all|-?\d+)$"))
     app.add_handler(CommandHandler("gstats", gstats))
     app.add_handler(CommandHandler("approve", approve_group))
     app.add_handler(CommandHandler("removeapprove", remove_approval))
@@ -10979,7 +11040,7 @@ def main():
         ("exchange", exchange),
         ("guess_num", guess_num_start),
         ("nguess", guess_number),
-        ("cooldown", cooldown),
+        (["cooldown", "cd"], cooldown),
     )
     for command_name, callback in public_handlers:
         app.add_handler(CommandHandler(command_name, callback))
