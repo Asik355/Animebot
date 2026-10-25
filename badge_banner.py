@@ -15,13 +15,13 @@ BADGES   /badges  /claimbadge <code/name>
          the user qualifies for.  Claims are permanent records (never removed when copies are lost, never downgraded;
          a unique index on user + character + tier makes double claims impossible).
 BANNERS  /banner  /usebanner <code>             (everyone)
-         /addbanner /editbanner /delbanner /listbanners   (Owner + Executive only, checked again inside every handler)
-         A banner is unlocked only while the user owns ALL of its required characters (always computed from CURRENT
-         ownership).  An equipped banner whose requirements are no longer met is unequipped the next time it is read.
+         /addbanner /editbanner /delbanner   (Owner + Executive only, checked again inside every handler)
+         A banner is unlocked only while the user owns ALL of its required SLOTS (always computed from CURRENT
+         ownership).  A slot is one or more character codes (e.g. Kakashi 1003/1113): owning ANY ONE of them fills it.  An equipped banner whose requirements are no longer met is unequipped the next time it is read.
 
 Collections (created lazily, indexes are idempotent):
   badge_claims_v1  {user_id, character_code, tier, copies_at_claim, claimed_at}   unique (user_id, character_code, tier)
-  banners_v1       {_id: "001", code, name, photo_file_id, required_codes[], created_by, created_at, updated_at}
+  banners_v1       {_id: "001", code, name, photo_file_id, required_codes[] (each item: a code string, or a list of alternative codes), created_by, created_at, updated_at}
   user_banners_v1  {_id: user_id, banner_code, equipped_at}                        (one equipped banner per user)
 """
 import asyncio
@@ -59,7 +59,8 @@ BANNERS = "banners_v1"
 USER_BANNERS = "user_banners_v1"
 
 BANNER_NAME_MAX = 40
-BANNER_MAX_CHARACTERS = 10
+BANNER_MAX_CHARACTERS = 10     # slots per banner
+BANNER_MAX_ALTERNATIVES = 10  # codes per slot
 BANNER_MAX_CODE = 999         # banner codes are always exactly 3 digits (001-999)
 PICKER_MAX = 10
 CAPTION_LIMIT = 1024          # Telegram photo caption limit
@@ -69,21 +70,20 @@ MYSTATS_TIER_NAMES_MAX = 12   # names shown per tier inside /mystats (the full l
 COMMAND_DESCRIPTIONS = {
     "badges": "View badge tiers and your badges",
     "claimbadge": "Claim a character badge (/claimbadge <code/name>)",
-    "banner": "View your banners",
+    "banner": "Banner list, or details of one (/banner <code>)",
     "usebanner": "Equip a banner (/usebanner <code>)",
     "addbanner": "Staff: create a banner (guided, PM only)",
     "editbanner": "Staff: edit a banner (/editbanner <code>)",
     "delbanner": "Staff: delete a banner (/delbanner <code>)",
-    "listbanners": "Staff: list all banners",
 }
 PUBLIC_COMMANDS = {"badges", "claimbadge", "banner", "usebanner"}
-STAFF_COMMANDS = {"addbanner", "editbanner", "delbanner", "listbanners"}   # Owner + Executive (role gate + in-handler check)
+STAFF_COMMANDS = {"addbanner", "editbanner", "delbanner"}   # Owner + Executive (role gate + in-handler check)
 
 # Telegram accepts at most 100 commands per menu (a longer list is rejected completely). The Owner menu lists every
 # command, so when a menu is too long these are left OUT of the menu (least essential first). They all keep working
 # when typed, and they stay in /help. Only the first entries needed to get down to the limit are ever dropped.
 MENU_LIMIT = 100
-MENU_TRIM_ORDER = ("listbanners", "delbanner", "editbanner", "addbanner", "scout", "logmappings")
+MENU_TRIM_ORDER = ("delbanner", "editbanner", "addbanner", "scout", "logmappings")
 
 
 def fit_command_menu(commands, limit=MENU_LIMIT):
@@ -205,6 +205,10 @@ def _names(codes):
 
 def _label(code, names):
     return f"{_esc(str(names.get(code) or 'Unknown'))} ({code})"
+
+
+def _slot_text(slot, names, sep=" / "):
+    return sep.join(_label(c, names) for c in slot)
 
 
 # ---------------- badges ----------------
@@ -364,16 +368,39 @@ def get_banner(code):
     return _col(BANNERS).find_one({"_id": str(code)})
 
 
+def banner_slots(banner):
+    """Required slots of a banner: [[code, ...], ...]. Old banners store plain code strings = one-option slots."""
+    slots = []
+    for item in banner.get("required_codes") or []:
+        opts = [str(c) for c in item] if isinstance(item, (list, tuple)) else [str(item)]
+        if opts:
+            slots.append(opts)
+    return slots
+
+
+def slots_codes(slots):
+    """Every distinct code used by a list of slots."""
+    return {c for slot in slots for c in slot}
+
+
+def banners_codes(banners):
+    return {c for b in banners for c in slots_codes(banner_slots(b))}
+
+
+def slot_filled(slot, owned):
+    return any(c in owned for c in slot)
+
+
 def is_unlocked(banner, owned):
-    req = [str(c) for c in banner.get("required_codes") or []]
-    return bool(req) and all(c in owned for c in req)
+    slots = banner_slots(banner)
+    return bool(slots) and all(slot_filled(s, owned) for s in slots)
 
 
 def banner_rows(uid):
     """[(banner, unlocked, owned_set, names)] for every banner; computed from CURRENT ownership."""
     owned = owned_codes(uid)
     banners = all_banners()
-    names = _names({str(c) for b in banners for c in b.get("required_codes") or []})
+    names = _names(banners_codes(banners))
     equipped = _col(USER_BANNERS).find_one({"_id": int(uid)})
     eq_code = equipped.get("banner_code") if equipped else None
     rows = []
@@ -402,8 +429,8 @@ def equip_banner(uid, code):
         return {"status": "no_banner", "code": code}
     owned = owned_codes(uid)
     if not is_unlocked(banner, owned):
-        missing = [str(c) for c in banner.get("required_codes") or [] if str(c) not in owned]
-        return {"status": "locked", "banner": banner, "names": _names(missing), "missing": missing}
+        missing = [s for s in banner_slots(banner) if not slot_filled(s, owned)]     # unfilled slots
+        return {"status": "locked", "banner": banner, "names": _names(slots_codes(missing)), "missing": missing}
     current = _col(USER_BANNERS).find_one({"_id": int(uid)})
     if current and current.get("banner_code") == banner["_id"]:
         return {"status": "already", "banner": banner}
@@ -417,24 +444,31 @@ def unequip_banner(uid):
 
 
 def parse_character_codes(text):
-    """Validate a comma/space separated list of character codes against the database.
-    Returns {"codes": [...], "problems": [str]}; problems is empty only if every code is valid and unique."""
+    """Validate a comma/space separated list of required slots against the database.
+    A slot is one code, or several alternatives joined with '/' (e.g. '1003/1113' = Kakashi 1003 OR 1113).
+    Returns {"codes": [[code, ...], ...], "problems": [str]}; problems is empty only if every code is valid and unique."""
     tokens = [t for t in re.split(r"[,\s]+", str(text or "").strip()) if t]
-    problems, codes, seen = [], [], set()
     if not tokens:
         return {"codes": [], "problems": ["Send at least one character code."]}
-    bad, dup, missing = [], [], []
+    problems, slots, seen = [], [], set()
+    bad, dup, missing, too_many = [], [], [], []
     for tok in tokens:
-        code = normalize_char_code(tok)
-        if code is None:
-            bad.append(tok)
-            continue
-        if code in seen:
-            dup.append(code)
-            continue
-        seen.add(code)
-        codes.append(code)
-    for code in codes:
+        slot = []
+        for part in tok.split("/"):
+            code = normalize_char_code(part)
+            if code is None:
+                bad.append(part or tok)
+                continue
+            if code in seen:
+                dup.append(code)
+                continue
+            seen.add(code)
+            slot.append(code)
+        if len(slot) > BANNER_MAX_ALTERNATIVES:
+            too_many.append(tok)
+        if slot:
+            slots.append(slot)
+    for code in sorted(seen):
         if _character_row(code) is None:
             missing.append(code)
     if bad:
@@ -443,14 +477,23 @@ def parse_character_codes(text):
         problems.append("Duplicate codes: " + ", ".join(sorted(set(dup))))
     if missing:
         problems.append("Character not found: " + ", ".join(missing))
-    if len(codes) > BANNER_MAX_CHARACTERS:
-        problems.append(f"At most {BANNER_MAX_CHARACTERS} characters per banner.")
-    return {"codes": codes, "problems": problems}
+    if too_many:
+        problems.append(f"At most {BANNER_MAX_ALTERNATIVES} versions per slot: " + ", ".join(_esc(t) for t in too_many))
+    if len(slots) > BANNER_MAX_CHARACTERS:
+        problems.append(f"At most {BANNER_MAX_CHARACTERS} required characters per banner.")
+    if not slots and not problems:
+        problems.append("Send at least one character code.")
+    return {"codes": slots, "problems": problems}
+
+
+def _slots_to_text(slots):
+    """[[a], [b, c]] -> 'a, b/c' (round-trips through parse_character_codes)."""
+    return ",".join("/".join(s) for s in slots)
 
 
 def create_banner(draft, creator_id):
     """Revalidate and insert. Returns {"status": "ok", "code"} / {"status": "invalid", "problems"} / {"status": "error"}."""
-    check = parse_character_codes(",".join(draft.get("codes") or []))
+    check = parse_character_codes(_slots_to_text(draft.get("codes") or []))
     if check["problems"] or not draft.get("photo") or not draft.get("name"):
         return {"status": "invalid", "problems": check["problems"] or ["The banner draft is incomplete."]}
     now = _stamp()
@@ -462,7 +505,7 @@ def create_banner(draft, creator_id):
         try:
             _col(BANNERS).insert_one({
                 "_id": code, "code": code, "name": draft["name"], "photo_file_id": draft["photo"],
-                "required_codes": list(check["codes"]), "created_by": int(creator_id),
+                "required_codes": [list(x) for x in check["codes"]], "created_by": int(creator_id),
                 "created_at": now, "updated_at": now})
             return {"status": "ok", "code": code}
         except DuplicateKeyError:
@@ -731,16 +774,19 @@ def _banner_detail(uid, code):
     if banner is None:
         return None, None
     owned = owned_codes(uid)
-    names = _names({str(c) for c in banner.get("required_codes") or []})
+    slots = banner_slots(banner)
+    names = _names(slots_codes(slots))
     unlocked = is_unlocked(banner, owned)
     eq_doc = _col(USER_BANNERS).find_one({"_id": int(uid)})
     equipped = bool(unlocked and eq_doc and eq_doc.get("banner_code") == banner["_id"])
     lines = [f"🎌 {_esc(banner['name'])}", f"Code: {banner['_id']}",
              "Status: " + ("🔓 Unlocked" if unlocked else "🔒 Locked") + ("  ⭐ EQUIPPED" if equipped else ""),
              "", "Required characters:"]
-    for c in banner.get("required_codes") or []:
-        mark = "✅" if str(c) in owned else "❌"
-        lines.append(f"{mark} {_label(str(c), names)}")
+    for slot in slots:
+        mark = "✅" if slot_filled(slot, owned) else "❌"
+        lines.append(f"{mark} {_label(slot[0], names)}")
+        for c in slot[1:]:
+            lines.append(f"   or {_label(c, names)}")
     lines.append("")
     if unlocked and not equipped:
         lines.append(f"Equip it with /usebanner {banner['_id']}")
@@ -824,7 +870,7 @@ async def usebanner_command(update, context):
     if s == "no_banner":
         await _reply(msg, "❌ No banner with that code. See /banner.")
     elif s == "locked":
-        need = ", ".join(_label(c, res["names"]) for c in res["missing"])
+        need = ", ".join(_slot_text(s, res["names"], " or ") for s in res["missing"])
         await _reply(msg, f"🔒 “{_esc(res['banner']['name'])}” is locked. You still need: {need}", parse_mode="HTML")
     elif s == "already":
         await _reply(msg, f"ℹ️ “{_esc(res['banner']['name'])}” is already equipped.", parse_mode="HTML")
@@ -862,7 +908,10 @@ async def _guard_private(update):
 
 
 def _staff_required_lines(banner, names):
-    req = [f"• {_label(str(c), names)}" for c in banner.get("required_codes") or []]
+    req = []
+    for slot in banner_slots(banner):
+        req.append(f"• {_label(slot[0], names)}")
+        req += [f"   or {_label(c, names)}" for c in slot[1:]]
     return "\n".join(req) or "• —"
 
 
@@ -911,7 +960,9 @@ async def addbanner_name(update, context):
     context.user_data.setdefault(_DRAFT, {})["name"] = name
     await _reply(update.effective_message,
                  "✅ Name saved.\n\nStep 3/3 - send the REQUIRED character codes, separated by commas.\n"
-                 "Users need ALL of them to unlock the banner.\nExample: 1001, 1002, 1003")
+                 "Users need ALL of them to unlock the banner.\n"
+                 "For a character with several versions, join the codes with / - owning ANY ONE of them is enough.\n"
+                 "Example: 1111, 1112, 1002, 1003/1113")
     return B_CODES
 
 
@@ -919,8 +970,10 @@ def _preview_html(draft, names):
     lines = ["🎌 Banner preview", "",
              f"Name: {_esc(draft['name'])}",
              "Code: assigned automatically when you press Create",
-             "Required characters (users need ALL):"]
-    lines += [f"• {_label(c, names)}" for c in draft["codes"]]
+             "Required characters (users need ALL; \"or\" = any one of those versions):"]
+    for slot in draft["codes"]:
+        lines.append(f"• {_label(slot[0], names)}")
+        lines += [f"   or {_label(c, names)}" for c in slot[1:]]
     return "\n".join(lines)
 
 
@@ -938,7 +991,7 @@ async def addbanner_codes(update, context):
         return B_CODES
     draft["codes"] = check["codes"]
     draft["token"] = secrets.token_hex(4)
-    names = await asyncio.to_thread(_names, check["codes"])
+    names = await asyncio.to_thread(_names, slots_codes(check["codes"]))
     kb = InlineKeyboardMarkup([[_btn("✅ Create Banner", f"bb:ac:{update.effective_user.id}:{draft['token']}:ok"),
                                 _btn("❌ Cancel", f"bb:ac:{update.effective_user.id}:{draft['token']}:no")]])
     await context.bot.send_photo(chat_id=msg.chat_id, photo=draft["photo"], caption=_preview_html(draft, names)[:CAPTION_LIMIT],
@@ -1011,7 +1064,7 @@ def _banner_summary(code):
     b = get_banner(code)
     if b is None:
         return None, None
-    return b, _names(b.get("required_codes") or [])
+    return b, _names(slots_codes(banner_slots(b)))
 
 
 def _banner_summary_html(b, names):
@@ -1042,11 +1095,11 @@ async def editbanner_start(update, context):
     msg = update.effective_message
     code = normalize_banner_code(context.args[0]) if context.args else None
     if code is None:
-        await _reply(msg, "Usage: /editbanner <banner code>   (codes: /listbanners)")
+        await _reply(msg, "Usage: /editbanner <banner code>   (codes: /banner)")
         return -1
     exists = await asyncio.to_thread(get_banner, code)
     if exists is None:
-        await _reply(msg, "❌ No banner with that code. See /listbanners.")
+        await _reply(msg, "❌ No banner with that code. See /banner.")
         return -1
     context.user_data[_EDIT] = {"code": code}
     return await _show_edit_menu(context, msg.chat_id, update.effective_user.id, code)
@@ -1075,7 +1128,8 @@ async def editbanner_menu(update, context):
     prompts = {"name": (E_NAME, f"✏️ Send the new NAME (max {BANNER_NAME_MAX} characters)."),
                "photo": (E_PHOTO, "🖼 Send the new PHOTO."),
                "req": (E_REQ, "🧩 Send the new REQUIRED character codes, separated by commas.\n"
-                              "Users who no longer own all of them will have the banner unequipped.")}
+                              "Join alternative versions with / (example: 1111, 1002, 1003/1113): any one of them counts.\n"
+                              "Users who no longer qualify will have the banner unequipped.")}
     nxt, text = prompts[action]
     await context.bot.send_message(chat_id=chat_id, text=text + "\n\nSend /cancel to stop.")
     return nxt
@@ -1128,7 +1182,7 @@ async def editbanner_req(update, context):
 
 
 # ==========================================================================
-# /delbanner <code> and /listbanners
+# /delbanner <code>
 # ==========================================================================
 async def delbanner_command(update, context):
     if not await _guard_staff(update):
@@ -1136,46 +1190,17 @@ async def delbanner_command(update, context):
     msg = update.effective_message
     code = normalize_banner_code(context.args[0]) if context.args else None
     if code is None:
-        await _reply(msg, "Usage: /delbanner <banner code>   (codes: /listbanners)")
+        await _reply(msg, "Usage: /delbanner <banner code>   (codes: /banner)")
         return
     b = await asyncio.to_thread(get_banner, code)
     if b is None:
-        await _reply(msg, "❌ No banner with that code. See /listbanners.")
+        await _reply(msg, "❌ No banner with that code. See /banner.")
         return
     uid = update.effective_user.id
     kb = InlineKeyboardMarkup([[_btn("🗑 Delete", f"bb:dl:{uid}:{code}:ok"), _btn("↩️ Cancel", f"bb:dl:{uid}:{code}:no")]])
     await _reply(msg, f"⚠️ Delete banner “{_esc(b['name'])}” ({code})?\n"
                       f"It will be unequipped from every user who has it. This cannot be undone.",
                  parse_mode="HTML", reply_markup=kb)
-
-
-def _list_page_html(page):
-    banners = all_banners()
-    names = _names({str(c) for b in banners for c in b.get("required_codes") or []})
-    per = _per_page()
-    pages = max(1, -(-len(banners) // per))
-    page = min(max(page, 0), pages - 1)
-    lines = [f"🎌 All banners (page {page + 1}/{pages})", ""]
-    if not banners:
-        lines.append("No banners yet. Create one with /addbanner.")
-    for b in banners[page * per:(page + 1) * per]:
-        lines.append(f"{b['_id']} — {_esc(b['name'])}")
-        lines.append(_staff_required_lines(b, names))
-        lines.append("")
-    return "\n".join(lines), page, pages
-
-
-async def listbanners_command(update, context):
-    if not await _guard_staff(update):
-        return
-    try:
-        text, page, pages = await asyncio.to_thread(_list_page_html, 0)
-    except Exception as e:
-        logger.error("listbanners failed: %s", e)
-        await _reply(update.effective_message, "❌ Could not load banners right now. Please try again.")
-        return
-    await _reply(update.effective_message, text, parse_mode="HTML",
-                 reply_markup=_pager("bb:lb", update.effective_user.id, page, pages))
 
 
 # ==========================================================================
@@ -1215,13 +1240,6 @@ async def bb_callback(update, context):
             result = await asyncio.to_thread(claim_badge, uid, parts[3])
             await q.answer()
             await _edit(q, claim_text(result))
-        elif kind == "lb":                                  # staff: /listbanners pagination
-            if not _is_staff(uid):
-                await q.answer(DENIED_TEXT, show_alert=True)
-                return
-            text, page, pages = await asyncio.to_thread(_list_page_html, int(parts[3]))
-            await q.answer()
-            await _edit(q, text, _pager("bb:lb", uid, page, pages))
         elif kind == "dl":                                  # staff: /delbanner confirmation
             await _delete_callback(q, uid, parts[3], parts[4])
         elif kind in ("ac", "ed"):
@@ -1271,14 +1289,13 @@ PUBLIC_HELP_SECTION = (
 
 def help_page_text():
     entries = [
-        ("/addbanner", "Create a banner (guided, PM only): photo, name, required character codes, preview, ✅ Create"),
+        ("/addbanner", "Create a banner (guided, PM only): photo, name, required character codes (alternative versions: 1003/1113), preview, ✅ Create"),
         ("/editbanner <code>", "Edit a banner's name, photo or required characters (PM only). "
                                "Users who no longer qualify are unequipped"),
         ("/delbanner <code>", "Delete a banner (asks to confirm; unequips everyone who has it)"),
-        ("/listbanners", "List every banner with its code and required characters (paginated)"),
         ("/badges", "Badge tiers and your own badges (public)"),
         ("/claimbadge <code/name>", "Claim the highest badge you qualify for (public)"),
-        ("/banner", "Your banners: locked / unlocked / equipped (public)"),
+        ("/banner [code]", "Banner list with codes, or one banner's details (public)"),
         ("/usebanner <code>", "Equip an unlocked banner; /usebanner off removes it (public)"),
     ]
     lines = ["🏅 Badges & Banners (Owner & Executive)", "", "📌 Overview",
@@ -1302,7 +1319,8 @@ def member_help_text():
         "• /claimbadge <code/name> - claims the highest tier you qualify for",
         "Badges are permanent, even if you later sell or trade the copies.", "",
         "🎌 Banners",
-        "A banner is a profile picture that unlocks when you own ALL of its required characters.",
+        "A banner is a profile picture that unlocks when you own ALL of its required characters. "
+        "Some characters accept several versions: owning any one of them counts.",
         "• /banner - list of banners with their 3-digit codes (🔓 unlocked / 🔒 locked)",
         "• /banner <code> - details of one banner and the characters it needs (example: /banner 001)",
         "• /usebanner <code> - equip an unlocked banner (/usebanner off removes it)",
@@ -1360,6 +1378,6 @@ def register(app):
     ))
     for name, callback in (("badges", badges_command), ("claimbadge", claimbadge_command),
                            ("banner", banner_command), ("usebanner", usebanner_command),
-                           ("delbanner", delbanner_command), ("listbanners", listbanners_command)):
+                           ("delbanner", delbanner_command)):
         app.add_handler(CommandHandler(name, callback))
     app.add_handler(CallbackQueryHandler(bb_callback, pattern=r"^bb:"))
