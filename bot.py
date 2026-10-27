@@ -1338,7 +1338,8 @@ def _build_help_text_raw():
         "/add — Catch the spawned character\n"
         "/daily — Claim your daily reward\n"
         "/dailytask — View your daily missions and earn Berrys\n"
-        "/sell <code/name> [quantity] — Sell a character\n"
+        "/sell <code/name> [quantity] — Sell a character (many at once: /sell naruto 2 / sakura, or the 💰 Sell button in your collection)\n"
+        "/rem [number] — Delete the bot's own messages (reply to one, or /rem 10)\n"
         "/transfer <code/name> — Transfer a character by replying to a user\n"
         "/exchange <your_code> <their_code> — Exchange same-tier characters by replying to a user\n\n"
         "🎮 Games\n"
@@ -3441,6 +3442,7 @@ def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, ra
             InlineKeyboardButton("⭐ Favourite", callback_data=f"coll:{user_id}:nochange:0"),
             InlineKeyboardButton("❌ Clear Favourite", callback_data=f"coll:{user_id}:clearfav{suffix}:0"),
         ])
+    buttons.append([InlineKeyboardButton("💰 Sell", callback_data=f"coll:{user_id}:sell:0")])
     return InlineKeyboardMarkup(buttons)
 
 def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name="Player", tier_filter=None):
@@ -3707,6 +3709,13 @@ async def collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             await query.edit_message_reply_markup(reply_markup=collection_tier_keyboard(user_id))
         except Exception as e:
             print("Tier menu error:", e)
+        return
+    if action == "sell":                             # 💰 Sell: send the how-to guide and wait for the list
+        await query.answer()
+        try:
+            await _sell_send_guide(context, query.message.chat_id, user_id)
+        except Exception as e:
+            print("Sell guide error:", e)
         return
     if rarity and not await get_collection_rows(user_id, "tier", rarity):
         await query.answer(f"❌ You have no {rarity} characters.", show_alert=True)   # nothing changes on screen
@@ -4383,13 +4392,458 @@ async def check(update, context):
 
     await send_character_check_result(context.bot, update.message.chat_id, character, update.message)
 
+# ======================================================================================================
+# MULTI-CHARACTER SELL  (💰 Sell button in the collection  +  /sell naruto 2 / sakura)
+#   * Format: characters are separated by "/", a number after a character = copies (no number = 1).
+#   * Payout per character = worth * copies // 2 (same rule as the single /sell).
+#   * Nothing is removed until the user presses ✅ Confirm; the whole sale is ONE database transaction.
+# ======================================================================================================
+SELL_INPUT_TTL = 120          # seconds the bot waits for the list after 💰 Sell / bare /sell
+SELL_CONFIRM_TTL = 300        # seconds the ✅ Confirm / ❌ Cancel screen stays valid
+SELL_MAX_ENTRIES = 25         # characters per sale
+PENDING_SELL_INPUT = {}       # (chat_id, user_id) -> {"guide_id": message_id, "expires": monotonic seconds}
+PENDING_SELL_CONFIRM = {}     # token -> {"uid", "chat_id", "lines", "total", "expires"}
+_BG_TASKS = set()             # keeps background tasks alive until they finish
+
+SELL_GUIDE_TITLE = "💰 Sell Characters"
+SELL_GUIDE_TEXT = (
+    f"{SELL_GUIDE_TITLE}\n\n"
+    "Send the characters you want to sell in ONE message:\n"
+    "• Separate different characters with /\n"
+    "• Add a number after a character for more copies (no number = 1 copy)\n"
+    "• Use the 4-digit code or the name\n\n"
+    "Examples:\n"
+    "naruto 2 / sakura\n"
+    "1344 2 / 6023 / 1329 3\n\n"
+    "💸 You get half of each character's worth in Berrys.\n"
+    "✅ You will see a summary and confirm before anything is sold.\n\n"
+    "Send your list now, or reply to this message with it if nothing happens."
+)
+
+
+class _SellShort(Exception):
+    """A character copy count changed (or the user row is missing) while the sale was being committed."""
+
+    def __init__(self, name=None, have=0):
+        super().__init__(name or "")
+        self.name, self.have = name, have
+
+
+def _spawn_bg(coro):
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+def parse_sell_list(text):
+    """'naruto 2 / sakura' -> [('naruto', 2), ('sakura', 1)].  '/' (or a new line) separates characters; a number as the
+    last word of a part is the copy count (default 1). Names with spaces are fine ('rem ram 2')."""
+    entries = []
+    for part in re.split(r"[/\n]+", text or ""):
+        tokens = part.split()
+        if not tokens:
+            continue
+        qty = 1
+        if len(tokens) >= 2 and tokens[-1].isascii() and tokens[-1].isdigit():
+            qty = int(tokens[-1])
+            tokens = tokens[:-1]
+        entries.append((" ".join(tokens), qty))
+    return entries
+
+
+def _sell_resolve_character(lookup):
+    """(character_row, None) or (None, error text). Unlike get_character() it says WHY a name did not resolve."""
+    lookup = (lookup or "").strip()
+    shown = lookup if len(lookup) <= 30 else lookup[:30] + "…"
+    if not lookup:
+        return None, "❌ An entry is empty (check your / separators)."
+    if lookup.isascii() and lookup.isdigit():
+        row = get_character_by_code(lookup)
+        return (row, None) if row else (None, f"❌ No character with code {shown}.")
+    rows = find_characters_by_name_parts(lookup)
+    if len(rows) == 1:
+        return rows[0], None
+    if len(rows) > 1:
+        names = ", ".join(f"{r[1]} [{r[0]}]" for r in rows[:5]) + ("…" if len(rows) > 5 else "")
+        return None, f"❌ \"{shown}\" matches several characters ({names}). Use the 4-digit code."
+    recruit = find_character_by_recruit_name(lookup)
+    if recruit:
+        return recruit, None
+    return None, f"❌ Character \"{shown}\" not found."
+
+
+def _sell_build_plan(uid, entries):
+    """Sync (run in a thread). Returns (lines, errors): lines = characters that can be sold, errors = skipped entries."""
+    owned = {str(r[0]): int(r[5]) for r in mongo_db.get_collection_summary(uid)}
+    favorite = get_favorite_code(uid)
+    favorite = str(favorite) if favorite else None
+    merged, order, errors = {}, [], []
+    for lookup, qty in entries:
+        if qty <= 0:
+            errors.append(f"❌ \"{lookup[:30]}\" — the number of copies must be at least 1.")
+            continue
+        character, err = _sell_resolve_character(lookup)
+        if err:
+            errors.append(err)
+            continue
+        code, name, _anime, rarity, worth, _photo = character
+        code = str(code)
+        if code not in merged:
+            merged[code] = {"code": code, "name": name, "rarity": rarity, "worth": int(worth or 0), "qty": 0}
+            order.append(code)
+        merged[code]["qty"] += qty          # the same character written twice is added together
+    lines = []
+    for code in order:
+        ln = merged[code]
+        have = owned.get(code, 0)
+        if have <= 0:
+            errors.append(f"❌ {ln['name']} [{code}] — you don't own this character.")
+            continue
+        if ln["qty"] > have:
+            errors.append(f"❌ {ln['name']} [{code}] — you have only {have}, but asked for {ln['qty']}.")
+            continue
+        ln["have"] = have
+        ln["payout"] = (ln["worth"] * ln["qty"]) // 2
+        ln["fav"] = (code == favorite)
+        ln["clears_fav"] = ln["fav"] and ln["qty"] >= have
+        lines.append(ln)
+    return lines, errors
+
+
+def _sell_commit(uid, lines):
+    """Sync (run in a thread). Removes the copies and pays the Berrys in ONE transaction; returns the Berrys paid.
+    Raises _SellShort (nothing changed) if any copy count is no longer enough."""
+    def _work(session):
+        coll = _mc(mongo_db.COLLECTIONS)
+        total = 0
+        for ln in lines:
+            ids = [d["_id"] for d in coll.find({"user_id": uid, "character_code": ln["code"]}, {"_id": 1},
+                                               sort=[("_id", 1)], limit=ln["qty"], session=session)]
+            if len(ids) < ln["qty"]:
+                raise _SellShort(ln["name"], len(ids))
+            coll.delete_many({"_id": {"$in": ids}}, session=session)
+            total += ln["payout"]
+        if total:
+            res = _mc(mongo_db.USERS).update_one({"_id": uid}, {"$inc": {"coins": total}}, session=session)
+            if res.matched_count != 1:
+                raise _SellShort(None, 0)
+        fav = _mc(mongo_db.FAVORITES).find_one({"_id": uid}, session=session)
+        if fav and str(fav.get("character_code")) in {ln["code"] for ln in lines}:
+            if coll.count_documents({"user_id": uid, "character_code": str(fav["character_code"])}, session=session) == 0:
+                _mc(mongo_db.FAVORITES).delete_one({"_id": uid}, session=session)   # sold the last copy of the favourite
+        return total
+    return mongo_db.run_transaction(_work)
+
+
+def sell_guide_keyboard(user_id):
+    return InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"sellg:{user_id}:x")]])
+
+
+async def _sell_guide_expire(bot, chat_id, user_id, guide_id):
+    await asyncio.sleep(SELL_INPUT_TTL + 2)
+    pend = PENDING_SELL_INPUT.get((chat_id, user_id))
+    if pend and pend.get("guide_id") == guide_id and time.monotonic() >= pend["expires"]:
+        PENDING_SELL_INPUT.pop((chat_id, user_id), None)
+        await safe_delete_message(bot, chat_id, guide_id)
+
+
+async def _sell_send_guide(context, chat_id, user_id):
+    """Send the how-to message and start waiting for this user's list in this chat."""
+    old = PENDING_SELL_INPUT.pop((chat_id, user_id), None)
+    if old:
+        await safe_delete_message(context.bot, chat_id, old.get("guide_id"))
+    sent = await context.bot.send_message(chat_id=chat_id, text=SELL_GUIDE_TEXT, reply_markup=sell_guide_keyboard(user_id))
+    PENDING_SELL_INPUT[(chat_id, user_id)] = {"guide_id": sent.message_id, "expires": time.monotonic() + SELL_INPUT_TTL}
+    _spawn_bg(_sell_guide_expire(context.bot, chat_id, user_id, sent.message_id))
+
+
+async def _sell_begin(update, context, raw_text):
+    """Parse the list, check ownership and show the ✅ Confirm / ❌ Cancel summary. Returns True if a summary was shown."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    entries = parse_sell_list(raw_text)
+    if not entries:
+        await safe_reply_text(msg, "❌ I could not find any character in your message.\nExample: naruto 2 / sakura")
+        return False
+    if len(entries) > SELL_MAX_ENTRIES:
+        await safe_reply_text(msg, f"❌ You can sell at most {SELL_MAX_ENTRIES} different characters at once.")
+        return False
+    try:
+        lines, errors = await asyncio.to_thread(_sell_build_plan, user.id, entries)
+    except Exception as e:
+        print("Sell plan error:", e)
+        await safe_reply_text(msg, "❌ Could not check your collection. Please try again.")
+        return False
+    skipped = "\n".join(errors[:10]) + (f"\n…and {len(errors) - 10} more" if len(errors) > 10 else "")
+    if not lines:
+        await safe_reply_text(msg, "❌ Nothing can be sold:\n" + skipped + "\n\nSend a corrected list.")
+        return False
+
+    now = time.monotonic()
+    for key in [k for k, v in PENDING_SELL_CONFIRM.items() if v["expires"] < now]:
+        PENDING_SELL_CONFIRM.pop(key, None)
+    total = sum(ln["payout"] for ln in lines)
+    token = uuid.uuid4().hex[:12]
+    PENDING_SELL_CONFIRM[token] = {"uid": user.id, "chat_id": chat.id, "lines": lines, "total": total,
+                                   "expires": now + SELL_CONFIRM_TTL}
+    body = "\n".join(
+        f"{SYMBOL.get(ln['rarity'], '⭐')} {ln['name']} [{ln['code']}] x{ln['qty']} → 💰 {ln['payout']}"
+        + (" ⭐" if ln["fav"] else "")
+        for ln in lines)
+    text = f"🧾 Sale Summary\n\n{body}\n\n💰 Total: {total} Berrys"
+    if any(ln["clears_fav"] for ln in lines):
+        text += "\n⭐ Your favourite will be cleared (you are selling all its copies)."
+    if errors:
+        text += "\n\n⚠️ Not included:\n" + skipped
+    text += "\n\nNothing is sold until you press Confirm."
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Confirm", callback_data=f"sellc:{token}:y"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"sellc:{token}:n"),
+    ]])
+    await safe_reply_text(msg, text, reply_markup=keyboard)
+    pend = PENDING_SELL_INPUT.pop((chat.id, user.id), None)      # the list was received: stop waiting, tidy the guide
+    guide_id = (pend or {}).get("guide_id")
+    reply = getattr(msg, "reply_to_message", None)
+    if reply is not None and SELL_GUIDE_TITLE in (reply.text or "")[:80] and getattr(reply.from_user, "id", None) == context.bot.id:
+        guide_id = reply.message_id
+    if guide_id:
+        await safe_delete_message(context.bot, chat.id, guide_id)
+    return True
+
+
+async def sell_input_handler(update, context):
+    """Plain text from a user who tapped 💰 Sell (or replied to the guide message) = their sell list."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if msg is None or user is None or chat is None or not msg.text:
+        return
+    key = (chat.id, user.id)
+    pend = PENDING_SELL_INPUT.get(key)
+    if pend and time.monotonic() > pend["expires"]:
+        PENDING_SELL_INPUT.pop(key, None)
+        pend = None
+    reply = msg.reply_to_message
+    replied_to_guide = bool(reply is not None and getattr(reply.from_user, "id", None) == context.bot.id
+                            and SELL_GUIDE_TITLE in (reply.text or "")[:80])
+    if not pend and not replied_to_guide:
+        return
+    if chat.type in ("group", "supergroup") and not await asyncio.to_thread(is_bot_enabled, chat.id):
+        return
+    restricted = await get_restricted_message(update)
+    if restricted:
+        PENDING_SELL_INPUT.pop(key, None)
+        await safe_reply_text(msg, restricted)
+        return
+    await save_user_async(user)
+    await _sell_begin(update, context, msg.text)
+
+
+async def sell_guide_callback(update, context):
+    """❌ Cancel under the how-to message."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "sellg":
+        await query.answer()
+        return
+    try:
+        owner_id = int(parts[1])
+    except ValueError:
+        await query.answer()
+        return
+    if query.from_user.id != owner_id:
+        await query.answer("❌ This menu belongs to another user.", show_alert=True)
+        return
+    await query.answer("Cancelled.")
+    PENDING_SELL_INPUT.pop((query.message.chat_id, owner_id), None)
+    await safe_delete_message(context.bot, query.message.chat_id, query.message.message_id)
+
+
+async def sell_confirm_callback(update, context):
+    """✅ Confirm / ❌ Cancel on the sale summary."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "sellc":
+        await query.answer()
+        return
+    token, choice = parts[1], parts[2]
+
+    async def _edit(text):
+        try:
+            await query.edit_message_text(add_display_name_header(query, text), reply_markup=None)
+        except Exception as e:
+            print("Sell edit error:", e)
+
+    info = PENDING_SELL_CONFIRM.get(token)
+    if info is None or time.monotonic() > info["expires"]:
+        PENDING_SELL_CONFIRM.pop(token, None)
+        await query.answer("⌛ This sale has expired. Start again with 💰 Sell or /sell.", show_alert=True)
+        await _edit("⌛ This sale has expired. Nothing was sold.")
+        return
+    if query.from_user.id != info["uid"]:
+        await query.answer("❌ This sale belongs to another user.", show_alert=True)
+        return
+    if choice != "y":
+        PENDING_SELL_CONFIRM.pop(token, None)
+        await query.answer("Cancelled.")
+        await _edit("❌ Sale cancelled. Nothing was sold.")
+        return
+
+    info = PENDING_SELL_CONFIRM.pop(token, None)      # removed BEFORE the first await: a second tap can never pay twice
+    if info is None:
+        await query.answer()
+        return
+    await query.answer()
+    uid, lines = info["uid"], info["lines"]
+    try:
+        total = await asyncio.to_thread(_sell_commit, uid, lines)
+    except _SellShort as e:
+        if e.name:
+            await _edit(f"❌ Sale cancelled: you now have only {e.have} of {e.name}. Nothing was sold.")
+        else:
+            await _edit("❌ Sale cancelled: your account could not be updated. Nothing was sold.")
+        return
+    except Exception as e:
+        print("Multi-sell transaction error:", e)
+        await _edit("❌ Could not complete the sale. Nothing was sold. Please try again.")
+        return
+
+    for ln in lines:
+        await fusion.record_sell(uid, ln["rarity"], ln["qty"])      # stone task progress (never raises)
+    done = "\n".join(f"• {ln['name']} [{ln['code']}] x{ln['qty']} → +{ln['payout']}" for ln in lines)
+    await _edit(f"💸 Sold {sum(ln['qty'] for ln in lines)} character copies!\n\n{done}\n\n💰 +{total} Berrys")
+    await fusion.stone_remind(uid, chat_id=info["chat_id"], name=berry_display_name(query.from_user))
+
+
+# ======================================================================================================
+# /rem  -  delete the bot's OWN messages (everyone can use it)
+#   * reply to a bot message + /rem            -> deletes that one message
+#   * /rem 10  or  /rem10                      -> deletes the bot's last 10 messages in this chat
+#   * /rem alone (no reply)                    -> deletes the bot's last message
+# Telegram cannot list a bot's past messages, so every message the bot sends is remembered (per chat, last
+# BOT_SENT_KEEP ids, in memory). Only messages sent since the last restart can be counted, and Telegram only
+# allows deleting messages that are less than 48 hours old.
+# ======================================================================================================
+import collections as _collections
+
+BOT_SENT_KEEP = 100
+REM_MAX = 50
+_BOT_SENT_IDS = {}          # chat_id -> deque of message ids sent by the bot
+_REM_RE = r"(?i)^/rem(?:@(\w+))?\s*(\d{0,3})\s*$"      # /rem  /rem 10  /rem10  /rem@MyBot 10
+_TRACKED_SEND_METHODS = ("send_message", "send_photo", "send_animation", "send_document", "send_video", "send_sticker",
+                         "send_audio", "send_voice", "send_video_note", "send_dice", "send_poll")
+
+
+def _track_bot_message(result):
+    try:
+        message_id = int(result.message_id)
+        chat_id = int(result.chat_id if getattr(result, "chat_id", None) is not None else result.chat.id)
+    except Exception:
+        return
+    if message_id >= 10 ** 9:                 # console-bridge test messages are not real Telegram ids
+        return
+    _BOT_SENT_IDS.setdefault(chat_id, _collections.deque(maxlen=BOT_SENT_KEEP)).append(message_id)
+
+
+def install_bot_message_tracker():
+    """Remember the id of every message the bot sends (class-level wrapper, same technique as the console bridge)."""
+    from telegram import Bot
+    for name in _TRACKED_SEND_METHODS:
+        original = getattr(Bot, name, None)
+        if original is None or getattr(original, "_msg_tracker", False):
+            continue
+
+        def make(orig):
+            async def wrapper(self, *args, **kwargs):
+                result = await orig(self, *args, **kwargs)
+                _track_bot_message(result)
+                return result
+            wrapper._msg_tracker = True
+            return wrapper
+
+        wrapper = make(original)
+        wrapper.__name__ = name
+        setattr(Bot, name, wrapper)
+
+
+async def _delete_later(bot, chat_id, message_id, delay):
+    await asyncio.sleep(delay)
+    await safe_delete_message(bot, chat_id, message_id)
+
+
+async def _rem_notice(context, chat_id, text, delay=6):
+    try:
+        sent = await context.bot.send_message(chat_id=chat_id, text=text)
+        _spawn_bg(_delete_later(context.bot, chat_id, sent.message_id, delay))
+    except Exception as e:
+        print("Rem notice error:", e)
+
+
+async def rem_command(update, context):
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if msg is None or user is None or chat is None or not msg.text:
+        return
+    m = re.match(_REM_RE, msg.text.strip())
+    if not m:
+        return
+    target, digits = m.group(1), m.group(2)
+    if target and context.bot.username and target.lower() != str(context.bot.username).lstrip("@").lower():
+        return                                              # /rem@OtherBot: not for us
+    if chat.type in ("group", "supergroup"):
+        if not await is_group_approved(chat.id) or not await asyncio.to_thread(is_bot_enabled, chat.id):
+            return                                          # unapproved / OFF group: stay silent like the other commands
+    restricted = await get_restricted_message(update)
+    if restricted:
+        await safe_reply_text(msg, restricted)
+        return
+
+    count = int(digits) if digits else None
+    if count == 0:
+        await _rem_notice(context, chat.id, "❌ The number must be at least 1. Example: /rem 10")
+        return
+    if count is not None:
+        count = min(count, REM_MAX)
+    tracked = _BOT_SENT_IDS.get(chat.id)
+    ids = []
+    if count is None and msg.reply_to_message is not None:
+        replied = msg.reply_to_message
+        if not replied.from_user or replied.from_user.id != context.bot.id:
+            await _rem_notice(context, chat.id, "❌ Reply to one of the bot's own messages. I can only delete my own messages.")
+            return
+        ids = [replied.message_id]
+    else:
+        ids = list(tracked or ())[-(count or 1):]
+        ids.reverse()                                       # newest first
+    if not ids:
+        await _rem_notice(context, chat.id,
+                          "ℹ️ I have no recent messages of mine to delete here "
+                          "(only messages sent since the last restart, under 48 hours old, can be removed).")
+        return
+
+    deleted = 0
+    for i in range(0, len(ids), 10):
+        results = await asyncio.gather(*(safe_delete_message(context.bot, chat.id, mid) for mid in ids[i:i + 10]))
+        deleted += sum(1 for ok in results if ok)
+    if tracked:
+        gone = set(ids)
+        remaining = [mid for mid in tracked if mid not in gone]
+        tracked.clear()
+        tracked.extend(remaining)
+    await safe_delete_message(context.bot, chat.id, msg.message_id)      # the /rem command itself (needs delete rights)
+    if deleted:
+        await _rem_notice(context, chat.id, f"🧹 Deleted {deleted} bot message{'s' if deleted != 1 else ''}.")
+    else:
+        await _rem_notice(context, chat.id, "❌ Could not delete (the message may be older than 48 hours, or already gone).")
+
+
 async def sell(update, context):
     (await save_user_async(update.effective_user))
 
-    if not context.args:
-        await safe_reply_text(update.message,
-            "Usage: /sell <4-digit code, first name, last name, or full name> [quantity]\nExamples: /sell 1001 2, /sell Yuji 2, /sell Itadori"
-        )
+    if not context.args:      # bare /sell: show the how-to guide and wait for the list
+        await _sell_send_guide(context, update.effective_chat.id, update.effective_user.id)
+        return
+
+    joined_args = " ".join(context.args)
+    if "/" in joined_args:      # several characters at once: /sell naruto 2 / sakura
+        await _sell_begin(update, context, joined_args)
         return
 
     quantity = 1
@@ -8657,7 +9111,7 @@ LOG_CATEGORY_OF = {cmd: cat for cat, (_t, _d, cmds) in LOG_CATEGORIES.items() fo
 # Owner "Category A": logged to the log channel automatically, no confirmation.
 OWNER_AUTO_LOG_CATEGORIES = {"character"}
 # Never logged in any way (no log entry, no security entry, no prompt) - /callcharacter is Owner-only and silent.
-SILENT_LOG_COMMANDS = {"callcharacter", "cooldown", "cd"}
+SILENT_LOG_COMMANDS = {"callcharacter", "cooldown", "cd", "rem"}
 # When the OWNER runs one of these, the log is held and the Owner is asked Yes/No first (whatever the category).
 OWNER_CONFIRM_LOG_COMMANDS = {"addredeem", "redeem"}
 # Multi-step (ConversationHandler) commands: the Owner's Yes/No prompt is held back until the LAST step succeeds
@@ -10000,7 +10454,8 @@ COMMANDS = {
     "characters": "List characters",
     "view": "View a character",
     "check": "Check character details and owners",
-    "sell": "Sell a character",
+    "sell": "Sell characters (many at once: /sell naruto 2 / sakura)",
+    "rem": "Delete the bot's own messages (reply to one, or /rem 10)",
     "transfer": "Transfer a character to the replied user",
     "berrytransfer": "Give Berrys by replying to a user",
     "berry": "View your daily Berry transfer status",
@@ -10092,7 +10547,7 @@ COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "myfav", "mystats", "addlist",
-    "daily", "characters", "view", "check", "sell", "transfer", "issue", "idea",
+    "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
     "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about", "dailytask",
@@ -10987,6 +11442,7 @@ def main():
         logger.error("MongoDB startup failed: %s", e)
         raise SystemExit(f"MongoDB startup failed: {e}")
     setup_database()
+    install_bot_message_tracker()      # remembers the bot's own message ids for /rem
 
     app = (
         Application.builder()
@@ -11044,6 +11500,10 @@ def main():
     )
     for command_name, callback in public_handlers:
         app.add_handler(CommandHandler(command_name, callback))
+    app.add_handler(MessageHandler(filters.Regex(_REM_RE) & filters.UpdateType.MESSAGE, rem_command))   # /rem, /rem 10, /rem10
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, sell_input_handler), group=50)      # list after 💰 Sell
+    app.add_handler(CallbackQueryHandler(sell_confirm_callback, pattern=r"^sellc:"))
+    app.add_handler(CallbackQueryHandler(sell_guide_callback, pattern=r"^sellg:"))
     fusion.bind(is_owner=is_owner, is_executive=is_executive, symbols=SYMBOL, conv_timeout=CONV_TIMEOUT,
                 notify=notify_staff_action, log_action=log_character_action, mark_success=mark_success,
                 safe_reply=safe_reply_text, skip_keyboard=skip_keyboard, is_skip_text=is_skip_text,
