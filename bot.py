@@ -4715,21 +4715,75 @@ async def sell_confirm_callback(update, context):
 
 # ======================================================================================================
 # /rem  -  delete the bot's OWN messages (everyone can use it)
-#   * reply to a bot message + /rem            -> deletes that one message
+#   * reply to a bot message + /rem            -> deletes that one message (works for any message < 48 hours old)
 #   * /rem 10  or  /rem10                      -> deletes the bot's last 10 messages in this chat
 #   * /rem alone (no reply)                    -> deletes the bot's last message
-# Telegram cannot list a bot's past messages, so every message the bot sends is remembered (per chat, last
-# BOT_SENT_KEEP ids, in memory). Only messages sent since the last restart can be counted, and Telegram only
-# allows deleting messages that are less than 48 hours old.
+#   * reply + number                           -> the replied message AND the newest others, N in total
+# Telegram cannot list a bot's past messages, so the id of every message the bot sends is remembered per chat
+# (last BOT_SENT_KEEP ids, kept in memory and saved to MongoDB every few seconds so a restart does not lose them).
+# Messages that are already gone are skipped, so /rem 10 keeps going until 10 messages were really deleted.
+# Telegram only allows deleting messages that are less than 48 hours old.
 # ======================================================================================================
 import collections as _collections
 
 BOT_SENT_KEEP = 100
 REM_MAX = 50
-_BOT_SENT_IDS = {}          # chat_id -> deque of message ids sent by the bot
+BOT_SENT_COLLECTION = "bot_sent_ids_v1"
+BOT_SENT_FLUSH_DELAY = 10                  # seconds between saves of the remembered ids
+_BOT_SENT_IDS = {}                         # chat_id -> deque of message ids sent by the bot (oldest ... newest)
+_BOT_SENT_LOADED = set()                   # chats whose saved ids were already merged into memory
+_BOT_SENT_DIRTY = set()                    # chats with changes not saved yet
+_BOT_SENT_FLUSH = {"pending": False}
 _REM_RE = r"(?i)^/rem(?:@(\w+))?\s*(\d{0,3})\s*$"      # /rem  /rem 10  /rem10  /rem@MyBot 10
 _TRACKED_SEND_METHODS = ("send_message", "send_photo", "send_animation", "send_document", "send_video", "send_sticker",
                          "send_audio", "send_voice", "send_video_note", "send_dice", "send_poll")
+
+
+def _sent_deque(chat_id):
+    return _BOT_SENT_IDS.setdefault(chat_id, _collections.deque(maxlen=BOT_SENT_KEEP))
+
+
+async def _sent_flush_once():
+    await asyncio.sleep(BOT_SENT_FLUSH_DELAY)
+    _BOT_SENT_FLUSH["pending"] = False
+    chats = list(_BOT_SENT_DIRTY)
+    _BOT_SENT_DIRTY.clear()
+    for chat_id in chats:
+        try:
+            await _sent_ensure_loaded(chat_id)           # never overwrite saved ids that were not merged yet
+            ids = list(_BOT_SENT_IDS.get(chat_id, ()))
+            await asyncio.to_thread(_mc(BOT_SENT_COLLECTION).update_one, {"_id": chat_id}, {"$set": {"ids": ids}}, upsert=True)
+        except Exception as e:
+            print("Bot message ids save error:", e)
+
+
+async def _sent_ensure_loaded(chat_id):
+    """Merge the ids saved before the last restart (older) with the ones remembered since (newer)."""
+    if chat_id in _BOT_SENT_LOADED:
+        return
+    _BOT_SENT_LOADED.add(chat_id)
+    try:
+        doc = await asyncio.to_thread(_mc(BOT_SENT_COLLECTION).find_one, {"_id": chat_id})
+    except Exception as e:
+        print("Bot message ids load error:", e)
+        return
+    saved = [int(i) for i in ((doc or {}).get("ids") or [])]
+    dq = _sent_deque(chat_id)
+    current = list(dq)
+    known = set(current)
+    merged = [i for i in saved if i not in known] + current
+    dq.clear()
+    dq.extend(merged[-BOT_SENT_KEEP:])
+
+
+def _mark_sent_dirty(chat_id):
+    _BOT_SENT_DIRTY.add(chat_id)
+    if not _BOT_SENT_FLUSH["pending"]:
+        _BOT_SENT_FLUSH["pending"] = True
+        try:
+            _spawn_bg(_sent_flush_once())
+        except RuntimeError:                       # no running event loop
+            _BOT_SENT_FLUSH["pending"] = False
 
 
 def _track_bot_message(result):
@@ -4740,7 +4794,16 @@ def _track_bot_message(result):
         return
     if message_id >= 10 ** 9:                 # console-bridge test messages are not real Telegram ids
         return
-    _BOT_SENT_IDS.setdefault(chat_id, _collections.deque(maxlen=BOT_SENT_KEEP)).append(message_id)
+    _sent_deque(chat_id).append(message_id)
+    _mark_sent_dirty(chat_id)
+
+
+def _forget_sent(chat_id, message_id):
+    dq = _BOT_SENT_IDS.get(chat_id)
+    if dq and message_id in dq:
+        remaining = [i for i in dq if i != message_id]
+        dq.clear()
+        dq.extend(remaining)
 
 
 def install_bot_message_tracker():
@@ -4764,14 +4827,26 @@ def install_bot_message_tracker():
         setattr(Bot, name, wrapper)
 
 
+async def _delete_one(bot, chat_id, message_id):
+    """(True, None) when deleted, (False, telegram error text) otherwise."""
+    try:
+        await asyncio.wait_for(bot.delete_message(chat_id=chat_id, message_id=message_id), timeout=15)
+        return True, None
+    except Exception as e:
+        print(f"/rem delete error for {chat_id}/{message_id}: {e}")
+        return False, str(e) or e.__class__.__name__
+
+
 async def _delete_later(bot, chat_id, message_id, delay):
     await asyncio.sleep(delay)
     await safe_delete_message(bot, chat_id, message_id)
 
 
 async def _rem_notice(context, chat_id, text, delay=6):
+    """Short message that removes itself (and is not remembered as a bot message)."""
     try:
         sent = await context.bot.send_message(chat_id=chat_id, text=text)
+        _forget_sent(chat_id, sent.message_id)
         _spawn_bg(_delete_later(context.bot, chat_id, sent.message_id, delay))
     except Exception as e:
         print("Rem notice error:", e)
@@ -4799,39 +4874,52 @@ async def rem_command(update, context):
     if count == 0:
         await _rem_notice(context, chat.id, "❌ The number must be at least 1. Example: /rem 10")
         return
-    if count is not None:
-        count = min(count, REM_MAX)
-    tracked = _BOT_SENT_IDS.get(chat.id)
-    ids = []
-    if count is None and msg.reply_to_message is not None:
-        replied = msg.reply_to_message
-        if not replied.from_user or replied.from_user.id != context.bot.id:
+    wanted = min(count, REM_MAX) if count else 1
+    replied = msg.reply_to_message
+    if replied is not None and (not replied.from_user or replied.from_user.id != context.bot.id):
+        if count is None:
             await _rem_notice(context, chat.id, "❌ Reply to one of the bot's own messages. I can only delete my own messages.")
             return
-        ids = [replied.message_id]
-    else:
-        ids = list(tracked or ())[-(count or 1):]
-        ids.reverse()                                       # newest first
-    if not ids:
-        await _rem_notice(context, chat.id,
-                          "ℹ️ I have no recent messages of mine to delete here "
-                          "(only messages sent since the last restart, under 48 hours old, can be removed).")
-        return
+        replied = None                                      # /rem 10 as a reply to someone else's message: just the last 10
 
-    deleted = 0
-    for i in range(0, len(ids), 10):
-        results = await asyncio.gather(*(safe_delete_message(context.bot, chat.id, mid) for mid in ids[i:i + 10]))
-        deleted += sum(1 for ok in results if ok)
-    if tracked:
-        gone = set(ids)
-        remaining = [mid for mid in tracked if mid not in gone]
-        tracked.clear()
-        tracked.extend(remaining)
+    await _sent_ensure_loaded(chat.id)
+    dq = _sent_deque(chat.id)
+    deleted, attempted, last_error = 0, 0, None
+    if replied is not None:                                 # the message that was replied to goes first
+        _forget_sent(chat.id, replied.message_id)
+        ok, err = await _delete_one(context.bot, chat.id, replied.message_id)
+        attempted += 1
+        if ok:
+            deleted += 1
+        else:
+            last_error = err
+    need = wanted - deleted if replied is not None else wanted
+    if replied is not None and count is None:
+        need = 0                                            # plain reply + /rem: only that one message
+    while need > 0 and dq:                                  # newest first; messages that are already gone are skipped
+        batch = [dq.pop() for _ in range(min(need, 10, len(dq)))]
+        results = await asyncio.gather(*(_delete_one(context.bot, chat.id, mid) for mid in batch))
+        attempted += len(batch)
+        for ok, err in results:
+            if ok:
+                deleted += 1
+                need -= 1
+            else:
+                last_error = err
+    _mark_sent_dirty(chat.id)
     await safe_delete_message(context.bot, chat.id, msg.message_id)      # the /rem command itself (needs delete rights)
+
     if deleted:
-        await _rem_notice(context, chat.id, f"🧹 Deleted {deleted} bot message{'s' if deleted != 1 else ''}.")
+        text = f"🧹 Deleted {deleted} bot message{'s' if deleted != 1 else ''}."
+        if count and deleted < wanted:
+            text += f"\nOnly {deleted} of {wanted} were still available (I remember my last {BOT_SENT_KEEP} messages, under 48 hours old)."
+        await _rem_notice(context, chat.id, text)
+    elif attempted == 0:
+        await _rem_notice(context, chat.id,
+                          "ℹ️ I have no saved messages of mine for this chat yet. I remember every message I send from now on.\n"
+                          "To delete an older message, reply to it with /rem.")
     else:
-        await _rem_notice(context, chat.id, "❌ Could not delete (the message may be older than 48 hours, or already gone).")
+        await _rem_notice(context, chat.id, f"❌ Could not delete: {last_error}", delay=10)
 
 
 async def sell(update, context):
