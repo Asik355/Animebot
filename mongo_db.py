@@ -1200,6 +1200,51 @@ def cleanup_left_group(chat_id):
     )
 
 
+# ---- Auto Approve (Owner setting). Stored in bot_settings (_id "auto_approve"); BOT_SETTINGS is defined further down,
+# which is fine because these functions only read it when they run.
+_AUTO_APPROVE_TTL = 5.0
+_auto_approve_cache = {"v": None, "ts": 0.0}
+
+
+@retry_read
+def _fetch_auto_approve():
+    d = col(BOT_SETTINGS).find_one({"_id": "auto_approve"}) or {}
+    return {"enabled": bool(d.get("enabled")), "set_by": d.get("set_by"), "set_at": d.get("set_at")}
+
+
+def get_auto_approve(fresh=False):
+    """{enabled, set_by, set_at}. Cached for a few seconds (it is read whenever the bot is added to a group)."""
+    now = time.monotonic()
+    cached = _auto_approve_cache["v"]
+    if not fresh and cached is not None and now - _auto_approve_cache["ts"] < _AUTO_APPROVE_TTL:
+        return dict(cached)
+    value = _fetch_auto_approve()
+    _auto_approve_cache["v"] = value
+    _auto_approve_cache["ts"] = time.monotonic()
+    return dict(value)
+
+
+@retry_write
+def set_auto_approve(enabled, set_by=None, set_at=None):
+    col(BOT_SETTINGS).update_one(
+        {"_id": "auto_approve"},
+        {"$set": {"enabled": bool(enabled), "set_by": set_by, "set_at": set_at}},
+        upsert=True,
+    )
+    _auto_approve_cache["v"] = None
+    return bool(enabled)
+
+
+def load_pending_groups():
+    """[(chat_id, title)] of groups the bot is in (registered) that are not approved yet. Always a fresh read."""
+    _invalidate_groups()
+    out = []
+    for cid, d in _fetch_groups().items():
+        if d.get("registered") and not d.get("approved"):
+            out.append((int(cid), d.get("title")))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Per-user notification toggle (default: DISABLED - a user must explicitly turn it ON)
 # --------------------------------------------------------------------------
@@ -1262,6 +1307,7 @@ def replace_restrictions(data):
 #   _id "log_categories": {custom: {name: description}, disabled: [category names]}
 #   _id "command_mappings": {map: {command: category}}   (Owner /logmap: command -> log category)
 #   _id "rules":          {text, updated_by, updated_at}
+#   _id "auto_approve":   {enabled, set_by, set_at}   (Owner /autoapprove: approve every new group automatically)
 # Category switches live in their own document so unlinking/re-linking the log channel keeps them.
 # --------------------------------------------------------------------------
 BOT_SETTINGS = "bot_settings"
