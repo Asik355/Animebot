@@ -1124,6 +1124,11 @@ def hide_gstats_group(chat_id):
     return _set_group_fields(chat_id, {"gstats_hidden": True})
 
 
+def unhide_gstats_group(chat_id):
+    """Show a group in /gstats again (the Hide button in the group's manage page only sets this flag)."""
+    return _set_group_fields(chat_id, {"gstats_hidden": False})
+
+
 # registered bot groups (title info)
 def load_bot_groups():
     out = {}
@@ -1196,7 +1201,7 @@ def cleanup_left_group(chat_id):
     return _set_group_fields(
         chat_id,
         {"approved": False, "auto_spawn": False, "registered": False},
-        ["bot_enabled", "title", "type", "username"],
+        ["bot_enabled", "title", "type", "username", "gstats_hidden"],
     )
 
 
@@ -1209,7 +1214,12 @@ _auto_approve_cache = {"v": None, "ts": 0.0}
 @retry_read
 def _fetch_auto_approve():
     d = col(BOT_SETTINGS).find_one({"_id": "auto_approve"}) or {}
-    return {"enabled": bool(d.get("enabled")), "set_by": d.get("set_by"), "set_at": d.get("set_at")}
+    try:
+        minimum = max(0, int(d.get("min_members") or 0))
+    except (TypeError, ValueError):
+        minimum = 0
+    return {"enabled": bool(d.get("enabled")), "min_members": minimum,
+            "set_by": d.get("set_by"), "set_at": d.get("set_at")}
 
 
 def get_auto_approve(fresh=False):
@@ -1233,6 +1243,19 @@ def set_auto_approve(enabled, set_by=None, set_at=None):
     )
     _auto_approve_cache["v"] = None
     return bool(enabled)
+
+
+@retry_write
+def set_auto_approve_min_members(min_members, set_by=None, set_at=None):
+    """Smallest member count a new group needs to be auto-approved (0 = no limit). Leaves the ON/OFF switch alone."""
+    value = max(0, int(min_members))
+    col(BOT_SETTINGS).update_one(
+        {"_id": "auto_approve"},
+        {"$set": {"min_members": value, "set_by": set_by, "set_at": set_at}},
+        upsert=True,
+    )
+    _auto_approve_cache["v"] = None
+    return value
 
 
 def load_pending_groups():
@@ -1307,7 +1330,8 @@ def replace_restrictions(data):
 #   _id "log_categories": {custom: {name: description}, disabled: [category names]}
 #   _id "command_mappings": {map: {command: category}}   (Owner /logmap: command -> log category)
 #   _id "rules":          {text, updated_by, updated_at}
-#   _id "auto_approve":   {enabled, set_by, set_at}   (Owner /autoapprove: approve every new group automatically)
+#   _id "auto_approve":   {enabled, min_members, set_by, set_at}   (Owner /autoapprove: approve new groups automatically;
+#                          min_members = smallest group size that is auto-approved, 0 = no limit)
 # Category switches live in their own document so unlinking/re-linking the log channel keeps them.
 # --------------------------------------------------------------------------
 BOT_SETTINGS = "bot_settings"

@@ -321,6 +321,9 @@ def load_gstats_hidden_groups():
 def hide_gstats_group(chat_id):
     return _mongo_safe(mongo_db.hide_gstats_group, int(chat_id))
 
+def unhide_gstats_group(chat_id):
+    return _mongo_safe(mongo_db.unhide_gstats_group, int(chat_id))
+
 def register_bot_group(chat):
     if not chat or not getattr(chat, "id", None):
         return
@@ -677,63 +680,112 @@ async def approve_group(update, context):
     )
 
 # ---------------------------------------------------------------------------------------------------
-# AUTO APPROVE (Owner only). While ON, every group the bot is added to is approved automatically.
-# Turned on/off with /autoapprove or the button in /help -> Owner Commands -> Group Control.
+# AUTO APPROVE (Owner only). While ON, a group the bot is added to is approved automatically, as long as it has
+# at least the minimum number of members the Owner set (0 = no limit). Smaller groups wait in "Pending".
+# Opened from /help -> Owner Commands -> ✅ Auto Approve (next to 🎨 Customize Bot), or with /autoapprove.
 # ---------------------------------------------------------------------------------------------------
-async def is_auto_approve_on():
-    """Fails closed: if the setting cannot be read, Auto Approve counts as OFF (the normal manual flow applies)."""
+AA_PAGE_SIZE = 8
+AA_INPUT_TIMEOUT = 300                # seconds the bot waits for the minimum-members number
+AA_MAX_MIN_MEMBERS = 1000000
+_aa_waiting_min = {}                  # owner id -> expiry (time.monotonic) while the bot waits for the number
+
+
+async def get_auto_approve_settings(fresh=False):
+    """{enabled, min_members, ...}, or None when the setting cannot be read."""
     try:
-        return bool((await asyncio.to_thread(mongo_db.get_auto_approve)).get("enabled"))
+        return await asyncio.to_thread(mongo_db.get_auto_approve, fresh)
     except Exception as e:
         print("Auto-approve lookup error:", e)
-        return False
+        return None
+
+
+async def is_auto_approve_on():
+    """Fails closed: if the setting cannot be read, Auto Approve counts as OFF (the normal manual flow applies)."""
+    s = await get_auto_approve_settings()
+    return bool(s and s.get("enabled"))
+
+
+async def group_member_count(bot, chat_id):
+    try:
+        return int(await bot.get_chat_member_count(chat_id))
+    except Exception as e:
+        print(f"Member count error for {chat_id}:", e)
+        return None
+
+
+async def check_group_size(bot, chat_id, minimum):
+    """(ok, member_count, note). No limit -> ok. A limit is set but the count is unknown -> not ok (fails closed)."""
+    if minimum <= 0:
+        return True, None, None
+    count = await group_member_count(bot, chat_id)
+    if count is None:
+        return False, None, f"👥 Members could not be checked (minimum {minimum})"
+    if count < minimum:
+        return False, count, f"👥 Members: {count} (minimum {minimum})"
+    return True, count, None
 
 
 async def auto_approve_group(context, chat, added_by=None):
-    """Approve one group because Auto Approve is ON. Returns True when the group is approved afterwards."""
+    """Approve one group because Auto Approve is ON and it is big enough.
+    Returns (approved, note). `note` explains why a group was NOT auto-approved (shown to the Owner in the approval request)."""
+    s = await get_auto_approve_settings()
+    if not s or not s.get("enabled"):
+        return False, None
     cid = int(chat.id)
     inflight = context.application.bot_data.setdefault("auto_approve_inflight", set())
     if cid in inflight:
-        return True                       # another update is already approving this group
+        return True, None                 # another update is already approving this group
     inflight.add(cid)
     try:
         if cid in await asyncio.to_thread(mongo_db.load_approved_groups):
-            return True
+            return True, None
+        minimum = int(s.get("min_members") or 0)
+        ok, count, note = await check_group_size(context.bot, cid, minimum)
+        if not ok:
+            return False, "🤖 Auto Approve is ON but did not approve this group.\n" + note
         if not await apply_group_approval(context, cid):
-            return False
+            return False, None
         await send_group_approved_confirmation(context, cid)
         owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
         if owner_id:
             try:
                 who = html_escape(display_user(added_by)) if added_by else "Unknown"
+                members = f"👥 Members: {count}\n" if count is not None else ""
                 await context.bot.send_message(
                     chat_id=owner_id,
                     text=(
                         "🤖 GROUP AUTO-APPROVED\n"
                         f"🏷 Group: {html_escape(_chat_title(chat))}\n"
                         f"🆔 Group ID: {group_id_html(cid)}\n"
+                        f"{members}"
                         f"👤 Added by: {who}\n\n"
-                        "Auto Approve is ON. Turn it off with /autoapprove off"
+                        "Auto Approve is ON. Change it from /help → Owner Commands → ✅ Auto Approve"
                     ),
                     parse_mode="HTML",
                 )
             except Exception as e:
                 print("Owner auto-approve notification error:", e)
-        return True
+        return True, None
     except Exception as e:
         print(f"Auto approve error for {cid}:", e)
-        return False
+        return False, None
     finally:
         inflight.discard(cid)
 
 
-async def sweep_pending_groups(context):
-    """Approve every group that is waiting for approval. Returns (approved_count, failed_count)."""
+async def sweep_pending_groups(context, minimum):
+    """Approve the waiting groups that have enough members. Returns (approved, below_minimum, failed)."""
     pending = await asyncio.to_thread(mongo_db.load_pending_groups)
-    approved = failed = 0
+    approved = below = failed = 0
     for cid, _title in pending:
         try:
-            if await apply_group_approval(context, cid):
+            ok, _count, note = await check_group_size(context.bot, cid, minimum)
+            if not ok:
+                if _count is None:
+                    failed += 1                # member count could not be read
+                else:
+                    below += 1
+            elif await apply_group_approval(context, cid):
                 approved += 1
                 await send_group_approved_confirmation(context, cid)     # never raises
             else:
@@ -742,40 +794,219 @@ async def sweep_pending_groups(context):
             failed += 1
             print(f"Pending group approval error for {cid}:", e)
         await asyncio.sleep(0.2)          # stay well under Telegram's flood limits when many groups are waiting
-    return approved, failed
+    return approved, below, failed
 
 
-def auto_approve_status_text(enabled):
-    if enabled:
-        return ("🤖 Auto Approve: ✅ ON\n"
-                "Every group the bot is added to is approved automatically.")
-    return ("🤖 Auto Approve: ❌ OFF\n"
-            "New groups wait for the Owner to use /approve.")
+def sweep_result_text(approved, below, failed):
+    lines = [f"📦 Waiting groups approved: {approved}"]
+    if below:
+        lines.append(f"👥 Below the minimum, still pending: {below}")
+    if failed:
+        lines.append(f"⚠️ Could not check/approve: {failed} (use /approve <group_chat_id>)")
+    return "\n".join(lines)
+
+
+def auto_approve_status_text(enabled, minimum):
+    return ("🤖 Auto Approve: " + ("✅ ON" if enabled else "❌ OFF") + "\n"
+            "👥 Minimum members: " + (str(minimum) if minimum > 0 else "no limit"))
+
+
+async def _aa_edit(query, text, markup, html=False):
+    try:
+        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML" if html else None)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            print("Auto approve edit error:", e)
+
+
+async def auto_approve_hub(owner_id, extra=""):
+    """(text, keyboard) of the Auto Approve page."""
+    back = [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:owner")]
+    s = await get_auto_approve_settings(True)
+    if s is None:
+        return "⚠️ Could not read the Auto Approve setting. Please try again.", InlineKeyboardMarkup([back])
+    enabled, minimum = bool(s.get("enabled")), int(s.get("min_members") or 0)
+    try:
+        pending = len(await asyncio.to_thread(mongo_db.load_pending_groups))
+    except Exception as e:
+        print("Pending groups read error:", e)
+        pending = None
+    text = ("✅ Auto Approve\n\n" + auto_approve_status_text(enabled, minimum) +
+            f"\n📋 Groups waiting: {pending if pending is not None else '?'}\n\n"
+            "When ON, a group the bot is added to is approved by itself if it has at least the minimum members. "
+            "Smaller groups wait in Pending until you use /approve.")
+    if extra:
+        text += "\n\n" + extra
+    rows = [
+        [_module_button("Auto: " + ("✅ ON" if enabled else "❌ OFF"), f"aa:{owner_id}:tog"),
+         _module_button("👥 Min: " + (str(minimum) if minimum > 0 else "Off"), f"aa:{owner_id}:min")],
+        [_module_button(f"📋 Pending ({pending if pending is not None else '?'})", f"aa:{owner_id}:pend:0")],
+        back,
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def auto_approve_pending_page(context, owner_id, page):
+    """(html_text, keyboard) of the Pending list: every group the bot is in that is not approved yet."""
+    pending = await asyncio.to_thread(mongo_db.load_pending_groups)
+    total = len(pending)
+    pages = max(1, -(-total // AA_PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    chunk = pending[page * AA_PAGE_SIZE:(page + 1) * AA_PAGE_SIZE]
+    counts = await asyncio.gather(*[group_member_count(context.bot, cid) for cid, _t in chunk])
+    lines = [f"📋 <b>Pending groups</b> ({total})"]
+    if not chunk:
+        lines.append("\nNo group is waiting for approval. ✅")
+    for (cid, title), n in zip(chunk, counts):
+        lines.append(f"\n• <b>{html_escape(str(title or 'Unknown'))}</b>\n"
+                     f"  🆔 {group_id_html(cid)}\n  👥 {n if n is not None else '?'} members")
+    if chunk:
+        lines.append("\nApprove one with " + html_escape("/approve <group_chat_id>"))
+        if pages > 1:
+            lines.append(f"Page {page + 1}/{pages}")
+    nav = []
+    if page > 0:
+        nav.append(_module_button("‹ Prev", f"aa:{owner_id}:pend:{page - 1}"))
+    if page < pages - 1:
+        nav.append(_module_button("Next ›", f"aa:{owner_id}:pend:{page + 1}"))
+    rows = ([nav] if nav else []) + [
+        [_module_button("🔄 Refresh", f"aa:{owner_id}:pend:{page}")],
+        [InlineKeyboardButton("« Back", callback_data=f"aa:{owner_id}:hub")],
+    ]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def auto_approve_callback(update, context):
+    """Buttons of the Auto Approve page. Callback data: aa:<menu_owner_id>:<hub|tog|min|pend>[:<page>]. Owner only."""
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    uid = query.from_user.id
+    try:
+        if len(parts) < 3 or not parts[1].isdigit():
+            await query.answer(HELP_STALE_TEXT, show_alert=True)
+            return
+        menu_owner, action = int(parts[1]), parts[2]
+        arg = parts[3] if len(parts) > 3 else ""
+        if uid != menu_owner:
+            await query.answer(NOT_YOURS_TEXT, show_alert=True)
+            return
+        if not is_owner(uid):
+            await deny_callback(query)
+            return
+
+        if action == "hub":
+            await query.answer()
+            text, markup = await auto_approve_hub(uid)
+            await _aa_edit(query, text, markup)
+        elif action == "tog":
+            s = await get_auto_approve_settings(True)
+            if s is None:
+                await query.answer("⚠️ Could not read the setting. Nothing was changed.", show_alert=True)
+                return
+            want = not bool(s.get("enabled"))
+            try:
+                await asyncio.to_thread(mongo_db.set_auto_approve, want, uid, india_timestamp())
+            except Exception as e:
+                print("Auto approve toggle error:", repr(e))
+                await query.answer("⚠️ Could not change Auto Approve. Nothing was changed.", show_alert=True)
+                return
+            try:
+                await query.answer("🤖 Auto Approve is now " + ("ON ✅" if want else "OFF ❌"))
+            except Exception:
+                pass
+            extra = ""
+            if want:
+                extra = sweep_result_text(*(await sweep_pending_groups(context, int(s.get("min_members") or 0))))
+            text, markup = await auto_approve_hub(uid, extra)
+            await _aa_edit(query, text, markup)
+        elif action == "min":
+            s = await get_auto_approve_settings()
+            current = int((s or {}).get("min_members") or 0)
+            _aa_waiting_min[uid] = time.monotonic() + AA_INPUT_TIMEOUT
+            await query.answer("Send the number in the chat")
+            chat = query.message.chat if query.message else None
+            if chat is not None:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=("👥 Minimum members\n"
+                          f"Current: {current if current > 0 else 'no limit'}\n\n"
+                          "Send the number now (0 = no limit). Send /cancel to stop."))
+        elif action == "pend":
+            await query.answer()
+            page = int(arg) if arg.isdigit() else 0
+            text, markup = await auto_approve_pending_page(context, uid, page)
+            await _aa_edit(query, text, markup, html=True)
+        else:
+            await query.answer()
+    except Exception as e:
+        print("Auto approve callback error:", repr(e))
+        try:
+            await query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def auto_approve_min_input(update, context):
+    """The Owner's reply (a number) after tapping 👥 Min. Does nothing unless the bot is waiting for it."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or user.id not in _aa_waiting_min:
+        return
+    if not is_owner(user.id) or time.monotonic() > _aa_waiting_min[user.id]:
+        _aa_waiting_min.pop(user.id, None)
+        return
+    text = (msg.text or "").strip()
+    if not re.fullmatch(r"[0-9]{1,7}", text) or int(text) > AA_MAX_MIN_MEMBERS:
+        await safe_reply_text(msg, f"⚠️ Send a whole number from 0 to {AA_MAX_MIN_MEMBERS} (0 = no limit), or /cancel.")
+        return
+    try:
+        value = await asyncio.to_thread(mongo_db.set_auto_approve_min_members, int(text), user.id, india_timestamp())
+    except Exception as e:
+        print("Auto approve min save error:", e)
+        await safe_reply_text(msg, "⚠️ Could not save the number. Please send it again, or /cancel.")
+        return
+    _aa_waiting_min.pop(user.id, None)
+    await safe_reply_text(msg, "✅ Minimum members set to " + (str(value) if value > 0 else "no limit (0)") + ".")
+    hub_text, hub_markup = await auto_approve_hub(user.id)
+    await safe_reply_text(msg, hub_text, reply_markup=hub_markup)
 
 
 async def autoapprove_command(update, context):
-    """/autoapprove [on|off] - Owner only."""
+    """/autoapprove [on|off|min <number>] - Owner only."""
     user = update.effective_user
     msg = update.effective_message
     if not user or not is_owner(user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
         return
     args = [a.lower() for a in (context.args or [])]
-    if len(args) > 1 or (args and args[0] not in ("on", "off")):
-        await safe_reply_text(msg, "Usage: /autoapprove on | off\nSend /autoapprove alone to see the current status.")
-        return
-    try:
-        current = bool((await asyncio.to_thread(mongo_db.get_auto_approve, True)).get("enabled"))
-    except Exception as e:
-        print("autoapprove read error:", e)
+    usage = "Usage: /autoapprove on | off | min <number>\nSend /autoapprove alone to see the status."
+    s = await get_auto_approve_settings(True)
+    if s is None:
         await safe_reply_text(msg, "⚠️ Could not read the Auto Approve setting. Nothing was changed. Please try again.")
         return
+    current, minimum = bool(s.get("enabled")), int(s.get("min_members") or 0)
     if not args:
-        await safe_reply_text(msg, auto_approve_status_text(current) + "\n\nChange it with /autoapprove on or /autoapprove off.")
+        await safe_reply_text(msg, auto_approve_status_text(current, minimum) +
+                              "\n\nChange it with /autoapprove on, /autoapprove off or /autoapprove min 50.\n"
+                              "Or open /help → Owner Commands → ✅ Auto Approve.")
+        return
+    if args[0] == "min":
+        if len(args) != 2 or not re.fullmatch(r"[0-9]{1,7}", args[1]) or int(args[1]) > AA_MAX_MIN_MEMBERS:
+            await safe_reply_text(msg, f"Usage: /autoapprove min <number>   (0 to {AA_MAX_MIN_MEMBERS}, 0 = no limit)")
+            return
+        try:
+            value = await asyncio.to_thread(mongo_db.set_auto_approve_min_members, int(args[1]), user.id, india_timestamp())
+        except Exception as e:
+            print("autoapprove min write error:", e)
+            await safe_reply_text(msg, "⚠️ Could not save the number. Nothing was changed. Please try again.")
+            return
+        await safe_reply_text(msg, "✅ Minimum members set to " + (str(value) if value > 0 else "no limit (0)") + ".")
+        return
+    if len(args) != 1 or args[0] not in ("on", "off"):
+        await safe_reply_text(msg, usage)
         return
     want = args[0] == "on"
     if want == current:
-        await safe_reply_text(msg, auto_approve_status_text(current) + "\n\nNo change was needed.")
+        await safe_reply_text(msg, auto_approve_status_text(current, minimum) + "\n\nNo change was needed.")
         return
     try:
         await asyncio.to_thread(mongo_db.set_auto_approve, want, user.id, india_timestamp())
@@ -786,12 +1017,8 @@ async def autoapprove_command(update, context):
     if not want:
         await safe_reply_text(msg, "🤖 Auto Approve: ❌ OFF\nGroups that are already approved stay approved. New groups wait for /approve again.")
         return
-    await safe_reply_text(msg, "🤖 Auto Approve: ✅ ON\nNew groups are approved automatically. Approving the groups that are waiting now...")
-    approved, failed = await sweep_pending_groups(context)
-    result = f"📦 Waiting groups approved: {approved}"
-    if failed:
-        result += f"\n⚠️ Could not approve {failed} group(s). Use /approve <group_chat_id> for them."
-    await safe_reply_text(msg, result)
+    await safe_reply_text(msg, "🤖 Auto Approve: ✅ ON\nApproving the groups that are waiting now...")
+    await safe_reply_text(msg, sweep_result_text(*(await sweep_pending_groups(context, minimum))))
 
 
 async def leave_group(update, context):
@@ -1070,15 +1297,19 @@ async def track_bot_membership(update, context):
     status = member_update.new_chat_member.status
     if status in ("member", "administrator"):
         (await asyncio.to_thread(register_bot_group, chat))
+        if getattr(member_update.old_chat_member, "status", None) in ("left", "kicked"):
+            (await asyncio.to_thread(unhide_gstats_group, chat.id))        # re-added: show it in /gstats again
         if await is_group_approved(chat.id):
             (await asyncio.to_thread(register_auto_spawn_group, chat.id))
             context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
             return
 
+        aa_note = None
         if await is_auto_approve_on():
-            if await auto_approve_group(context, chat, getattr(member_update, "from_user", None)):
+            approved_now, aa_note = await auto_approve_group(context, chat, getattr(member_update, "from_user", None))
+            if approved_now:
                 return
-            # approving failed: fall through to the normal manual-approval flow below
+            # not approved (too few members / failed): fall through to the normal manual-approval flow below
 
         notified = context.application.bot_data.setdefault("unapproved_notified", set())
         if chat.id not in notified:
@@ -1102,8 +1333,9 @@ async def track_bot_membership(update, context):
                             "🔔 New Group Approval Request\n"
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
                             f"🆔 Group ID: {group_id_html(chat.id)}\n"
-                            f"👤 Requested by: {html_escape(added_by_text)}\n\n"
-                            f"Approve with: <code>/approve {html_escape(str(chat.id))}</code>"
+                            f"👤 Requested by: {html_escape(added_by_text)}\n"
+                            + (f"{html_escape(aa_note)}\n" if aa_note else "") +
+                            f"\nApprove with: <code>/approve {html_escape(str(chat.id))}</code>"
                         ),
                         parse_mode="HTML",
                     )
@@ -1658,9 +1890,7 @@ HELP_MODULES = {
             "Switch the bot on or off per group and fix spawns that got stuck.",
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
-             ("/clearspawn", "Clear a stuck active spawn (group only)"),
-             ("/autoapprove [on|off]", "Owner only: approve every group the bot is added to automatically. "
-                                       "Send it alone to see the status, or use the button below")])),
+             ("/clearspawn", "Clear a stuck active spawn (group only)")])),
         ("broadcast", "📣 Broadcast", _help_page(
             "📣 Broadcast (Owner & Executive)",
             "Send one announcement to every linked group.",
@@ -1725,6 +1955,7 @@ for _role in ("executive", "scout"):
             HELP_MODULES["owner"].append(_module)
             _owner_keys.add(_module[0])
 HELP_MODULES["owner"].append(("customize", "🎨 Customize Bot", "🎨 Customize Bot"))    # Owner only (opens theme.py's hub)
+HELP_MODULES["owner"].append(("autoapprove", "✅ Auto Approve", "✅ Auto Approve"))     # Owner only (opens the Auto Approve page)
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -1743,14 +1974,20 @@ def _help_module_visible(key, user_id):
         return False
     if key == "scouts" and is_owner(uid):
         return False
-    if key == "customize" and not is_owner(uid):
+    if key in ("customize", "autoapprove") and not is_owner(uid):
         return False
     return True
 
 
 def help_grid_keyboard(role, owner_id):
     """LAYER 2: module buttons in a strict 3-column grid + « Back to Layer 1 (main help)."""
-    buttons = [_module_button(label, f"theme:{owner_id}:hub:open" if key == "customize" else f"help:{owner_id}:{role}:{key}")
+    def _target(key):
+        if key == "customize":
+            return f"theme:{owner_id}:hub:open"
+        if key == "autoapprove":
+            return f"aa:{owner_id}:hub"
+        return f"help:{owner_id}:{role}:{key}"
+    buttons = [_module_button(label, _target(key))
                for key, label, _text in HELP_MODULES[role] if _help_module_visible(key, owner_id)]
     rows = [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
     rows.append([InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:back")])
@@ -2753,50 +2990,6 @@ async def _edit_help_message(query, text, reply_markup=None):
     except Exception as e:
         print("Help fallback send error:", e)
 
-def _auto_approve_button(owner_id, enabled):
-    label = "🤖 Auto Approve: ✅ ON" if enabled else "🤖 Auto Approve: ❌ OFF"
-    return _module_button(label, f"help:{owner_id}:aa:toggle")
-
-
-def _groupctl_owner_panel(text, markup, owner_id, enabled, extra=""):
-    """Group Control page for the Owner: the usual text + status line, and the Auto Approve toggle button on top."""
-    note = "\n\n" + auto_approve_status_text(enabled) + "\nTap the button below to switch it."
-    if extra:
-        note += "\n" + extra
-    rows = [[_auto_approve_button(owner_id, enabled)]] + [list(r) for r in markup.inline_keyboard]
-    return text + note, InlineKeyboardMarkup(rows)
-
-
-async def help_autoapprove_toggle(context, query, user_id):
-    """Owner taps the Auto Approve button in Group Control. Ownership of the menu was already checked by help_callback."""
-    if not is_owner(user_id):
-        await deny_callback(query)
-        return
-    try:
-        current = bool((await asyncio.to_thread(mongo_db.get_auto_approve, True)).get("enabled"))
-        want = not current
-        await asyncio.to_thread(mongo_db.set_auto_approve, want, user_id, india_timestamp())
-    except Exception as e:
-        print("Auto approve toggle error:", repr(e))
-        await query.answer("⚠️ Could not change Auto Approve. Nothing was changed. Please try again.", show_alert=True)
-        return
-    try:
-        await query.answer("🤖 Auto Approve is now " + ("ON ✅" if want else "OFF ❌"))
-    except Exception:
-        pass
-    extra = ""
-    if want:
-        approved, failed = await sweep_pending_groups(context)
-        extra = f"📦 Waiting groups approved: {approved}"
-        if failed:
-            extra += f"\n⚠️ Could not approve {failed} group(s). Use /approve <group_chat_id> for them."
-    detail = help_detail("owner", "groupctl", user_id)
-    if detail is None:
-        return
-    text, markup = _groupctl_owner_panel(detail[0], detail[1], user_id, want, extra)
-    await _edit_help_message(query, text, markup)
-
-
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = (query.data or "").split(":")
@@ -2824,10 +3017,6 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _edit_help_message(query, build_help_text(), (await asyncio.to_thread(staff_help_keyboard, user_id)))
             return
 
-        if action == "aa" and key == "toggle":
-            await help_autoapprove_toggle(context, query, user_id)       # Owner only (checked inside)
-            return
-
         if action in HELP_MODULES:
             # Role is verified again on every tap: a stale button must never open a panel the user cannot use.
             if not await help_role_allowed(action, user_id):
@@ -2838,8 +3027,6 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, markup = help_grid_text(action), help_grid_keyboard(action, user_id)
             else:
                 text, markup = detail
-                if action == "owner" and key == "groupctl" and is_owner(user_id):
-                    text, markup = _groupctl_owner_panel(text, markup, user_id, await is_auto_approve_on())
             chat = query.message.chat if query.message else None
             if chat is not None and chat.type != "private":
                 # Restricted panels never open in a group: they are sent to the user's private chat instead.
@@ -7297,10 +7484,17 @@ async def _safe_edit_text(message, text, **kwargs):
             raise
 
 
-async def gstats(update, context):
-    if not is_owner(update.effective_user.id):
-        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
-        return
+GSTATS_PAGE_SIZE = 10
+GSTATS_CACHE_TTL = 45        # seconds: page / manage taps reuse the last Telegram refresh instead of re-checking every group
+
+
+async def _gstats_collect(context, force=False):
+    """Refresh the group registry from Telegram (hidden groups are skipped).
+    Returns (groups, invite_links), or None when Telegram cannot be reached."""
+    bd = context.application.bot_data
+    cache = bd.get("gstats_cache")
+    if not force and cache and time.monotonic() - cache["ts"] < GSTATS_CACHE_TTL:
+        return cache["groups"], cache["links"]
 
     hidden_ids = (await asyncio.to_thread(load_gstats_hidden_groups))
     groups = (await asyncio.to_thread(load_bot_groups))
@@ -7321,8 +7515,7 @@ async def gstats(update, context):
         bot_user_id = int(me.id)
     except Exception as e:
         print("/gstats get_me error:", e)
-        await safe_reply_text(update.effective_message, "⚠️ Could not refresh group membership right now. Please try again.")
-        return
+        return None
 
     refreshed = {}
     invite_links = {}                      # raw_id -> invite link returned by Telegram (not persisted)
@@ -7365,26 +7558,59 @@ async def gstats(update, context):
             if info:
                 refreshed[raw_id] = dict(info)
 
-    groups = refreshed
-    (await asyncio.to_thread(save_bot_groups, groups))
+    (await asyncio.to_thread(save_bot_groups, refreshed))
+    bd["gstats_cache"] = {"ts": time.monotonic(), "groups": refreshed, "links": invite_links}
+    return refreshed, invite_links
 
-    if not groups:
-        text = "📊 Group Statistics\n\nTotal Groups: 0"
-        if update.callback_query:
-            requester = update.callback_query.from_user
-            first = (getattr(requester, "first_name", None) or "").strip()
-            last = (getattr(requester, "last_name", None) or "").strip()
-            display_name = " ".join(part for part in (first, last) if part) or "Unknown"
-            await _safe_edit_text(update.callback_query.message, 
-                f"👤 {html_escape(display_name)}\n\n{text}",
-                parse_mode="HTML",
-            )
-        else:
-            await safe_reply_text(update.effective_message, text)
+
+async def _gstats_deliver(update, text, markup=None, preview=False):
+    """Edit the GStats message (button taps) or send it (the /gstats command)."""
+    if update.callback_query:
+        requester = update.callback_query.from_user
+        first = (getattr(requester, "first_name", None) or "").strip()
+        last = (getattr(requester, "last_name", None) or "").strip()
+        display_name = " ".join(part for part in (first, last) if part) or "Unknown"
+        await _safe_edit_text(update.callback_query.message, f"👤 {html_escape(display_name)}\n\n{text}",
+                              parse_mode="HTML", reply_markup=markup, disable_web_page_preview=not preview)
+    else:
+        await safe_reply_text(update.effective_message, text, parse_mode="HTML",
+                              disable_web_page_preview=not preview, reply_markup=markup)
+
+
+def _gstats_name_rows(buttons):
+    """Group-name buttons, two per row."""
+    return [buttons[k:k + 2] for k in range(0, len(buttons), 2)]
+
+
+def _gstats_nav_row(page, pages, prefix):
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"{prefix}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"{prefix}:{page + 1}"))
+    return nav
+
+
+async def gstats(update, context, page=0, force=True):
+    """/gstats: text list of every group the bot is in + one name button per group (tap = manage that group)."""
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
         return
 
-    lines = ["📊 Group Statistics", "", f"Total Groups: {len(groups)}", ""]
-    keyboard = []
+    got = await _gstats_collect(context, force)
+    if got is None:
+        await safe_reply_text(update.effective_message, "⚠️ Could not refresh group membership right now. Please try again.")
+        return
+    groups, invite_links = got
+    hidden_count = len(await asyncio.to_thread(load_gstats_hidden_groups))
+    total_line = f"Total Groups: {len(groups)}" + (f" ({hidden_count} hidden)" if hidden_count else "")
+    hidden_row = [[InlineKeyboardButton(f"👁 Hidden ({hidden_count})", callback_data="gstats:h:0")]] if hidden_count else []
+
+    if not groups:
+        await _gstats_deliver(update, f"📊 Group Statistics\n\n{total_line}",
+                              InlineKeyboardMarkup(hidden_row) if hidden_row else None)
+        return
+
     sorted_groups = sorted(
         groups.items(),
         key=lambda item: (
@@ -7392,25 +7618,26 @@ async def gstats(update, context):
             (item[1].get("title") or "").casefold(),
         ),
     )
-    for i, (chat_id, info) in enumerate(sorted_groups, 1):
+    pages = max(1, -(-len(sorted_groups) // GSTATS_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    offset = page * GSTATS_PAGE_SIZE
+
+    lines = ["📊 Group Statistics", "", total_line, ""]
+    buttons = []
+    for i, (chat_id, info) in enumerate(sorted_groups[offset:offset + GSTATS_PAGE_SIZE], offset + 1):
         title = info.get("title") or "Unknown"
         status = "🟢 ON" if (await asyncio.to_thread(is_bot_enabled, int(chat_id))) else "🔴 OFF"
         approved = "✅ Approved" if await is_group_approved(int(chat_id)) else "❌ Not Approved"
         lines.append(f"{i}. 🏠 {html_escape(title)}")
         lines.append(f"🆔 Group ID: <code>{chat_id}</code>")      # tap to copy
-        group_link = build_group_open_link(chat_id, info.get("username"), invite_links.get(chat_id))
         lines.append(f"🤖 Bot: {status}")
         lines.append(f"🔐 Approval: {approved}")
         lines.append("")
-        row = []
-        if group_link:
-            row.append(InlineKeyboardButton("🔗 Open Link", url=group_link))
-        row.append(InlineKeyboardButton(
-            f"🗑 Remove: {title[:24]}",
-            callback_data=f"gstats:delete:{chat_id}",
-        ))
-        keyboard.append(row)
+        buttons.append(InlineKeyboardButton(f"{i}. {title[:22]}", callback_data=f"gstats:g:{chat_id}:{page}"))
 
+    if pages > 1:
+        lines.append(f"Page {page + 1}/{pages}")
+        lines.append("")
     default_info = groups.get(str(DEFAULT_GSTATS_GROUP_ID))
     if default_info:
         default_link = build_group_open_link(
@@ -7418,49 +7645,181 @@ async def gstats(update, context):
         if default_link:
             lines.append(f'<a href="{html_escape(default_link)}">Telegram Wonderland</a>')
 
-    markup = InlineKeyboardMarkup(keyboard)
-    text = "\n".join(lines).rstrip()
+    rows = _gstats_name_rows(buttons)
+    nav = _gstats_nav_row(page, pages, "gstats:p")
+    if nav:
+        rows.append(nav)
+    rows.extend(hidden_row)
+    await _gstats_deliver(update, "\n".join(lines).rstrip(), InlineKeyboardMarkup(rows), preview=True)
 
-    if update.callback_query:
-        requester = update.callback_query.from_user
-        first = (getattr(requester, "first_name", None) or "").strip()
-        last = (getattr(requester, "last_name", None) or "").strip()
-        display_name = " ".join(part for part in (first, last) if part) or "Unknown"
-        text = f"👤 {html_escape(display_name)}\n\n{text}"
-        await _safe_edit_text(update.callback_query.message, 
-            text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=False
-        )
+
+async def set_group_bot_state(context, chat_id, enabled, actor):
+    """Bot ON/OFF in one group, with the same effects as /boton and /botoff. Returns an error text, or None when done."""
+    if not await is_group_approved(chat_id):
+        return "⚠️ This group is not approved. Use /approve first."
+    bd = context.application.bot_data
+    await asyncio.to_thread(set_bot_enabled, chat_id, bool(enabled))
+    bd.setdefault("bot_off_warning_sent", set()).discard(chat_id)
+    if enabled:
+        await asyncio.to_thread(register_auto_spawn_group, chat_id)
+        bd.setdefault("active_chats", set()).add(chat_id)
     else:
-        await safe_reply_text(
-            update.effective_message,
-            text,
-            parse_mode="HTML",
-            disable_web_page_preview=False,
-            reply_markup=markup,
-        )
+        bd.setdefault("active_chats", set()).discard(chat_id)
+        removed_spawn = bd.setdefault("active_spawns", {}).pop(chat_id, None)
+        if removed_spawn:
+            await cancel_spawn_expiry_task(removed_spawn)
+            await safe_delete_message(context.bot, chat_id, removed_spawn.get("message_id"))
+    await notify_staff_action(
+        context,
+        ("🟢 BOT TURNED ON" if enabled else "🔴 BOT TURNED OFF") + f"\n🆔 Group ID: {chat_id}\n👤 By: {display_user(actor)}",
+        actor_id=actor.id,
+    )
+    return None
+
+
+async def _gstats_show_group(update, context, chat_id, page):
+    """Manage page of one group: details + Open Link / Bot ON-OFF / Hide / Back."""
+    got = await _gstats_collect(context, False)
+    info = got[0].get(str(chat_id)) if got else None
+    if info is None:                                   # no longer in the list (hidden, or the bot left)
+        await gstats(update, context, page=page, force=False)
+        return
+    links = got[1]
+    title = info.get("title") or "Unknown"
+    enabled = await asyncio.to_thread(is_bot_enabled, chat_id)
+    approved = await is_group_approved(chat_id)
+    members = await group_member_count(context.bot, chat_id)
+    text = (f"🏠 <b>{html_escape(title)}</b>\n"
+            f"🆔 Group ID: <code>{chat_id}</code>\n"
+            f"👥 Members: {members if members is not None else '?'}\n"
+            f"🤖 Bot: {'🟢 ON' if enabled else '🔴 OFF'}\n"
+            f"🔐 Approval: {'✅ Approved' if approved else '❌ Not Approved'}")
+    rows = []
+    link = build_group_open_link(chat_id, info.get("username"), links.get(str(chat_id)))
+    if link:
+        rows.append([InlineKeyboardButton("🔗 Open Link", url=link)])
+    rows.append([InlineKeyboardButton("🤖 Bot: Turn OFF" if enabled else "🤖 Bot: Turn ON",
+                                      callback_data=f"gstats:t:{chat_id}:{page}")])
+    rows.append([InlineKeyboardButton("🙈 Hide", callback_data=f"gstats:x:{chat_id}:{page}")])
+    rows.append([InlineKeyboardButton("« Back", callback_data=f"gstats:p:{page}")])
+    await _gstats_deliver(update, text, InlineKeyboardMarkup(rows))
+
+
+async def _gstats_hidden_items():
+    hidden_ids = await asyncio.to_thread(load_gstats_hidden_groups)
+    registry = await asyncio.to_thread(load_bot_groups)
+    items = []
+    for cid in hidden_ids:
+        info = registry.get(str(int(cid)), {})
+        title = DEFAULT_GSTATS_GROUP_TITLE if int(cid) == DEFAULT_GSTATS_GROUP_ID else (info.get("title") or "Unknown")
+        items.append((int(cid), title))
+    items.sort(key=lambda it: it[1].casefold())
+    return items
+
+
+async def _gstats_hidden_list(update, context, page):
+    items = await _gstats_hidden_items()
+    back = [InlineKeyboardButton("« Back", callback_data="gstats:p:0")]
+    if not items:
+        await _gstats_deliver(update, "👁 <b>Hidden groups</b>\n\nNo group is hidden.", InlineKeyboardMarkup([back]))
+        return
+    pages = max(1, -(-len(items) // GSTATS_PAGE_SIZE))
+    page = max(0, min(int(page), pages - 1))
+    offset = page * GSTATS_PAGE_SIZE
+    lines = [f"👁 <b>Hidden groups</b> ({len(items)})", "", "Tap a group to show it again.", ""]
+    buttons = []
+    for i, (cid, title) in enumerate(items[offset:offset + GSTATS_PAGE_SIZE], offset + 1):
+        lines.append(f"{i}. 🏠 {html_escape(title)}")
+        lines.append(f"🆔 Group ID: <code>{cid}</code>")
+        lines.append("")
+        buttons.append(InlineKeyboardButton(f"{i}. {title[:22]}", callback_data=f"gstats:hg:{cid}:{page}"))
+    if pages > 1:
+        lines.append(f"Page {page + 1}/{pages}")
+    rows = _gstats_name_rows(buttons)
+    nav = _gstats_nav_row(page, pages, "gstats:h")
+    if nav:
+        rows.append(nav)
+    rows.append(back)
+    await _gstats_deliver(update, "\n".join(lines).rstrip(), InlineKeyboardMarkup(rows))
+
+
+async def _gstats_hidden_group(update, context, chat_id, page):
+    """Page of one hidden group: details + Show / Back."""
+    title = next((t for c, t in await _gstats_hidden_items() if c == chat_id), "Unknown")
+    enabled = await asyncio.to_thread(is_bot_enabled, chat_id)
+    approved = await is_group_approved(chat_id)
+    text = (f"🙈 <b>{html_escape(title)}</b> (hidden)\n"
+            f"🆔 Group ID: <code>{chat_id}</code>\n"
+            f"🤖 Bot: {'🟢 ON' if enabled else '🔴 OFF'}\n"
+            f"🔐 Approval: {'✅ Approved' if approved else '❌ Not Approved'}\n\n"
+            "This group is hidden from the /gstats list. Nothing was removed.")
+    rows = [[InlineKeyboardButton("👁 Show", callback_data=f"gstats:s:{chat_id}:{page}")],
+            [InlineKeyboardButton("« Back", callback_data=f"gstats:h:{page}")]]
+    await _gstats_deliver(update, text, InlineKeyboardMarkup(rows))
+
 
 async def gstats_callback(update, context):
+    """GStats buttons. Callback data: gstats:<p|g|t|x|h|hg|s>:<page or group id>[:<page>]  (gstats:delete:<id> = old Hide)."""
     query = update.callback_query
-    user_id = query.from_user.id
-    if not is_owner(user_id):
+    if not is_owner(query.from_user.id):
         await deny_callback(query)
         return
+    parts = (query.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    arg = parts[2] if len(parts) > 2 else ""
+    page_arg = parts[3] if len(parts) > 3 else "0"
+    page = int(page_arg) if page_arg.isdigit() else 0
+    is_group_arg = arg.lstrip("-").isdigit()
 
-    data = query.data or ""
-    parts = data.split(":", 2)
-    if len(parts) != 3 or parts[1] != "delete" or not parts[2].lstrip("-").isdigit():
-        await query.answer("❌ Invalid GStats option.", show_alert=True)
-        return
+    async def _answer(text=None, alert=False):
+        try:
+            await query.answer(text, show_alert=alert)       # answer first (Telegram expires it after ~15 s)
+        except Exception:
+            pass
 
-    chat_id = int(parts[2])
     try:
-        await query.answer("🗑 Removing group from GStats…")        # answer first (Telegram expires it after ~15 s)
-    except Exception:
-        pass
-    if not (await asyncio.to_thread(hide_gstats_group, chat_id)):
-        await safe_reply_text(query.message, "❌ Could not remove this group from GStats.")
-        return
-    await gstats(update, context)
+        if action == "p" and arg.isdigit():
+            await _answer()
+            await gstats(update, context, page=int(arg), force=False)
+        elif action == "g" and is_group_arg:
+            await _answer()
+            await _gstats_show_group(update, context, int(arg), page)
+        elif action == "t" and is_group_arg:
+            chat_id = int(arg)
+            now_enabled = await asyncio.to_thread(is_bot_enabled, chat_id)
+            error = await set_group_bot_state(context, chat_id, not now_enabled, query.from_user)
+            if error:
+                await _answer(error, alert=True)
+                return
+            await _answer("🔴 Bot is now OFF" if now_enabled else "🟢 Bot is now ON")
+            await _gstats_show_group(update, context, chat_id, page)
+        elif action in ("x", "delete") and is_group_arg:
+            chat_id = int(arg)
+            await _answer("🙈 Hiding group from GStats…")
+            if not (await asyncio.to_thread(hide_gstats_group, chat_id)):
+                await safe_reply_text(query.message, "❌ Could not hide this group.")
+                return
+            cache = context.application.bot_data.get("gstats_cache")
+            if cache:
+                cache["groups"].pop(str(chat_id), None)
+            await gstats(update, context, page=page, force=False)
+        elif action == "h" and arg.isdigit():
+            await _answer()
+            await _gstats_hidden_list(update, context, int(arg))
+        elif action == "hg" and is_group_arg:
+            await _answer()
+            await _gstats_hidden_group(update, context, int(arg), page)
+        elif action == "s" and is_group_arg:
+            await _answer("👁 Showing group in GStats…")
+            if not (await asyncio.to_thread(unhide_gstats_group, int(arg))):
+                await safe_reply_text(query.message, "❌ Could not show this group.")
+                return
+            await gstats(update, context, page=0, force=True)
+        else:
+            await _answer("❌ Invalid GStats option.", alert=True)
+    except Exception as e:
+        print("GStats callback error:", repr(e))
+        await _answer("⚠️ Something went wrong. Please try /gstats again.", alert=True)
 
 def _staff_rows(ids):
     """[(user_id, display name, username|None)] sorted by id, from the users collection (one worker-thread call)."""
@@ -9321,6 +9680,8 @@ async def cancel_everything(update, context):
     if any(not k.startswith(("evo_", "eevo_")) for k in keys):
         stopped.append("Active command (add/edit/photo/event/redeem/report)")
     context.user_data.clear()
+    if _aa_waiting_min.pop(uid, None) is not None:
+        stopped.append("Auto Approve minimum-members input")
     try:
         if theme.cancel_input(uid):
             stopped.append("Customize Bot input")
@@ -10779,7 +11140,7 @@ COMMANDS = {
     "addgroupapprove": "Owner: give an Executive group approval permission",
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
-    "autoapprove": "Owner: auto-approve every new group (/autoapprove on|off, alone = status)",
+    "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -11557,6 +11918,8 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("removegroupapprove", remove_group_approval_permission))
     app.add_handler(CommandHandler("leavegroup", leave_group))
     app.add_handler(CommandHandler("autoapprove", autoapprove_command))
+    app.add_handler(CallbackQueryHandler(auto_approve_callback, pattern=r"^aa:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, auto_approve_min_input), group=51)
     app.add_handler(CommandHandler("boton", bot_on))
 
     call_conv = ConversationHandler(
@@ -11892,7 +12255,7 @@ def main():
         MessageHandler(filters.PHOTO, receive_photo)
     )
 
-    app.add_handler(CallbackQueryHandler(gstats_callback, pattern=r"^gstats:delete:-?\d+$"))
+    app.add_handler(CallbackQueryHandler(gstats_callback, pattern=r"^gstats:"))
     app.add_handler(CallbackQueryHandler(owner_notification_callback, pattern=r"^owner_notify:(yes|no)$"), group=-1)
     app.add_handler(CallbackQueryHandler(deleted_account_review_callback, pattern=r"^delacct:(ask|keep|yes|no):-?\d+:[0-9a-f]{10}$"))
     app.add_handler(CallbackQueryHandler(help_callback, pattern=r"^help:"))
