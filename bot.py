@@ -7519,46 +7519,60 @@ async def _gstats_collect(context, force=False):
 
     refreshed = {}
     invite_links = {}                      # raw_id -> invite link returned by Telegram (not persisted)
-    for raw_id in sorted(known_ids, key=lambda v: int(v)):
+    gate = asyncio.Semaphore(8)            # check several groups at the same time (one after another was slow)
+
+    async def _check(raw_id):
+        """-> (raw_id, group info or None, invite link or None)"""
         chat_id = int(raw_id)
         info = groups.get(raw_id, {})
-        try:
-            member = await context.bot.get_chat_member(chat_id, bot_user_id)
-            member_status = getattr(member, "status", "")
-            member_is_present = getattr(member, "is_member", True)
-            if member_status not in ("creator", "administrator", "member", "restricted") or (
-                member_status == "restricted" and not member_is_present
-            ):
-                await cleanup_left_group(chat_id, context)
-                continue
+        async with gate:
+            try:
+                member = await context.bot.get_chat_member(chat_id, bot_user_id)
+                member_status = getattr(member, "status", "")
+                member_is_present = getattr(member, "is_member", True)
+                if member_status not in ("creator", "administrator", "member", "restricted") or (
+                    member_status == "restricted" and not member_is_present
+                ):
+                    await cleanup_left_group(chat_id, context)
+                    return raw_id, None, None
 
-            chat = await context.bot.get_chat(chat_id)
-            refreshed[raw_id] = {
-                "title": (
-                    DEFAULT_GSTATS_GROUP_TITLE
-                    if chat_id == DEFAULT_GSTATS_GROUP_ID
-                    else getattr(chat, "title", None) or getattr(chat, "username", None) or info.get("title") or "Unknown"
-                ),
-                "type": getattr(chat, "type", info.get("type", "group")),
-                "username": getattr(chat, "username", info.get("username")),
-            }
-            invite_links[raw_id] = getattr(chat, "invite_link", None)
-        except (Forbidden, BadRequest) as e:
-            reason = str(e).lower()
-            if isinstance(e, Forbidden) or any(w in reason for w in (
-                    "chat not found", "kicked", "not a member", "bot was kicked", "bot is not a member", "group chat was deleted")):
-                print(f"/gstats: bot is no longer in {chat_id} ({e}); removing it")
-                await cleanup_left_group(chat_id, context)
-            else:                                     # unknown API refusal: keep the group, do not wipe it
-                print(f"/gstats refresh error for {chat_id} (kept):", e)
-                if info:
-                    refreshed[raw_id] = dict(info)
-        except Exception as e:                        # network / flood control / timeout: NEVER clean up
-            print(f"/gstats membership refresh error for {chat_id} (kept):", e)
-            if info:
-                refreshed[raw_id] = dict(info)
+                chat = await context.bot.get_chat(chat_id)
+                entry = {
+                    "title": (
+                        DEFAULT_GSTATS_GROUP_TITLE
+                        if chat_id == DEFAULT_GSTATS_GROUP_ID
+                        else getattr(chat, "title", None) or getattr(chat, "username", None) or info.get("title") or "Unknown"
+                    ),
+                    "type": getattr(chat, "type", info.get("type", "group")),
+                    "username": getattr(chat, "username", info.get("username")),
+                }
+                return raw_id, entry, getattr(chat, "invite_link", None)
+            except (Forbidden, BadRequest) as e:
+                reason = str(e).lower()
+                if isinstance(e, Forbidden) or any(w in reason for w in (
+                        "chat not found", "kicked", "not a member", "bot was kicked", "bot is not a member", "group chat was deleted")):
+                    print(f"/gstats: bot is no longer in {chat_id} ({e}); removing it")
+                    await cleanup_left_group(chat_id, context)
+                    return raw_id, None, None
+                print(f"/gstats refresh error for {chat_id} (kept):", e)   # unknown API refusal: keep the group, do not wipe it
+                return raw_id, (dict(info) if info else None), None
+            except Exception as e:                        # network / flood control / timeout: NEVER clean up
+                print(f"/gstats membership refresh error for {chat_id} (kept):", e)
+                return raw_id, (dict(info) if info else None), None
 
-    (await asyncio.to_thread(save_bot_groups, refreshed))
+    for raw_id, entry, link in await asyncio.gather(*[_check(r) for r in sorted(known_ids, key=lambda v: int(v))]):
+        if entry:
+            refreshed[raw_id] = entry
+        if link:
+            invite_links[raw_id] = link
+
+    # Hidden groups are not refreshed, but they must keep their registration and name (the registry is replaced as a whole).
+    to_save = dict(refreshed)
+    for cid in hidden_ids:
+        key = str(int(cid))
+        if key in groups and key not in to_save:
+            to_save[key] = groups[key]
+    (await asyncio.to_thread(save_bot_groups, to_save))
     bd["gstats_cache"] = {"ts": time.monotonic(), "groups": refreshed, "links": invite_links}
     return refreshed, invite_links
 
@@ -7624,9 +7638,10 @@ async def gstats(update, context, page=0, force=True):
 
     lines = ["📊 Group Statistics", "", total_line, ""]
     buttons = []
+    states = await asyncio.to_thread(load_bot_group_states)          # one read for the whole page
     for i, (chat_id, info) in enumerate(sorted_groups[offset:offset + GSTATS_PAGE_SIZE], offset + 1):
         title = info.get("title") or "Unknown"
-        status = "🟢 ON" if (await asyncio.to_thread(is_bot_enabled, int(chat_id))) else "🔴 OFF"
+        status = "🟢 ON" if states.get(str(int(chat_id)), True) else "🔴 OFF"
         approved = "✅ Approved" if await is_group_approved(int(chat_id)) else "❌ Not Approved"
         lines.append(f"{i}. 🏠 {html_escape(title)}")
         lines.append(f"🆔 Group ID: <code>{chat_id}</code>")      # tap to copy
@@ -7677,6 +7692,33 @@ async def set_group_bot_state(context, chat_id, enabled, actor):
     return None
 
 
+GSTATS_JOIN_LINK_TTL = 12 * 3600
+
+
+async def _gstats_join_link(context, chat_id, info, links):
+    """(url, joinable). joinable=True: the link lets a non-member join (public name, the group's invite link, or a link the
+    bot creates when it is an admin with the 'Invite users' right). Otherwise a members-only link (or None)."""
+    username = (info.get("username") or "").lstrip("@").strip()
+    if username:
+        return f"https://t.me/{username}", True
+    primary = links.get(str(chat_id))
+    if primary and str(primary).startswith(("https://t.me/", "http://t.me/", "https://telegram.me/")):
+        return str(primary), True
+    cache = context.application.bot_data.setdefault("gstats_join_links", {})
+    hit = cache.get(chat_id)
+    if hit and time.monotonic() - hit[0] < GSTATS_JOIN_LINK_TTL:
+        return hit[1], True
+    try:
+        created = await context.bot.create_chat_invite_link(chat_id, name="Owner access")   # extra link, nothing is revoked
+        url = getattr(created, "invite_link", None)
+        if url:
+            cache[chat_id] = (time.monotonic(), url)
+            return url, True
+    except Exception as e:
+        print(f"/gstats invite link error for {chat_id}:", e)
+    return build_group_open_link(chat_id), False
+
+
 async def _gstats_show_group(update, context, chat_id, page):
     """Manage page of one group: details + Open Link / Bot ON-OFF / Hide / Back."""
     got = await _gstats_collect(context, False)
@@ -7688,16 +7730,19 @@ async def _gstats_show_group(update, context, chat_id, page):
     title = info.get("title") or "Unknown"
     enabled = await asyncio.to_thread(is_bot_enabled, chat_id)
     approved = await is_group_approved(chat_id)
-    members = await group_member_count(context.bot, chat_id)
+    (members, (link, joinable)) = await asyncio.gather(
+        group_member_count(context.bot, chat_id), _gstats_join_link(context, chat_id, info, links))
     text = (f"🏠 <b>{html_escape(title)}</b>\n"
             f"🆔 Group ID: <code>{chat_id}</code>\n"
             f"👥 Members: {members if members is not None else '?'}\n"
             f"🤖 Bot: {'🟢 ON' if enabled else '🔴 OFF'}\n"
             f"🔐 Approval: {'✅ Approved' if approved else '❌ Not Approved'}")
+    if not joinable:
+        text += ("\n\n⚠️ No join link. The link below opens only for members. "
+                 "To get a join link, make the bot an admin with the “Invite users” right.")
     rows = []
-    link = build_group_open_link(chat_id, info.get("username"), links.get(str(chat_id)))
     if link:
-        rows.append([InlineKeyboardButton("🔗 Open Link", url=link)])
+        rows.append([InlineKeyboardButton("🔗 Open Link" if joinable else "🔗 Open (members only)", url=link)])
     rows.append([InlineKeyboardButton("🤖 Bot: Turn OFF" if enabled else "🤖 Bot: Turn ON",
                                       callback_data=f"gstats:t:{chat_id}:{page}")])
     rows.append([InlineKeyboardButton("🙈 Hide", callback_data=f"gstats:x:{chat_id}:{page}")])
@@ -7705,20 +7750,43 @@ async def _gstats_show_group(update, context, chat_id, page):
     await _gstats_deliver(update, text, InlineKeyboardMarkup(rows))
 
 
-async def _gstats_hidden_items():
+async def _gstats_hidden_items(context):
+    """[(chat_id, title)] of hidden groups. A name that is not stored is read from Telegram (and remembered)."""
     hidden_ids = await asyncio.to_thread(load_gstats_hidden_groups)
     registry = await asyncio.to_thread(load_bot_groups)
-    items = []
+    names = context.application.bot_data.setdefault("gstats_title_cache", {})
+    titles = {}
+    missing = []
     for cid in hidden_ids:
-        info = registry.get(str(int(cid)), {})
-        title = DEFAULT_GSTATS_GROUP_TITLE if int(cid) == DEFAULT_GSTATS_GROUP_ID else (info.get("title") or "Unknown")
-        items.append((int(cid), title))
+        cid = int(cid)
+        stored = (registry.get(str(cid), {}).get("title") or "").strip()
+        if cid == DEFAULT_GSTATS_GROUP_ID:
+            stored = DEFAULT_GSTATS_GROUP_TITLE
+        stored = stored or names.get(cid, "")
+        if stored:
+            titles[cid] = stored
+        else:
+            missing.append(cid)
+
+    async def _live_title(cid):
+        try:
+            chat = await asyncio.wait_for(context.bot.get_chat(cid), timeout=6)
+            return cid, (getattr(chat, "title", None) or getattr(chat, "username", None) or "").strip()
+        except Exception as e:
+            print(f"Hidden group name lookup error for {cid}:", e)
+            return cid, ""
+
+    for cid, name in await asyncio.gather(*[_live_title(c) for c in missing]):
+        if name:
+            names[cid] = name
+        titles[cid] = name or "Unknown"
+    items = [(cid, titles[cid]) for cid in titles]
     items.sort(key=lambda it: it[1].casefold())
     return items
 
 
 async def _gstats_hidden_list(update, context, page):
-    items = await _gstats_hidden_items()
+    items = await _gstats_hidden_items(context)
     back = [InlineKeyboardButton("« Back", callback_data="gstats:p:0")]
     if not items:
         await _gstats_deliver(update, "👁 <b>Hidden groups</b>\n\nNo group is hidden.", InlineKeyboardMarkup([back]))
@@ -7745,7 +7813,7 @@ async def _gstats_hidden_list(update, context, page):
 
 async def _gstats_hidden_group(update, context, chat_id, page):
     """Page of one hidden group: details + Show / Back."""
-    title = next((t for c, t in await _gstats_hidden_items() if c == chat_id), "Unknown")
+    title = next((t for c, t in await _gstats_hidden_items(context) if c == chat_id), "Unknown")
     enabled = await asyncio.to_thread(is_bot_enabled, chat_id)
     approved = await is_group_approved(chat_id)
     text = (f"🙈 <b>{html_escape(title)}</b> (hidden)\n"
@@ -11226,8 +11294,114 @@ async def refresh_command_menu(bot, user_id):
     except Exception as e:
         print(f"Command menu refresh error for {user_id}:", e)
 
+# ---------------------------------------------------------------------------------------------------
+# PERFORMANCE DIAGNOSTICS: tells you (in the Render logs) what makes the bot slow.
+#   🐢 SLOW UPDATE  a command/button took longer than SLOW_UPDATE_MS (default 1500): name, time, DB share, delay before it started
+#   🐢 SLOW DB      one MongoDB call took longer than SLOW_DB_MS (default 300)
+#   🧊 EVENT LOOP   the bot froze for longer than LOOP_LAG_MS (default 300): something ran without waiting
+#   📈 PERF         a summary line every PERF_REPORT_SECONDS (default 300)
+# ---------------------------------------------------------------------------------------------------
+SLOW_UPDATE_MS = int(os.getenv("SLOW_UPDATE_MS", "1500"))
+LOOP_LAG_MS = int(os.getenv("LOOP_LAG_MS", "300"))
+PERF_REPORT_SECONDS = max(30, int(os.getenv("PERF_REPORT_SECONDS", "300")))
+_perf = {"durations": [], "behind_max": 0.0, "loop_max": 0.0}
+
+
+def _perf_label(update):
+    try:
+        query = getattr(update, "callback_query", None)
+        if query is not None:
+            return "button " + ":".join((query.data or "").split(":")[:2])
+        msg = update.effective_message
+        text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "")
+        if text.startswith("/"):
+            return text.split()[0].split("@")[0][:40]
+        return "message"
+    except Exception:
+        return "update"
+
+
+def install_perf_monitor():
+    """Times every update (class-level wrapper, same technique as install_bot_message_tracker)."""
+    from telegram.ext import Application
+    original = Application.process_update
+    if getattr(original, "_perf_timed", False):
+        return
+
+    async def timed(self, update):
+        stats = {"ms": 0.0, "n": 0}
+        token = mongo_db.db_stats_var.set(stats)
+        started = time.perf_counter()
+        behind = None
+        try:
+            msg = getattr(update, "message", None)
+            if msg is not None and getattr(msg, "date", None) is not None:
+                behind = max(0.0, time.time() - msg.date.timestamp())      # Telegram -> bot -> start of handling
+        except Exception:
+            pass
+        try:
+            return await original(self, update)
+        finally:
+            elapsed = (time.perf_counter() - started) * 1000.0
+            try:
+                mongo_db.db_stats_var.reset(token)
+                durations = _perf["durations"]
+                if len(durations) < 5000:
+                    durations.append(elapsed)
+                if behind is not None:
+                    _perf["behind_max"] = max(_perf["behind_max"], behind)
+                if elapsed >= SLOW_UPDATE_MS:
+                    chat = getattr(update, "effective_chat", None)
+                    where = getattr(chat, "type", "?") if chat is not None else "?"
+                    extra = f" | started {behind:.1f}s after it was sent" if behind is not None else ""
+                    print(f"🐢 SLOW UPDATE {elapsed / 1000:.1f}s | {_perf_label(update)} | {where} | "
+                          f"DB {stats['ms'] / 1000:.1f}s in {stats['n']} calls{extra}")
+            except Exception:
+                pass
+
+    timed._perf_timed = True
+    Application.process_update = timed
+
+
+async def loop_lag_monitor():
+    """Wakes up every 0.25 s; if it wakes up late, something blocked the bot's event loop."""
+    interval = 0.25
+    while True:
+        before = time.perf_counter()
+        await asyncio.sleep(interval)
+        lag = (time.perf_counter() - before - interval) * 1000.0
+        _perf["loop_max"] = max(_perf["loop_max"], lag)
+        if lag >= LOOP_LAG_MS:
+            print(f"🧊 EVENT LOOP BLOCKED for {lag:.0f} ms (the whole bot froze for that long)")
+
+
+async def perf_report_loop():
+    while True:
+        await asyncio.sleep(PERF_REPORT_SECONDS)
+        try:
+            durations = sorted(_perf["durations"])
+            db = mongo_db.pop_db_perf()
+            if durations or db["calls"]:
+                n = len(durations)
+                avg = sum(durations) / n if n else 0.0
+                p95 = durations[min(n - 1, int(n * 0.95))] if n else 0.0
+                avg_db = db["ms"] / db["calls"] if db["calls"] else 0.0
+                print(f"📈 PERF last {PERF_REPORT_SECONDS // 60} min | updates {n}: avg {avg:.0f} ms, p95 {p95:.0f} ms, "
+                      f"max {(durations[-1] if n else 0):.0f} ms | DB calls {db['calls']}: avg {avg_db:.0f} ms, max {db['max']:.0f} ms | "
+                      f"worst loop freeze {_perf['loop_max']:.0f} ms | worst delay before handling {_perf['behind_max']:.1f}s")
+            _perf["durations"] = []
+            _perf["behind_max"] = 0.0
+            _perf["loop_max"] = 0.0
+        except Exception as e:
+            print("Perf report error:", e)
+
+
 async def startup_init(app):
     _SECURITY_APP["app"] = app
+    app.bot_data["perf_tasks"] = [
+        asyncio.create_task(loop_lag_monitor(), name="loop-lag-monitor"),
+        asyncio.create_task(perf_report_loop(), name="perf-report"),
+    ]
     # asyncio's default pool is only min(32, cpu+4) threads (5 on a 1-vCPU host): size it for DB calls.
     asyncio.get_running_loop().set_default_executor(
         ThreadPoolExecutor(max_workers=DB_THREADS, thread_name_prefix="db"))
@@ -12075,8 +12249,16 @@ def main():
     except Exception as e:
         logger.error("MongoDB startup failed: %s", e)
         raise SystemExit(f"MongoDB startup failed: {e}")
+    try:
+        lat = mongo_db.measure_latency()
+        verdict = ("good" if lat["avg"] < 40 else "a little slow" if lat["avg"] < 150
+                   else "SLOW: MongoDB is far from this server (put them in the same region)")
+        print(f"🗄 MongoDB round trip: avg {lat['avg']:.0f} ms (min {lat['min']:.0f}, max {lat['max']:.0f}) - {verdict}")
+    except Exception as e:
+        print("MongoDB latency check failed:", e)
     setup_database()
     install_bot_message_tracker()      # remembers the bot's own message ids for /rem
+    install_perf_monitor()             # slow-update / slow-DB / frozen-loop logging (see PERFORMANCE DIAGNOSTICS)
 
     app = (
         Application.builder()

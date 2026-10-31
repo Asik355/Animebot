@@ -32,6 +32,7 @@ Design notes
   running without a transaction.
 """
 
+import contextvars
 import functools
 import logging
 import os
@@ -42,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument, UpdateOne
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument, UpdateOne, monitoring
 from pymongo.errors import (
     AutoReconnect,
     ConfigurationError,
@@ -97,6 +98,70 @@ def _db_name():
     return os.getenv("MONGO_DB_NAME", "anime_bot")
 
 
+# ---- Performance diagnostics: times every MongoDB command (the round trip, network included) ----
+# db_stats_var is set by bot.py for each Telegram update, so the log can say how much of an update's time was spent in the DB.
+db_stats_var = contextvars.ContextVar("db_stats", default=None)
+_DB_PERF = {"calls": 0, "ms": 0.0, "max": 0.0}
+_DB_PERF_LOCK = threading.Lock()
+SLOW_DB_MS = _env_int("SLOW_DB_MS", 300)
+_QUIET_COMMANDS = {"hello", "isMaster", "ismaster", "saslStart", "saslContinue", "endSessions", "buildInfo", "getnonce"}
+
+
+class _DbTimer(monitoring.CommandListener):
+    def __init__(self):
+        self._names = {}
+
+    def started(self, event):
+        if event.command_name in _QUIET_COMMANDS:
+            return
+        try:
+            self._names[event.request_id] = str(event.command.get(event.command_name))[:40]
+        except Exception:
+            pass
+
+    def succeeded(self, event):
+        self._done(event)
+
+    def failed(self, event):
+        self._done(event)
+
+    def _done(self, event):
+        if event.command_name in _QUIET_COMMANDS:
+            return
+        ms = event.duration_micros / 1000.0
+        name = self._names.pop(event.request_id, "?")
+        with _DB_PERF_LOCK:
+            _DB_PERF["calls"] += 1
+            _DB_PERF["ms"] += ms
+            _DB_PERF["max"] = max(_DB_PERF["max"], ms)
+        stats = db_stats_var.get()
+        if stats is not None:
+            stats["ms"] += ms
+            stats["n"] += 1
+        if ms >= SLOW_DB_MS:
+            print(f"🐢 SLOW DB {event.command_name} on '{name}': {ms:.0f} ms")
+
+
+def pop_db_perf():
+    """{calls, ms, max} since the last call (used by the periodic performance line in bot.py)."""
+    with _DB_PERF_LOCK:
+        out = dict(_DB_PERF)
+        _DB_PERF.update({"calls": 0, "ms": 0.0, "max": 0.0})
+    return out
+
+
+def measure_latency(samples=4):
+    """MongoDB ping round-trip in ms: {avg, min, max}. The first ping (it opens the connection) is left out."""
+    client = get_client()
+    times = []
+    for _ in range(max(2, samples)):
+        started = time.perf_counter()
+        client.admin.command("ping")
+        times.append((time.perf_counter() - started) * 1000.0)
+    times = times[1:]
+    return {"avg": sum(times) / len(times), "min": min(times), "max": max(times)}
+
+
 def _build_client():
     uri = os.getenv("MONGO_URI")
     if not uri:
@@ -115,6 +180,7 @@ def _build_client():
         retryReads=True,
         appName="anime-bot",
         tz_aware=False,
+        event_listeners=[_DbTimer()],
     )
     if certifi is not None:
         kwargs["tlsCAFile"] = certifi.where()
