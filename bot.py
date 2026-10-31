@@ -627,6 +627,18 @@ async def send_group_approved_confirmation(context, chat_id):
         return False
 
 
+async def apply_group_approval(context, chat_id):
+    """The approval steps shared by /approve and Auto Approve. Returns True when the approval was saved.
+    Uses a one-group write (not the whole-set replace), so several groups approved at once cannot undo each other."""
+    chat_id = int(chat_id)
+    saved = await asyncio.to_thread(_mongo_safe, mongo_db.set_group_approved, chat_id, True)
+    await asyncio.to_thread(set_bot_enabled, chat_id, True)
+    await asyncio.to_thread(register_auto_spawn_group, chat_id)
+    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
+    context.application.bot_data.setdefault("unapproved_notified", set()).discard(chat_id)
+    return saved is not False
+
+
 async def approve_group(update, context):
     uid = update.effective_user.id
     if not (await asyncio.to_thread(has_group_approval_permission, uid)):
@@ -644,15 +656,9 @@ async def approve_group(update, context):
             return
         chat_id = int(context.args[0])
 
-    groups = (await asyncio.to_thread(load_approved_groups))
-    groups.add(chat_id)
-    saved = (await asyncio.to_thread(save_approved_groups, groups))
-    (await asyncio.to_thread(set_bot_enabled, chat_id, True))
-    (await asyncio.to_thread(register_auto_spawn_group, chat_id))
-    context.application.bot_data.setdefault("active_chats", set()).add(chat_id)
-    context.application.bot_data.setdefault("unapproved_notified", set()).discard(chat_id)
+    saved = await apply_group_approval(context, chat_id)
     # Confirmation goes to the exact group that was just approved, only after the approval was saved.
-    group_notified = (saved is not False) and (await send_group_approved_confirmation(context, chat_id))
+    group_notified = saved and (await send_group_approved_confirmation(context, chat_id))
     if chat.type in ("group", "supergroup"):
         if chat_id != chat.id:
             await safe_reply_text(update.message, f"✅ Group {chat_id} successfully approved.")
@@ -669,6 +675,124 @@ async def approve_group(update, context):
         f"✅ GROUP APPROVED\n🆔 Group ID: {chat_id}\n👤 Approved by: {display_user(update.effective_user)}",
         actor_id=update.effective_user.id,
     )
+
+# ---------------------------------------------------------------------------------------------------
+# AUTO APPROVE (Owner only). While ON, every group the bot is added to is approved automatically.
+# Turned on/off with /autoapprove or the button in /help -> Owner Commands -> Group Control.
+# ---------------------------------------------------------------------------------------------------
+async def is_auto_approve_on():
+    """Fails closed: if the setting cannot be read, Auto Approve counts as OFF (the normal manual flow applies)."""
+    try:
+        return bool((await asyncio.to_thread(mongo_db.get_auto_approve)).get("enabled"))
+    except Exception as e:
+        print("Auto-approve lookup error:", e)
+        return False
+
+
+async def auto_approve_group(context, chat, added_by=None):
+    """Approve one group because Auto Approve is ON. Returns True when the group is approved afterwards."""
+    cid = int(chat.id)
+    inflight = context.application.bot_data.setdefault("auto_approve_inflight", set())
+    if cid in inflight:
+        return True                       # another update is already approving this group
+    inflight.add(cid)
+    try:
+        if cid in await asyncio.to_thread(mongo_db.load_approved_groups):
+            return True
+        if not await apply_group_approval(context, cid):
+            return False
+        await send_group_approved_confirmation(context, cid)
+        owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
+        if owner_id:
+            try:
+                who = html_escape(display_user(added_by)) if added_by else "Unknown"
+                await context.bot.send_message(
+                    chat_id=owner_id,
+                    text=(
+                        "🤖 GROUP AUTO-APPROVED\n"
+                        f"🏷 Group: {html_escape(_chat_title(chat))}\n"
+                        f"🆔 Group ID: {group_id_html(cid)}\n"
+                        f"👤 Added by: {who}\n\n"
+                        "Auto Approve is ON. Turn it off with /autoapprove off"
+                    ),
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                print("Owner auto-approve notification error:", e)
+        return True
+    except Exception as e:
+        print(f"Auto approve error for {cid}:", e)
+        return False
+    finally:
+        inflight.discard(cid)
+
+
+async def sweep_pending_groups(context):
+    """Approve every group that is waiting for approval. Returns (approved_count, failed_count)."""
+    pending = await asyncio.to_thread(mongo_db.load_pending_groups)
+    approved = failed = 0
+    for cid, _title in pending:
+        try:
+            if await apply_group_approval(context, cid):
+                approved += 1
+                await send_group_approved_confirmation(context, cid)     # never raises
+            else:
+                failed += 1
+        except Exception as e:
+            failed += 1
+            print(f"Pending group approval error for {cid}:", e)
+        await asyncio.sleep(0.2)          # stay well under Telegram's flood limits when many groups are waiting
+    return approved, failed
+
+
+def auto_approve_status_text(enabled):
+    if enabled:
+        return ("🤖 Auto Approve: ✅ ON\n"
+                "Every group the bot is added to is approved automatically.")
+    return ("🤖 Auto Approve: ❌ OFF\n"
+            "New groups wait for the Owner to use /approve.")
+
+
+async def autoapprove_command(update, context):
+    """/autoapprove [on|off] - Owner only."""
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not is_owner(user.id):
+        await safe_reply_text(msg, UNAUTHORIZED_TEXT)
+        return
+    args = [a.lower() for a in (context.args or [])]
+    if len(args) > 1 or (args and args[0] not in ("on", "off")):
+        await safe_reply_text(msg, "Usage: /autoapprove on | off\nSend /autoapprove alone to see the current status.")
+        return
+    try:
+        current = bool((await asyncio.to_thread(mongo_db.get_auto_approve, True)).get("enabled"))
+    except Exception as e:
+        print("autoapprove read error:", e)
+        await safe_reply_text(msg, "⚠️ Could not read the Auto Approve setting. Nothing was changed. Please try again.")
+        return
+    if not args:
+        await safe_reply_text(msg, auto_approve_status_text(current) + "\n\nChange it with /autoapprove on or /autoapprove off.")
+        return
+    want = args[0] == "on"
+    if want == current:
+        await safe_reply_text(msg, auto_approve_status_text(current) + "\n\nNo change was needed.")
+        return
+    try:
+        await asyncio.to_thread(mongo_db.set_auto_approve, want, user.id, india_timestamp())
+    except Exception as e:
+        print("autoapprove write error:", e)
+        await safe_reply_text(msg, "⚠️ Could not save the Auto Approve setting. Nothing was changed. Please try again.")
+        return
+    if not want:
+        await safe_reply_text(msg, "🤖 Auto Approve: ❌ OFF\nGroups that are already approved stay approved. New groups wait for /approve again.")
+        return
+    await safe_reply_text(msg, "🤖 Auto Approve: ✅ ON\nNew groups are approved automatically. Approving the groups that are waiting now...")
+    approved, failed = await sweep_pending_groups(context)
+    result = f"📦 Waiting groups approved: {approved}"
+    if failed:
+        result += f"\n⚠️ Could not approve {failed} group(s). Use /approve <group_chat_id> for them."
+    await safe_reply_text(msg, result)
+
 
 async def leave_group(update, context):
     if not is_owner(update.effective_user.id):
@@ -950,6 +1074,11 @@ async def track_bot_membership(update, context):
             (await asyncio.to_thread(register_auto_spawn_group, chat.id))
             context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
             return
+
+        if await is_auto_approve_on():
+            if await auto_approve_group(context, chat, getattr(member_update, "from_user", None)):
+                return
+            # approving failed: fall through to the normal manual-approval flow below
 
         notified = context.application.bot_data.setdefault("unapproved_notified", set())
         if chat.id not in notified:
@@ -1529,7 +1658,9 @@ HELP_MODULES = {
             "Switch the bot on or off per group and fix spawns that got stuck.",
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
-             ("/clearspawn", "Clear a stuck active spawn (group only)")])),
+             ("/clearspawn", "Clear a stuck active spawn (group only)"),
+             ("/autoapprove [on|off]", "Owner only: approve every group the bot is added to automatically. "
+                                       "Send it alone to see the status, or use the button below")])),
         ("broadcast", "📣 Broadcast", _help_page(
             "📣 Broadcast (Owner & Executive)",
             "Send one announcement to every linked group.",
@@ -2622,6 +2753,50 @@ async def _edit_help_message(query, text, reply_markup=None):
     except Exception as e:
         print("Help fallback send error:", e)
 
+def _auto_approve_button(owner_id, enabled):
+    label = "🤖 Auto Approve: ✅ ON" if enabled else "🤖 Auto Approve: ❌ OFF"
+    return _module_button(label, f"help:{owner_id}:aa:toggle")
+
+
+def _groupctl_owner_panel(text, markup, owner_id, enabled, extra=""):
+    """Group Control page for the Owner: the usual text + status line, and the Auto Approve toggle button on top."""
+    note = "\n\n" + auto_approve_status_text(enabled) + "\nTap the button below to switch it."
+    if extra:
+        note += "\n" + extra
+    rows = [[_auto_approve_button(owner_id, enabled)]] + [list(r) for r in markup.inline_keyboard]
+    return text + note, InlineKeyboardMarkup(rows)
+
+
+async def help_autoapprove_toggle(context, query, user_id):
+    """Owner taps the Auto Approve button in Group Control. Ownership of the menu was already checked by help_callback."""
+    if not is_owner(user_id):
+        await deny_callback(query)
+        return
+    try:
+        current = bool((await asyncio.to_thread(mongo_db.get_auto_approve, True)).get("enabled"))
+        want = not current
+        await asyncio.to_thread(mongo_db.set_auto_approve, want, user_id, india_timestamp())
+    except Exception as e:
+        print("Auto approve toggle error:", repr(e))
+        await query.answer("⚠️ Could not change Auto Approve. Nothing was changed. Please try again.", show_alert=True)
+        return
+    try:
+        await query.answer("🤖 Auto Approve is now " + ("ON ✅" if want else "OFF ❌"))
+    except Exception:
+        pass
+    extra = ""
+    if want:
+        approved, failed = await sweep_pending_groups(context)
+        extra = f"📦 Waiting groups approved: {approved}"
+        if failed:
+            extra += f"\n⚠️ Could not approve {failed} group(s). Use /approve <group_chat_id> for them."
+    detail = help_detail("owner", "groupctl", user_id)
+    if detail is None:
+        return
+    text, markup = _groupctl_owner_panel(detail[0], detail[1], user_id, want, extra)
+    await _edit_help_message(query, text, markup)
+
+
 async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     parts = (query.data or "").split(":")
@@ -2649,6 +2824,10 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _edit_help_message(query, build_help_text(), (await asyncio.to_thread(staff_help_keyboard, user_id)))
             return
 
+        if action == "aa" and key == "toggle":
+            await help_autoapprove_toggle(context, query, user_id)       # Owner only (checked inside)
+            return
+
         if action in HELP_MODULES:
             # Role is verified again on every tap: a stale button must never open a panel the user cannot use.
             if not await help_role_allowed(action, user_id):
@@ -2659,6 +2838,8 @@ async def help_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text, markup = help_grid_text(action), help_grid_keyboard(action, user_id)
             else:
                 text, markup = detail
+                if action == "owner" and key == "groupctl" and is_owner(user_id):
+                    text, markup = _groupctl_owner_panel(text, markup, user_id, await is_auto_approve_on())
             chat = query.message.chat if query.message else None
             if chat is not None and chat.type != "private":
                 # Restricted panels never open in a group: they are sent to the user's private chat instead.
@@ -9191,7 +9372,7 @@ LOG_CATEGORIES = {
               {"addexec", "removeexec", "executives", "addscout", "removescout", "scout",
                "addgroupapprove", "removegroupapprove"}),
     "system": ("System logs", "Group approval, bot ON/OFF, leaving groups, status, history and broadcasts",
-               {"approve", "removeapprove", "leavegroup", "boton", "botoff", "status",
+               {"approve", "removeapprove", "leavegroup", "autoapprove", "boton", "botoff", "status",
                 "history", "gstats", "addmessage", "setrules", "resetrules"}),
     "general": ("General", "Every other command (collection, stats, characters, view, check ...)", set()),
 }
@@ -10598,6 +10779,7 @@ COMMANDS = {
     "addgroupapprove": "Owner: give an Executive group approval permission",
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
+    "autoapprove": "Owner: auto-approve every new group (/autoapprove on|off, alone = status)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -11338,7 +11520,7 @@ OWNER_COMMANDS = {
     "delevo", "callcharacter", "clearspawn", "gift", "delete", "discontinue", "continue",
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
-    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "removechar", "boton",
+    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton",
     "status", "gstats", "cooldown", "cd", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
@@ -11374,6 +11556,7 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("addgroupapprove", add_group_approval_permission))
     app.add_handler(CommandHandler("removegroupapprove", remove_group_approval_permission))
     app.add_handler(CommandHandler("leavegroup", leave_group))
+    app.add_handler(CommandHandler("autoapprove", autoapprove_command))
     app.add_handler(CommandHandler("boton", bot_on))
 
     call_conv = ConversationHandler(
