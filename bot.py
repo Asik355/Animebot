@@ -57,7 +57,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
+from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -1374,6 +1374,8 @@ async def track_bot_membership(update, context):
             print("Bot-removed notification error:", e)
 
 SPAWN_LIFETIME = 20 * 60  # 20 minutes
+PENDING_EXPIRY_CHECK_SECONDS = 30       # how often missed "character is gone" notices are looked for
+STALE_EXPIRY_NOTICE_SECONDS = 60 * 60   # an expiry notice older than this (after the spawn ended) is closed without sending
 AUTO_SPAWN_INTERVAL = 30 * 60  # 30 minutes
 PERSONAL_SPAWN_COOLDOWN = 3600  # 1 hour: Scouts and general members
 STAFF_SPAWN_COOLDOWN = 1800     # 30 minutes: Owner and Executive
@@ -7547,6 +7549,10 @@ async def _gstats_collect(context, force=False):
                     "username": getattr(chat, "username", info.get("username")),
                 }
                 return raw_id, entry, getattr(chat, "invite_link", None)
+            except ChatMigrated as e:                         # the group became a supergroup: move its settings to the new id
+                if getattr(e, "new_chat_id", None):
+                    await migrate_group_data(context.application, chat_id, e.new_chat_id)
+                return raw_id, None, None
             except (Forbidden, BadRequest) as e:
                 reason = str(e).lower()
                 if isinstance(e, Forbidden) or any(w in reason for w in (
@@ -9424,15 +9430,67 @@ def format_expiry_notice(spawn):
         f"Anime: {spawn.get('anime', '')}"
     )
 
-async def send_expiry_notice(app, chat_id, spawn):
-    history_id = spawn.get("history_id")
-    notice_lock = app.bot_data.setdefault("expiry_notice_lock", asyncio.Lock())
+async def migrate_group_data(app, old_id, new_id):
+    """A group became a supergroup (new chat id): carry its approval, bot ON/OFF, auto-spawn and /gstats-hidden state to the
+    new id and forget the old one. Safe to run more than once."""
+    old_id, new_id = int(old_id), int(new_id)
+    if old_id == new_id:
+        return
+    bd = app.bot_data
+    approved = await asyncio.to_thread(load_approved_groups)
+    states = await asyncio.to_thread(load_bot_group_states)
+    auto = await asyncio.to_thread(load_auto_spawn_groups)
+    hidden = await asyncio.to_thread(load_gstats_hidden_groups)
+    was_approved = old_id in approved
+    old_state = states.get(str(old_id))
+    if was_approved:
+        await asyncio.to_thread(_mongo_safe, mongo_db.set_group_approved, new_id, True)
+    if old_state is not None and str(new_id) not in states:
+        await asyncio.to_thread(set_bot_enabled, new_id, bool(old_state))
+    if old_id in auto:
+        await asyncio.to_thread(register_auto_spawn_group, new_id)
+    if old_id in hidden:
+        await asyncio.to_thread(hide_gstats_group, new_id)
+    await asyncio.to_thread(_mongo_safe, mongo_db.cleanup_left_group, old_id)
+    await asyncio.to_thread(_mongo_safe, mongo_db.sh_mark_chat_expiry_notified, old_id, india_timestamp())
+    active = bd.setdefault("active_chats", set())
+    active.discard(old_id)
+    bd.setdefault("active_spawns", {}).pop(old_id, None)
+    bd.setdefault("next_auto_spawn_at", {}).pop(old_id, None)
+    if was_approved and old_state is not False:
+        active.add(new_id)
+    print(f"Group became a supergroup: {old_id} -> {new_id} (settings moved)")
 
-    async with notice_lock:
+
+async def group_migrated_handler(update, context):
+    """Service message 'group migrated to supergroup' (seen in the old chat and in the new one)."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if msg is None or chat is None:
+        return
+    old_id = getattr(msg, "migrate_from_chat_id", None)
+    new_id = getattr(msg, "migrate_to_chat_id", None)
+    if old_id:
+        new_id = chat.id
+    elif new_id:
+        old_id = chat.id
+    if old_id and new_id:
+        await migrate_group_data(context.application, old_id, new_id)
+
+
+async def send_expiry_notice(app, chat_id, spawn):
+    """Tell the group that a spawned character is gone. Only temporary errors (network, flood limit) are retried; a permanent
+    error (group migrated / deleted, bot removed) marks the notice as done, so it can never loop forever."""
+    history_id = spawn.get("history_id")
+    inflight = app.bot_data.setdefault("expiry_notice_inflight", set())
+    if history_id:
+        if history_id in inflight:
+            return True                      # this notice is already being sent
+        inflight.add(history_id)
+    try:
         if history_id:
             try:
-                row = (True,) if (await asyncio.to_thread(mongo_db.sh_is_expiry_notified, history_id)) else None
-                if row and row[0]:
+                if await asyncio.to_thread(mongo_db.sh_is_expiry_notified, history_id):
                     return True
             except Exception as e:
                 print(f"Expiry notification status check error for {chat_id}: {e}")
@@ -9446,11 +9504,28 @@ async def send_expiry_notice(app, chat_id, spawn):
                 )
                 (await asyncio.to_thread(mark_spawn_expiry_notified, history_id))
                 return True
+            except ChatMigrated as e:
+                new_id = getattr(e, "new_chat_id", None)
+                if new_id:
+                    await migrate_group_data(app, chat_id, new_id)
+                (await asyncio.to_thread(mark_spawn_expiry_notified, history_id))
+                return True
+            except (Forbidden, BadRequest) as e:
+                print(f"Expiry notification dropped for {chat_id} (permanent error, not retried): {e}")
+                (await asyncio.to_thread(mark_spawn_expiry_notified, history_id))
+                return True
+            except RetryAfter as e:
+                print(f"Expiry notification flood wait for {chat_id} (attempt {attempt + 1}/3): {e}")
+                if attempt < 2:
+                    await asyncio.sleep(min(float(getattr(e, "retry_after", 1) or 1), 10))
             except Exception as e:
                 print(f"Expiry notification error for {chat_id} (attempt {attempt + 1}/3): {e}")
                 if attempt < 2:
                     await asyncio.sleep(1)
         return False
+    finally:
+        if history_id:
+            inflight.discard(history_id)
 
 async def restore_persisted_spawn_expiries(app):
     try:
@@ -9510,6 +9585,31 @@ async def retry_pending_expiry_notices(app):
         return
 
     now_utc = datetime.now(timezone.utc)
+
+    # Clean-up: a notice for a spawn that ended long ago, or for a group that is not approved any more, is not worth sending.
+    # Close those rows once (no message) so they are never retried.
+    try:
+        approved_now = await asyncio.to_thread(load_approved_groups)
+        stale_ids, live_rows = [], []
+        for row in rows:
+            try:
+                sd = datetime.fromisoformat(str(row[4]))
+                if sd.tzinfo is None:
+                    sd = sd.replace(tzinfo=INDIA_TZ)
+                too_old = (now_utc - sd.astimezone(timezone.utc)).total_seconds() > SPAWN_LIFETIME + STALE_EXPIRY_NOTICE_SECONDS
+            except Exception:
+                too_old = False
+            if too_old or int(row[1]) not in approved_now:
+                stale_ids.append(row[0])
+            else:
+                live_rows.append(row)
+        if stale_ids:
+            await asyncio.to_thread(_mongo_safe, mongo_db.sh_mark_expiry_notified_many, stale_ids, india_timestamp())
+            print(f"Closed {len(stale_ids)} old/unused expiry notice(s) without sending")
+        rows = live_rows
+    except Exception as e:
+        print("Pending expiry clean-up error:", e)
+
     for history_id, chat_id, code, rarity, spawned_at in rows:
         try:
             spawned_dt = datetime.fromisoformat(str(spawned_at))
@@ -9573,7 +9673,11 @@ async def spawn_expiry_tick(app):
     for chat_id, spawn in expired:
         await send_expiry_notice(app, chat_id, spawn)
 
-    await retry_pending_expiry_notices(app)
+    # Pending (missed) notices are a safety net: checking them every second cost hundreds of DB calls per minute.
+    now_m = time.monotonic()
+    if now_m - app.bot_data.get("pending_expiry_checked", -PENDING_EXPIRY_CHECK_SECONDS) >= PENDING_EXPIRY_CHECK_SECONDS:
+        app.bot_data["pending_expiry_checked"] = now_m
+        await retry_pending_expiry_notices(app)
 
 async def spawn_expiry_loop(app):
     while True:
@@ -12279,6 +12383,7 @@ def main():
 
     from telegram.ext import TypeHandler as _HumanOnlyTypeHandler
     app.add_handler(_HumanOnlyTypeHandler(Update, human_only_gate), group=-300)   # Human-only rule: runs before everything
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, group_migrated_handler, block=False), group=-150)   # group -> supergroup
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, track_group_chat, block=False), group=-101)
 
     app.add_handler(MessageHandler(filters.ALL, block_unapproved_group), group=-100)

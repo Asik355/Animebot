@@ -1892,6 +1892,23 @@ def sh_mark_expiry_notified(history_id, stamp):
                               {"$set": {"expiry_notified_at": stamp}}).modified_count == 1
 
 
+@retry_write
+def sh_mark_expiry_notified_many(history_ids, stamp):
+    """Mark several 'character expired' notices as done without sending them (old rows / groups that are gone)."""
+    ids = [int(h) for h in history_ids]
+    if not ids:
+        return 0
+    return col(SH).update_many({"_id": {"$in": ids}, "expiry_notified_at": None},
+                               {"$set": {"expiry_notified_at": stamp}}).modified_count
+
+
+@retry_write
+def sh_mark_chat_expiry_notified(chat_id, stamp):
+    """All unannounced expiry notices of one (dead / migrated) chat are done."""
+    return col(SH).update_many({"chat_id": int(chat_id), "caught_by": None, "expiry_notified_at": None},
+                               {"$set": {"expiry_notified_at": stamp}}).modified_count
+
+
 @retry_read
 def sh_is_expiry_notified(history_id):
     d = col(SH).find_one({"_id": int(history_id)}, {"expiry_notified_at": 1})
