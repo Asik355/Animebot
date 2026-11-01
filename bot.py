@@ -751,8 +751,10 @@ async def auto_approve_group(context, chat, added_by=None):
             try:
                 who = html_escape(display_user(added_by)) if added_by else "Unknown"
                 members = f"👥 Members: {count}\n" if count is not None else ""
+                group_link = await get_group_link(context.bot, context.application, cid, chat)
                 await context.bot.send_message(
                     chat_id=owner_id,
+                    reply_markup=open_group_markup(group_link),
                     text=(
                         "🤖 GROUP AUTO-APPROVED\n"
                         f"🏷 Group: {html_escape(_chat_title(chat))}\n"
@@ -1249,6 +1251,42 @@ def group_id_html(chat_id):
     return f"<code>{html_escape(str(chat_id))}</code>"
 
 
+async def get_group_link(bot, app, chat_id, chat=None, allow_fetch=True):
+    """
+    Best link that opens a group, or None. Order: public @username -> link remembered earlier ->
+    the group's existing invite link -> a newly created invite link (never revokes an existing one).
+    allow_fetch=False skips Telegram calls (used after the bot was removed: it can no longer ask).
+    """
+    try:
+        cid = int(chat_id)
+        cache = app.bot_data.setdefault("group_links", {})
+        username = getattr(chat, "username", None) if chat is not None else None
+        if username:
+            cache[cid] = f"https://t.me/{username}"
+            return cache[cid]
+        if cache.get(cid):
+            return cache[cid]
+        if not allow_fetch:
+            return None
+        info = await bot.get_chat(cid)
+        link = f"https://t.me/{info.username}" if getattr(info, "username", None) else getattr(info, "invite_link", None)
+        if not link:
+            link = (await bot.create_chat_invite_link(cid)).invite_link
+        if link:
+            cache[cid] = link
+        return link or None
+    except Exception as e:
+        print(f"Group link error for {chat_id}:", e)
+        return None
+
+
+def open_group_markup(link):
+    """One '🔗 Open Group' button, or None when no link is available (the message is then sent as before)."""
+    if not link:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Group", url=link)]])
+
+
 async def get_owner_contact_html(bot, app=None):
     """
     Bot Owner's CURRENT @username, read live from Telegram for the configured owner (ADMIN_IDS[0]).
@@ -1327,8 +1365,10 @@ async def track_bot_membership(update, context):
                 try:
                     added_by = getattr(member_update, "from_user", None)
                     added_by_text = display_user(added_by) if added_by else "Unknown"
+                    group_link = await get_group_link(context.bot, context.application, chat.id, chat)
                     await context.bot.send_message(
                         chat_id=owner_id,
+                        reply_markup=open_group_markup(group_link),
                         text=(
                             "🔔 New Group Approval Request\n"
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
@@ -1364,7 +1404,8 @@ async def track_bot_membership(update, context):
                 owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
                 if owner_id:
                     try:
-                        await context.bot.send_message(chat_id=owner_id, text=notice)
+                        group_link = await get_group_link(context.bot, context.application, chat.id, chat, allow_fetch=False)
+                        await context.bot.send_message(chat_id=owner_id, text=notice, reply_markup=open_group_markup(group_link))
                     except Exception as e:
                         print("Owner bot-removed notification error:", e)
                 cfg = await get_log_config()
