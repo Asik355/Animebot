@@ -754,7 +754,7 @@ async def auto_approve_group(context, chat, added_by=None):
                 group_link = await get_group_link(context.bot, context.application, cid, chat)
                 await context.bot.send_message(
                     chat_id=owner_id,
-                    reply_markup=open_group_markup(group_link),
+                    reply_markup=open_group_markup(group_link, cid),
                     text=(
                         "🤖 GROUP AUTO-APPROVED\n"
                         f"🏷 Group: {html_escape(_chat_title(chat))}\n"
@@ -762,6 +762,7 @@ async def auto_approve_group(context, chat, added_by=None):
                         f"{members}"
                         f"👤 Added by: {who}\n\n"
                         "Auto Approve is ON. Change it from /help → Owner Commands → ✅ Auto Approve"
+                        + ("" if group_link else f"\n\n{html_escape(GROUP_NO_LINK_NOTE)}")
                     ),
                     parse_mode="HTML",
                 )
@@ -1268,23 +1269,118 @@ async def get_group_link(bot, app, chat_id, chat=None, allow_fetch=True):
             return cache[cid]
         if not allow_fetch:
             return None
-        info = await bot.get_chat(cid)
-        link = f"https://t.me/{info.username}" if getattr(info, "username", None) else getattr(info, "invite_link", None)
-        if not link:
-            link = (await bot.create_chat_invite_link(cid)).invite_link
+        link = None
+        try:
+            info = await bot.get_chat(cid)
+            link = f"https://t.me/{info.username}" if getattr(info, "username", None) else getattr(info, "invite_link", None)
+            if not link:
+                link = (await bot.create_chat_invite_link(cid)).invite_link
+        except Exception as e:
+            print(f"Group invite link unavailable for {chat_id}:", e)
         if link:
             cache[cid] = link
-        return link or None
+            return link
+        return None  # private group and the bot has no invite right: no usable link exists
     except Exception as e:
         print(f"Group link error for {chat_id}:", e)
         return None
 
 
-def open_group_markup(link):
-    """One '🔗 Open Group' button, or None when no link is available (the message is then sent as before)."""
+GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot must be an admin with the 'Invite users' right to share one. "
+                      "No characters spawn in this group until the bot is an admin.")
+
+# Characters spawn only in groups where the bot is an admin. Set to False to turn this rule off.
+REQUIRE_BOT_ADMIN_FOR_SPAWN = True
+BOT_JOIN_ADMIN_TEXT = "🤖 Thanks for adding me! I need <b>admin</b> rights to work properly. Please promote me."
+BOT_ADMIN_SPAWN_TEXT = "❌ Make me an admin in this group first. Characters spawn only where the bot is an admin."
+
+
+def open_group_markup(link, cid=None):
+    """'🔗 Open Group' when a link exists; else '🔄 Get Link' (retry) if cid is given; else no button."""
+    if link:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Group", url=link)]])
+    if cid is not None:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Get Link", callback_data=f"gl:{int(cid)}")]])
+    return None
+
+
+ADMIN_REQUIRED_COLL = "admin_required_groups"   # groups the bot was added to after this rule started
+
+
+async def mark_admin_required(app, chat_id):
+    """Remember that this is a NEW group: spawns there need the bot to be admin. Older groups are never added."""
+    cid = int(chat_id)
+    app.bot_data.setdefault("admin_required_cache", {"ids": set(), "ts": 0.0})["ids"].add(cid)
+    try:
+        await asyncio.to_thread(_mc(ADMIN_REQUIRED_COLL).update_one, {"_id": cid}, {"$set": {"added_at": datetime.now(IST).isoformat()}}, True)
+    except Exception as e:
+        print(f"Could not save new-group admin rule for {cid}:", e)
+
+
+async def _admin_required(app, chat_id):
+    cache = app.bot_data.setdefault("admin_required_cache", {"ids": set(), "ts": 0.0})
+    now = time.monotonic()
+    if now - cache["ts"] > 120:
+        try:
+            docs = await asyncio.to_thread(lambda: list(_mc(ADMIN_REQUIRED_COLL).find({}, {"_id": 1})))
+            cache["ids"] = {int(d["_id"]) for d in docs} | cache["ids"]
+            cache["ts"] = now
+        except Exception as e:
+            print("Admin-required list error:", e)
+            cache["ts"] = now - 90          # retry in 30 s; until then keep what is already known
+    return int(chat_id) in cache["ids"]
+
+
+async def bot_is_group_admin(bot, app, chat_id):
+    """True when spawning is allowed here: the group is an older one (rule does not apply) or the bot is an admin.
+    Short cache (30 s while not admin, 5 min once admin).
+    If Telegram can't be asked, this returns True so a temporary error never stops spawns."""
+    if not REQUIRE_BOT_ADMIN_FOR_SPAWN:
+        return True
+    cid = int(chat_id)
+    if not await _admin_required(app, cid):
+        return True
+    cache = app.bot_data.setdefault("bot_admin_cache", {})
+    now = time.monotonic()
+    hit = cache.get(cid)
+    if hit and now - hit[1] < (300 if hit[0] else 30):
+        return hit[0]
+    try:
+        member = await bot.get_chat_member(cid, bot.id)
+        ok = member.status in ("administrator", "creator")
+    except Exception as e:
+        print(f"Bot admin check error for {cid}:", e)
+        return True
+    cache[cid] = (ok, now)
+    return ok
+
+
+async def group_link_callback(update, context):
+    """Owner taps '🔄 Get Link': try again to get a join link for that group."""
+    query = update.callback_query
+    if not query or not query.from_user or query.from_user.id not in ADMIN_IDS:
+        if query:
+            await query.answer("Owner only.", show_alert=True)
+        return
+    try:
+        cid = int((query.data or "").split(":", 1)[1])
+    except Exception:
+        await query.answer()
+        return
+    link = await get_group_link(context.bot, context.application, cid)
     if not link:
-        return None
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Open Group", url=link)]])
+        await query.answer("Still no link. Make the bot an admin with the 'Invite users' right, then tap again.",
+                           show_alert=True)
+        return
+    await query.answer("Link ready.")
+    try:
+        text = re.sub(r"\n{3,}", "\n\n", (query.message.text_html or "").replace(html_escape(GROUP_NO_LINK_NOTE), "")).rstrip()
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=open_group_markup(link))
+    except Exception:
+        try:
+            await query.edit_message_reply_markup(reply_markup=open_group_markup(link))
+        except Exception as e:
+            print("Group link button update error:", e)
 
 
 async def get_owner_contact_html(bot, app=None):
@@ -1337,6 +1433,13 @@ async def track_bot_membership(update, context):
         (await asyncio.to_thread(register_bot_group, chat))
         if getattr(member_update.old_chat_member, "status", None) in ("left", "kicked"):
             (await asyncio.to_thread(unhide_gstats_group, chat.id))        # re-added: show it in /gstats again
+        if (status == "member"
+                and getattr(member_update.old_chat_member, "status", None) in ("left", "kicked")):
+            await mark_admin_required(context.application, chat.id)    # new group: spawns need the bot as admin
+            try:   # newly added as a normal member: ask the group to promote the bot (sent once per join)
+                await context.bot.send_message(chat_id=chat.id, text=BOT_JOIN_ADMIN_TEXT, parse_mode="HTML")
+            except Exception as e:
+                print(f"Admin request message error for {chat.id}:", e)
         if await is_group_approved(chat.id):
             (await asyncio.to_thread(register_auto_spawn_group, chat.id))
             context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
@@ -1368,13 +1471,14 @@ async def track_bot_membership(update, context):
                     group_link = await get_group_link(context.bot, context.application, chat.id, chat)
                     await context.bot.send_message(
                         chat_id=owner_id,
-                        reply_markup=open_group_markup(group_link),
+                        reply_markup=open_group_markup(group_link, chat.id),
                         text=(
                             "🔔 New Group Approval Request\n"
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
                             f"🆔 Group ID: {group_id_html(chat.id)}\n"
                             f"👤 Requested by: {html_escape(added_by_text)}\n"
                             + (f"{html_escape(aa_note)}\n" if aa_note else "") +
+                            ("" if group_link else f"\n{html_escape(GROUP_NO_LINK_NOTE)}\n") +
                             f"\nApprove with: <code>/approve {html_escape(str(chat.id))}</code>"
                         ),
                         parse_mode="HTML",
@@ -2620,6 +2724,8 @@ async def send_spawn(chat_id, context, character):
 
 async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
     app = getattr(context, "application", context)
+    if not await bot_is_group_admin(app.bot, app, chat_id):
+        return False, BOT_ADMIN_SPAWN_TEXT
     lock = get_spawn_lock(app)
 
     random_spawn = spawned_by in ("auto_spawn", "manual_spawn")
@@ -3118,6 +3224,13 @@ async def spawn(update, context):
             update.message,
             "❌ A character is already spawned in this chat.\nUse /add to catch it first.",
         )
+        return
+
+    if not await bot_is_group_admin(context.bot, context.application, chat_id):
+        warned = context.application.bot_data.setdefault("admin_spawn_warned", {})
+        if time.monotonic() - warned.get(chat_id, -9999.0) > 600:      # at most one reminder per group per 10 minutes
+            warned[chat_id] = time.monotonic()
+            await safe_reply_text(update.message, BOT_ADMIN_SPAWN_TEXT)
         return
 
     now_dt = datetime.now()
@@ -9763,6 +9876,10 @@ async def _auto_spawn_one_chat(app, chat_id):
     if not last_activity or (now_dt - last_activity).total_seconds() > 300:
         return
 
+    if not await bot_is_group_admin(app.bot, app, chat_id):   # no spawns until the bot is an admin
+        next_auto[chat_id] = datetime.now() + timedelta(minutes=1)
+        return
+
     # Use the normal rarity picker first so high-rank spawns still occur when allowed.
     # Emergency fallback is only used when the normal pool is exhausted.
     character = (await asyncio.to_thread(choose_character, chat_id, app=app, require_photo=True))
@@ -12238,6 +12355,7 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("leavegroup", leave_group))
     app.add_handler(CommandHandler("autoapprove", autoapprove_command))
     app.add_handler(CallbackQueryHandler(auto_approve_callback, pattern=r"^aa:"))
+    app.add_handler(CallbackQueryHandler(group_link_callback, pattern=r"^gl:-?\d+$"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, auto_approve_min_input), group=51)
     app.add_handler(CommandHandler("boton", bot_on))
 
