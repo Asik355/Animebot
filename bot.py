@@ -2038,10 +2038,7 @@ HELP_MODULES = {
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
              ("/clearspawn", "Clear a stuck active spawn (group only)")])),
-        ("broadcast", "📣 Broadcast", _help_page(
-            "📣 Broadcast (Owner & Executive)",
-            "Send one announcement to every linked group.",
-            [("/addmessage", "Broadcast a PM message to all linked groups (PM only)")])),
+        ("broadcast", "📣 Broadcast", "📣 Broadcast"),                       # opens the broadcast flow (bc:m)
         ("scouts", "🔭 Scout Mgmt", _help_page(
             "🔭 Scout Management (Owner & Executive)",
             "Add or remove Scouts, the staff who manage characters.",
@@ -2133,6 +2130,8 @@ def help_grid_keyboard(role, owner_id):
             return f"theme:{owner_id}:hub:open"
         if key == "autoapprove":
             return f"aa:{owner_id}:hub"
+        if key == "broadcast":
+            return "bc:m"
         return f"help:{owner_id}:{role}:{key}"
     buttons = [_module_button(label, _target(key))
                for key, label, _text in HELP_MODULES[role] if _help_module_visible(key, owner_id)]
@@ -4746,65 +4745,342 @@ async def view(update, context):
     else:
         await safe_reply_text(update.message, text + "\n📷 Photo: Not added")
 
-async def add_message(update, context):
-    user = update.effective_user
-    chat = update.effective_chat
-    if not (is_owner(user.id) or is_executive(user.id)):
-        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
-        return
-    if not chat or chat.type != "private":
-        await safe_reply_text(update.effective_message, "⚠️ /addmessage can only be used in the bot's PM.")
-        return
+# ---------------------------------------------------------------------------
+# Broadcast (/help -> 📣 Broadcast): targets -> message -> pin -> summary -> Confirm.
+# Owner and Executive, private chat only. The message is copied, so text, media and formatting all work.
+# ---------------------------------------------------------------------------
+BC_PAGE, BC_DELAY, BC_COLL = 8, 0.15, "broadcast_report"
+_bc_state = {}   # user id -> the broadcast being prepared
+_bc_job = None   # the broadcast that is sending now (one at a time)
 
-    source = update.effective_message.reply_to_message
-    text = " ".join(context.args).strip()
-    if not source and not text:
-        await safe_reply_text(update.effective_message,
-            "Usage:\n"
-            "1. Reply to any message in PM and send /addmessage\n"
-            "2. Or send /addmessage <message>\n\n"
-            "Replying to a message keeps its Telegram formatting/media exactly as a copied message."
-        )
-        return
 
-    groups = (await asyncio.to_thread(load_bot_groups))
-    if not groups:
-        await safe_reply_text(update.effective_message, "❌ No linked groups are registered yet.")
-        return
+def _bc_ok(uid):
+    return is_owner(uid) or is_executive(uid)
 
-    success = 0
-    failed = 0
-    failed_groups = []
+def _bc_n(n):
+    return f"{n} group{'' if n == 1 else 's'}"
 
-    for raw_chat_id, info in sorted(groups.items(), key=lambda item: str(item[0])):
+def _bc_short(title, n=28):
+    title = (title or "?").strip() or "?"
+    return title if len(title) <= n else title[:n - 1] + "…"
+
+def _bc_btn(label, data):
+    return InlineKeyboardButton(label, callback_data=data)
+
+def _bc_kb(*rows):
+    return InlineKeyboardMarkup([list(r) for r in rows])
+
+def _bc_step(st):
+    if st["mode"] is None:
+        return "target"
+    if st["mode"] == "pick" and not st["done"]:
+        return "pick"
+    if st["msg"] is None or st["wait"]:
+        return "msg"
+    if st["pin"] is None or st["ask"]:
+        return "pin"
+    return "sum"
+
+def _bc_who(st, long=False):
+    if st["mode"] == "all":
+        return f"All groups ({len(st['groups'])})" if long else f"all {_bc_n(len(st['groups']))}"
+    names = [html_escape(_bc_short(t, 40)) for c, t in st["groups"] if c in st["sel"]]
+    if not long:
+        return f"{_bc_n(len(names))} selected"
+    more = f"\n   …and {len(names) - 10} more" if len(names) > 10 else ""
+    return f"{_bc_n(len(names))} selected:\n" + "\n".join(f"   • {n}" for n in names[:10]) + more
+
+def _bc_panel(uid):
+    role = "owner" if is_owner(uid) else "executive"
+    text = ("<b>📣 Broadcast</b>\n\nSend one message to every group the bot is in, or only to the groups you choose."
+            + ("\n\n⏳ A broadcast is sending right now." if _bc_job else ""))
+    return text, _bc_kb([_bc_btn("✍️ New Broadcast", "bc:new")], [_bc_btn("📜 Last Report", "bc:last")],
+                        [_bc_btn("🔙 Back", f"help:{uid}:{role}")])
+
+def _bc_screen(st):
+    """(text, keyboard) for the step the broadcast is on."""
+    step, n = _bc_step(st), len(st["groups"])
+    cancel = _bc_btn("❌ Cancel", "bc:x")
+    back = _bc_btn("🔙 Back to summary", "bc:sum") if st["snap"] else cancel
+    if step == "sum" and st["menu"]:
+        return "<b>✏️ What do you want to change?</b>", _bc_kb(
+            [_bc_btn("🎯 Targets", "bc:et")], [_bc_btn("📝 Message", "bc:em")], [_bc_btn("📌 Pin", "bc:ep")],
+            [_bc_btn("🔙 Back to summary", "bc:sum")])
+    if step == "target":
+        return (f"<b>📣 Broadcast: who gets it?</b>\n\nThe bot is in <b>{_bc_n(n)}</b>.\n"
+                "Send it to all of them, or pick one or more groups."), _bc_kb(
+            [_bc_btn(f"🌐 All groups ({n})", "bc:ta")], [_bc_btn("🎯 Specific groups", "bc:tp")], [back])
+    if step == "pick":
+        pages = max(1, -(-n // BC_PAGE))
+        st["page"] = min(max(st["page"], 0), pages - 1)
+        first = st["page"] * BC_PAGE
+        rows = [[_bc_btn(("✅ " if st["groups"][i][0] in st["sel"] else "⬜ ") + _bc_short(st["groups"][i][1]), f"bc:g:{i}")]
+                for i in range(first, min(first + BC_PAGE, n))]
+        if pages > 1:
+            rows.append([_bc_btn("◀", f"bc:pg:{st['page'] - 1}"), _bc_btn(f"{st['page'] + 1}/{pages}", "bc:noop"),
+                         _bc_btn("▶", f"bc:pg:{st['page'] + 1}")])
+        rows += [[_bc_btn("☑️ Select all", "bc:sa"), _bc_btn("🧹 Clear", "bc:cl")],
+                 [_bc_btn(f"✅ Done ({len(st['sel'])})", "bc:dn")],
+                 [_bc_btn("🔙 Back", "bc:bk"), cancel]]
+        return (f"<b>🎯 Pick the groups</b>\n\nTap a group to select or unselect it. "
+                f"Selected: <b>{len(st['sel'])}</b> of {n}."), _bc_kb(*rows)
+    if step == "msg":
+        return (f"<b>📝 Send the message</b>\n\nTargets: <b>{html_escape(_bc_who(st))}</b>\n\n"
+                "Now send me the message you want to broadcast, here in this chat. Text, photo, video or a file all "
+                "work, and the formatting is kept."), _bc_kb([back])
+    if step == "pin":
+        return ("<b>📌 Pin the message?</b>\n\nShould the bot pin it in each group? A group where the bot has no pin "
+                "right still gets the message, just not pinned."), _bc_kb(
+            [_bc_btn("✅ Yes, pin it", "bc:py"), _bc_btn("❌ No", "bc:pn")], [back])
+    info = st["msg"]
+    preview = html_escape(info["text"][:120]) + ("…" if len(info["text"]) > 120 else "")
+    return (f"<b>📋 Broadcast summary</b>\n\n🎯 <b>Groups:</b> {_bc_who(st, True)}\n\n"
+            f"📝 <b>Message:</b> {info['kind']}" + (f"\n<i>{preview}</i>" if preview else "") + "\n\n"
+            f"📌 <b>Pin:</b> {'ON' if st['pin'] else 'OFF'}\n\nCheck everything, then confirm."), _bc_kb(
+        [_bc_btn("✅ Confirm", "bc:ok")], [_bc_btn("✏️ Edit", "bc:ed"), cancel])
+
+async def _bc_render(context, uid, q=None):
+    """Show the current screen: edit the tapped message (q), or send a new one under the user's message."""
+    st = _bc_state[uid]
+    text, markup = _bc_screen(st)
+    if q is not None:
         try:
-            group_id = int(raw_chat_id)
-            if source:
-                await context.bot.copy_message(
-                    chat_id=group_id,
-                    from_chat_id=source.chat_id,
-                    message_id=source.message_id,
-                )
-            else:
-                await context.bot.send_message(chat_id=group_id, text=text)
-            success += 1
-        except Exception as e:
-            failed += 1
-            title = (info or {}).get("title") or str(raw_chat_id)
-            failed_groups.append(f"• {title} ({raw_chat_id})")
-            print(f"/addmessage broadcast failed for {raw_chat_id}:", e)
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup, disable_web_page_preview=True)
+        except TelegramError:
+            pass                                    # unchanged (double tap) or too old to edit
+        st["panel"] = (q.message.chat.id, q.message.message_id)
+        return
+    sent = await context.bot.send_message(st["panel"][0], text, parse_mode="HTML", reply_markup=markup,
+                                          disable_web_page_preview=True)
+    st["panel"] = (sent.chat_id, sent.message_id)
 
-    result = (
-        "📢 MESSAGE BROADCAST COMPLETE\n\n"
-        f"✅ Sent: {success}\n"
-        f"❌ Failed: {failed}\n"
-        f"👥 Linked groups: {len(groups)}"
-    )
-    if failed_groups:
-        result += "\n\nFailed groups:\n" + "\n".join(failed_groups[:20])
-        if len(failed_groups) > 20:
-            result += f"\n• ...and {len(failed_groups) - 20} more"
-    await safe_reply_text(update.effective_message, result)
+def _bc_report_text(rep):
+    when = datetime.fromtimestamp(rep.get("time", 0), IST).strftime("%d %b %Y, %I:%M %p")
+    lines = [f"<b>{'⏹ Broadcast stopped' if rep.get('stopped') else '📣 Broadcast finished'}</b>", f"🕒 {when} IST", "",
+             f"✅ Sent: <b>{rep.get('sent', 0)}</b> of {rep.get('total', 0)}",
+             f"❌ Failed: <b>{len(rep.get('failed', []))}</b>"]
+    if rep.get("pin"):
+        lines.append(f"📌 Pinned: <b>{rep.get('pinned', 0)}</b> (pin failed: {rep.get('pin_failed', 0)})")
+    failed = rep.get("failed", [])
+    if failed:
+        lines += ["", "<b>Failed groups:</b>"] + [f"• {html_escape(_bc_short(t, 30))}: {html_escape(r)}" for t, r in failed[:10]]
+        if len(failed) > 10:
+            lines.append(f"…and {len(failed) - 10} more")
+    return "\n".join(lines)
+
+def _bc_wait(exc):
+    value = getattr(exc, "retry_after", 1)
+    return min(float(value.total_seconds() if hasattr(value, "total_seconds") else value) + 1, 60)
+
+async def _bc_send_one(bot, job, cid, title):
+    target = cid
+    for _ in range(3):
+        try:
+            sent = await bot.copy_message(target, job["src_chat"], job["src_msg"])
+            break
+        except RetryAfter as e:
+            await asyncio.sleep(_bc_wait(e))
+        except ChatMigrated as e:
+            target = e.new_chat_id
+        except Forbidden:
+            job["failed"].append((title, "bot was removed or can't write"))
+            return
+        except TelegramError as e:
+            job["failed"].append((title, str(e)[:40] or type(e).__name__))
+            return
+    else:
+        job["failed"].append((title, "Telegram asked to wait too often"))
+        return
+    job["sent"] += 1
+    if job["pin"]:
+        try:
+            await bot.pin_chat_message(target, sent.message_id)
+            job["pinned"] += 1
+        except TelegramError:
+            job["pin_failed"] += 1
+
+async def _bc_progress(bot, job, force=False):
+    if not force and time.monotonic() - job["edited"] < 4:
+        return
+    job["edited"] = time.monotonic()
+    text = (f"<b>📤 Broadcasting…</b>\n\nDone: <b>{job['done']}</b> of {len(job['targets'])}\n"
+            f"✅ Sent: {job['sent']}\n❌ Failed: {len(job['failed'])}"
+            + (f"\n📌 Pinned: {job['pinned']}" if job["pin"] else ""))
+    try:
+        await bot.edit_message_text(text, chat_id=job["panel"][0], message_id=job["panel"][1], parse_mode="HTML",
+                                    reply_markup=_bc_kb([_bc_btn("⏹ Stop", "bc:stop")]))
+    except TelegramError:
+        pass
+
+async def _bc_run(bot, job):
+    global _bc_job
+    try:
+        await _bc_progress(bot, job, force=True)
+        for cid, title in job["targets"]:
+            if job["stop"]:
+                break
+            await _bc_send_one(bot, job, cid, title)
+            job["done"] += 1
+            await _bc_progress(bot, job)
+            await asyncio.sleep(BC_DELAY)
+    except Exception as e:
+        print("Broadcast stopped by an error:", e)
+    finally:
+        rep = {"time": int(time.time()), "total": len(job["targets"]), "sent": job["sent"],
+               "failed": [[t, r] for t, r in job["failed"][:30]], "pin": job["pin"], "pinned": job["pinned"],
+               "pin_failed": job["pin_failed"], "stopped": job["stop"] or job["done"] < len(job["targets"])}
+        _bc_job = None
+        try:
+            await asyncio.to_thread(_mc(BC_COLL).replace_one, {"_id": "last"}, {"_id": "last", **rep}, True)
+        except Exception as e:
+            print("Broadcast report save error:", e)
+        text, kb = _bc_report_text(rep), _bc_kb([_bc_btn("🔙 Back", "bc:m")])
+        try:
+            await bot.edit_message_text(text, chat_id=job["panel"][0], message_id=job["panel"][1],
+                                        parse_mode="HTML", reply_markup=kb)
+        except TelegramError:
+            try:
+                await bot.send_message(job["panel"][0], text, parse_mode="HTML", reply_markup=kb)
+            except TelegramError:
+                pass
+
+async def _bc_groups():
+    groups = await asyncio.to_thread(load_bot_groups) or {}
+    return sorted(((int(c), (i or {}).get("title") or str(c)) for c, i in groups.items()), key=lambda g: g[1].lower())
+
+async def bc_callback(update, context):
+    global _bc_job
+    q, uid = update.callback_query, update.callback_query.from_user.id
+    if not _bc_ok(uid):
+        await q.answer(UNAUTHORIZED_TEXT, show_alert=True)
+        return
+    chat = q.message.chat if q.message else None
+    if chat is None or chat.type != "private":
+        await q.answer("Open me in a private chat to broadcast: /help → Owner Commands → 📣 Broadcast.", show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    act, arg = parts[1] if len(parts) > 1 else "m", parts[2] if len(parts) > 2 else ""
+
+    async def show(text, markup):
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramError:
+            pass
+
+    if act == "noop":
+        await q.answer()
+        return
+    if act == "m":
+        await q.answer()
+        await show(*_bc_panel(uid))
+        return
+    if act == "last":
+        rep = await asyncio.to_thread(_mc(BC_COLL).find_one, {"_id": "last"})
+        await q.answer()
+        await show(_bc_report_text(rep) if rep else "There is no broadcast report yet.", _bc_kb([_bc_btn("🔙 Back", "bc:m")]))
+        return
+    if act == "stop":
+        if _bc_job:
+            _bc_job["stop"] = True
+        await q.answer("Stopping…" if _bc_job else "Nothing is sending right now.")
+        return
+    if act == "new":
+        if _bc_job:
+            await q.answer("A broadcast is already sending. Wait until it finishes.", show_alert=True)
+            return
+        groups = await _bc_groups()
+        if not groups:
+            await q.answer("The bot is not in any group yet.", show_alert=True)
+            return
+        _bc_state[uid] = {"groups": groups, "panel": (chat.id, q.message.message_id), "mode": None, "sel": set(),
+                          "done": False, "page": 0, "msg": None, "pin": None, "wait": False, "ask": False,
+                          "menu": False, "snap": None}
+        await q.answer()
+        await _bc_render(context, uid, q)
+        return
+
+    st = _bc_state.get(uid)
+    if st is None:
+        await q.answer("This broadcast is no longer active. Please start again.", show_alert=True)
+        await show(*_bc_panel(uid))
+        return
+    if act == "x":
+        _bc_state.pop(uid, None)
+        await q.answer("Cancelled.")
+        await show(*_bc_panel(uid))
+        return
+    st["menu"] = False
+    if act == "ta":
+        st["mode"] = "all"
+    elif act == "tp":
+        st["mode"], st["done"], st["page"] = "pick", False, 0
+    elif act == "bk":
+        st["mode"] = None
+    elif act == "g" and arg.isdigit() and int(arg) < len(st["groups"]):
+        st["sel"] ^= {st["groups"][int(arg)][0]}
+    elif act == "pg" and arg.lstrip("-").isdigit():
+        st["page"] = int(arg)
+    elif act == "sa":
+        st["sel"] = {c for c, _ in st["groups"]}
+    elif act == "cl":
+        st["sel"] = set()
+    elif act == "dn":
+        if not st["sel"]:
+            await q.answer("Pick at least one group first.", show_alert=True)
+            return
+        st["done"] = True
+    elif act in ("py", "pn"):
+        st["pin"], st["ask"] = act == "py", False
+    elif act == "ed":
+        st["menu"] = True
+    elif act in ("et", "em", "ep"):
+        st["snap"] = (st["mode"], set(st["sel"]), st["done"], st["msg"], st["pin"])    # "Back to summary" restores it
+        if act == "et":
+            st["mode"], st["done"] = None, False
+        else:
+            st["wait" if act == "em" else "ask"] = True
+    elif act == "sum":
+        if st["snap"]:
+            st["mode"], st["sel"], st["done"], st["msg"], st["pin"] = st["snap"]
+        st["snap"], st["wait"], st["ask"] = None, False, False
+    elif act == "ok":
+        if _bc_step(st) != "sum":
+            await q.answer("Please finish the steps first.", show_alert=True)
+            return
+        if _bc_job:
+            await q.answer("A broadcast is already sending. Wait until it finishes.", show_alert=True)
+            return
+        targets = (st["groups"] if st["mode"] == "all" else [g for g in st["groups"] if g[0] in st["sel"]])
+        _bc_job = {"targets": targets, "src_chat": st["msg"]["chat_id"], "src_msg": st["msg"]["message_id"],
+                   "pin": bool(st["pin"]), "panel": (chat.id, q.message.message_id), "stop": False, "done": 0,
+                   "sent": 0, "failed": [], "pinned": 0, "pin_failed": 0, "edited": 0.0}
+        _bc_state.pop(uid, None)
+        await q.answer("Sending…")
+        asyncio.create_task(_bc_run(context.bot, _bc_job))
+        return
+    else:
+        await q.answer()
+        return
+    if _bc_step(st) == "sum" and not st["menu"]:
+        st["snap"] = None                       # the edit is finished
+    await q.answer()
+    await _bc_render(context, uid, q)
+
+async def bc_message(update, context):
+    """The message sent after 'Send the message'. Ignored unless a broadcast is waiting for it."""
+    msg, user = update.effective_message, update.effective_user
+    st = _bc_state.get(user.id) if msg and user else None
+    if st is None or _bc_step(st) != "msg" or not _bc_ok(user.id):
+        return
+    kind = next((k for k in ("photo", "video", "animation", "document", "audio", "voice", "video_note", "sticker",
+                             "poll") if getattr(msg, k, None)), "text")
+    st["msg"] = {"chat_id": msg.chat_id, "message_id": msg.message_id, "kind": kind,
+                 "text": (msg.text or msg.caption or "").strip()}
+    st["wait"] = False
+    if _bc_step(st) == "sum":
+        st["snap"] = None
+    await _bc_render(context, user.id)
+
 
 async def send_character_check_result(bot, chat_id, character, source_message=None):
     code, name, anime, rarity, worth, photo = character
@@ -10064,7 +10340,7 @@ LOG_CATEGORIES = {
                "addgroupapprove", "removegroupapprove"}),
     "system": ("System logs", "Group approval, bot ON/OFF, leaving groups, status, history and broadcasts",
                {"approve", "removeapprove", "leavegroup", "autoapprove", "boton", "botoff", "status",
-                "history", "gstats", "addmessage", "setrules", "resetrules"}),
+                "history", "gstats", "setrules", "resetrules"}),
     "general": ("General", "Every other command (collection, stats, characters, view, check ...)", set()),
 }
 LOG_CATEGORY_OF = {cmd: cat for cat, (_t, _d, cmds) in LOG_CATEGORIES.items() for cmd in cmds}
@@ -11482,7 +11758,6 @@ COMMANDS = {
     "notificationoff": "Owner/Executive/Scout: turn your own PM notifications OFF",
     "notificationon": "Owner/Executive/Scout: turn your own PM notifications ON",
     "notificationhistory": "Owner/Executive/Scout: view your personal notification history",
-    "addmessage": "Owner/Executive: broadcast a message to linked groups (PM only)",
     "btransfer": "Owner/Executive: block transfer between two user IDs",
     "unbtransfer": "Owner/Executive: remove transfer block between two user IDs",
     "setrules": "Owner/Executive: set the bot usage rules (PM only)",
@@ -12255,7 +12530,7 @@ async def scout_list_command(update, context):
 
 EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict", "restrictions",
-    "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory", "addmessage",
+    "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
     "btransfer", "unbtransfer", "setrules",
 } | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
@@ -12272,7 +12547,8 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("notificationoff", notificationoff_command))
     app.add_handler(CommandHandler("notificationon", notificationon_command))
     app.add_handler(CommandHandler("notificationhistory", notification_history_command))
-    app.add_handler(CommandHandler("addmessage", add_message))
+    app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, bc_message), group=102)
     app.add_handler(CommandHandler("btransfer", block_transfer_pair))
     app.add_handler(CommandHandler("unbtransfer", unblock_transfer_pair))
     app.add_handler(CommandHandler("clearspawn", clearspawn))
