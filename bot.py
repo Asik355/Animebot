@@ -2038,7 +2038,7 @@ HELP_MODULES = {
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
              ("/clearspawn", "Clear a stuck active spawn (group only)")])),
-        ("broadcast", "📣 Broadcast", "📣 Broadcast"),                       # opens the broadcast flow (bc:m)
+        ("broadcast", "📣 Broadcast", "📣 Broadcast"),                       # opens the Broadcast / DM menu (bc:h)
         ("scouts", "🔭 Scout Mgmt", _help_page(
             "🔭 Scout Management (Owner & Executive)",
             "Add or remove Scouts, the staff who manage characters.",
@@ -2131,7 +2131,7 @@ def help_grid_keyboard(role, owner_id):
         if key == "autoapprove":
             return f"aa:{owner_id}:hub"
         if key == "broadcast":
-            return "bc:m"
+            return "bc:h"
         return f"help:{owner_id}:{role}:{key}"
     buttons = [_module_button(label, _target(key))
                for key, label, _text in HELP_MODULES[role] if _help_module_visible(key, owner_id)]
@@ -4791,11 +4791,15 @@ def _bc_who(st, long=False):
     return f"{_bc_n(len(names))} selected:\n" + "\n".join(f"   • {n}" for n in names[:10]) + more
 
 def _bc_panel(uid):
-    role = "owner" if is_owner(uid) else "executive"
     text = ("<b>📣 Broadcast</b>\n\nSend one message to every group the bot is in, or only to the groups you choose."
             + ("\n\n⏳ A broadcast is sending right now." if _bc_job else ""))
     return text, _bc_kb([_bc_btn("✍️ New Broadcast", "bc:new")], [_bc_btn("📜 Last Report", "bc:last")],
-                        [_bc_btn("🔙 Back", f"help:{uid}:{role}")])
+                        [_bc_btn("🔙 Back", "bc:h")])
+
+def _bc_hub(uid):
+    role = "owner" if is_owner(uid) else "executive"
+    rows = [[_bc_btn("📣 Broadcast", "bc:m")]] + ([[_bc_btn("💬 DM", "dm:m")]] if is_owner(uid) else [])
+    return "<b>📣 Broadcast & DM</b>\n\nChoose what you want to do.", _bc_kb(*rows, [_bc_btn("🔙 Back", f"help:{uid}:{role}")])
 
 def _bc_screen(st):
     """(text, keyboard) for the step the broadcast is on."""
@@ -4970,6 +4974,10 @@ async def bc_callback(update, context):
     if act == "noop":
         await q.answer()
         return
+    if act == "h":
+        await q.answer()
+        await show(*_bc_hub(uid))
+        return
     if act == "m":
         await q.answer()
         await show(*_bc_panel(uid))
@@ -5081,6 +5089,188 @@ async def bc_message(update, context):
         st["snap"] = None
     await _bc_render(context, user.id)
 
+
+# ---------------------------------------------------------------------------
+# DM (/help -> 📣 Broadcast -> 💬 DM, Owner only): message one user through the bot and read the whole chat.
+# Their replies come to the owner with a ✍️ Reply button. Everything is saved in the dm_log collection.
+# A user can only be messaged after they pressed Start in the bot (Telegram rule).
+# ---------------------------------------------------------------------------
+DM_COLL, DM_WINDOW, DM_PAGE = "dm_log", 24 * 3600, 10   # replies are forwarded for 24 h after your last message
+_dm_state = {}   # owner id -> {"step": "id" | "hist" | "msg", "to": user id}
+_DM_LABELS = {"photo": "📷 photo", "video": "🎬 video", "animation": "🎞 gif", "document": "📄 file", "audio": "🎵 audio",
+              "voice": "🎤 voice", "video_note": "⏺ video note", "sticker": "🏷 sticker", "poll": "📊 poll"}
+
+def _dm_kind(msg):
+    return next((k for k in _DM_LABELS if getattr(msg, k, None)), "text")
+
+async def _dm_name(uid):
+    try:
+        row = (await asyncio.to_thread(mongo_db.get_users_by_ids, [uid]) or {}).get(uid) or ("", "", "")
+    except Exception:
+        row = ("", "", "")
+    return " ".join(p for p in row[:2] if p).strip() or f"User {uid}"
+
+async def _dm_recent(app):
+    """{user id: time of the owner's last message to them}. Loaded from the database once, then kept in memory."""
+    if "dm_recent" not in app.bot_data:
+        since = int(time.time()) - DM_WINDOW
+        try:
+            rows = await asyncio.to_thread(lambda: list(_mc(DM_COLL).aggregate(
+                [{"$match": {"out": True, "t": {"$gte": since}}}, {"$group": {"_id": "$uid", "t": {"$max": "$t"}}}])))
+            app.bot_data["dm_recent"] = {r["_id"]: r["t"] for r in rows}
+        except Exception as e:
+            print("DM recent load error:", e)
+            app.bot_data["dm_recent"] = {}
+    return app.bot_data["dm_recent"]
+
+async def _dm_log(uid, out, kind, text):
+    try:
+        await asyncio.to_thread(_mc(DM_COLL).insert_one,
+                                {"uid": uid, "out": out, "kind": kind, "text": text[:500], "t": int(time.time())})
+    except Exception as e:
+        print("DM log error:", e)
+
+async def _dm_send(context, uid, src=None, text=None):
+    """Send a copy of message `src` (or plain `text`) to the user. False if they never started the bot or blocked it."""
+    try:
+        if src is not None:
+            await context.bot.copy_message(uid, src.chat_id, src.message_id)
+        else:
+            await context.bot.send_message(uid, text)
+    except TelegramError:
+        return False
+    await _dm_log(uid, True, _dm_kind(src) if src is not None else "text",
+                  ((src.text or src.caption or "") if src is not None else text).strip())
+    (await _dm_recent(context.application))[uid] = time.time()
+    return True
+
+async def _dm_result(context, uid, src=None, text=None):
+    name = html_escape(await _dm_name(uid))
+    if await _dm_send(context, uid, src, text):
+        return f"✅ Sent to <b>{name}</b>."
+    return f"❌ Couldn't send to <b>{name}</b>. They haven't pressed Start in the bot, or they blocked it."
+
+async def _dm_history(uid, page):
+    """(text, keyboard) with the chat, newest page first (10 messages per page, oldest at the top of each page)."""
+    rows = await asyncio.to_thread(lambda: list(
+        _mc(DM_COLL).find({"uid": uid}).sort("t", -1).skip(page * DM_PAGE).limit(DM_PAGE + 1)))
+    more, rows = len(rows) > DM_PAGE, rows[:DM_PAGE][::-1]
+    name = html_escape(await _dm_name(uid))
+    if rows:
+        lines = []
+        for r in rows:
+            body = html_escape((r.get("text") or "")[:150])
+            if r.get("kind", "text") != "text":
+                body = (_DM_LABELS.get(r["kind"], r["kind"]) + " " + body).strip()
+            lines.append(f"🕒 {datetime.fromtimestamp(r['t'], IST).strftime('%d %b, %I:%M %p')}\n"
+                         f"<b>{'You' if r['out'] else name}:</b> {body}")
+        text = f"<b>📜 Chat with {name}</b> (<code>{uid}</code>)\n\n" + "\n\n".join(lines)
+    else:
+        text = f"📜 No messages with <b>{name}</b> yet."
+    nav = ([_bc_btn("◀ Older", f"dm:h:{uid}:{page + 1}")] if more else []) + \
+          ([_bc_btn("Newer ▶", f"dm:h:{uid}:{page - 1}")] if page else [])
+    return text, _bc_kb(*([nav] if nav else []), [_bc_btn("✍️ Reply", f"dm:r:{uid}"), _bc_btn("🔙 Back", "dm:m")])
+
+def _dm_panel():
+    return ("<b>💬 DM</b>\n\nMessage one person through the bot and read the whole chat with them.",
+            _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:hist")], [_bc_btn("🔙 Back", "bc:h")]))
+
+async def dm_command(update, context):
+    """/dm <user_id> <message>   or reply to a message with /dm <user_id>"""
+    msg = update.effective_message
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(msg, UNAUTHORIZED_TEXT)
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /dm can only be used in the bot's PM.")
+        return
+    text = " ".join(context.args[1:]).strip()
+    src = msg.reply_to_message
+    if not context.args or not context.args[0].lstrip("-").isdigit() or not (src or text):
+        await safe_reply_text(msg, "Usage:\n/dm <user_id> <message>\nOr reply to a message with /dm <user_id>")
+        return
+    await safe_reply_text(msg, await _dm_result(context, int(context.args[0]), src if not text else None, text), parse_mode="HTML")
+
+async def dmhistory_command(update, context):
+    msg = update.effective_message
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(msg, UNAUTHORIZED_TEXT)
+        return
+    if update.effective_chat.type != "private" or not context.args or not context.args[0].lstrip("-").isdigit():
+        await safe_reply_text(msg, "Usage in the bot's PM: /dmhistory <user_id>")
+        return
+    text, markup = await _dm_history(int(context.args[0]), 0)
+    await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+
+async def dm_callback(update, context):
+    q, uid = update.callback_query, update.callback_query.from_user.id
+    if not is_owner(uid):
+        await q.answer(UNAUTHORIZED_TEXT, show_alert=True)
+        return
+    if q.message is None or q.message.chat.type != "private":
+        await q.answer("Open me in a private chat to use DM.", show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    act, a, b = parts[1] if len(parts) > 1 else "m", parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "0"
+
+    async def show(text, markup):
+        try:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=markup)
+        except TelegramError:
+            pass
+
+    cancel = _bc_kb([_bc_btn("❌ Cancel", "dm:x")])
+    await q.answer()
+    if act in ("m", "x"):
+        _dm_state.pop(uid, None)
+        await show(*_dm_panel())
+    elif act in ("new", "hist"):
+        _dm_state[uid] = {"step": "id" if act == "new" else "hist"}
+        await show("<b>💬 DM</b>\n\nSend the user ID of the person" + (" you want to message." if act == "new" else
+                   " whose chat you want to see."), cancel)
+    elif act == "r" and a.lstrip("-").isdigit():
+        _dm_state[uid] = {"step": "msg", "to": int(a)}
+        await context.bot.send_message(q.message.chat.id, f"✍️ Send your message for <b>{html_escape(await _dm_name(int(a)))}</b>. "
+                                       "Text, photo, video or a file all work.", parse_mode="HTML", reply_markup=cancel)
+    elif act == "h" and a.lstrip("-").isdigit() and b.isdigit():
+        await show(*await _dm_history(int(a), int(b)))
+
+async def dm_message(update, context):
+    """The owner's next message in a DM step, or a user's reply to the bot (forwarded to the owner)."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    text = (msg.text or msg.caption or "").strip()
+    if is_owner(user.id):
+        st = _dm_state.get(user.id)
+        if not st:
+            return
+        if st["step"] == "msg":
+            _dm_state.pop(user.id, None)
+            await safe_reply_text(msg, await _dm_result(context, st["to"], msg), parse_mode="HTML")
+        elif not (msg.text or "").strip().lstrip("-").isdigit():
+            await safe_reply_text(msg, "⚠️ Please send the numeric user ID.")
+        elif st["step"] == "hist":
+            _dm_state.pop(user.id, None)
+            out, markup = await _dm_history(int(msg.text), 0)
+            await msg.reply_text(out, parse_mode="HTML", reply_markup=markup)
+        else:
+            st.update(step="msg", to=int(msg.text))
+            await safe_reply_text(msg, f"✍️ Send your message for <b>{html_escape(await _dm_name(st['to']))}</b>.",
+                                  parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "dm:x")]))
+        return
+    if not ADMIN_IDS or time.time() - (await _dm_recent(context.application)).get(user.id, 0) > DM_WINDOW:
+        return                                  # only people the owner messaged in the last 24 h are forwarded
+    kind = _dm_kind(msg)
+    await _dm_log(user.id, False, kind, text)
+    who = html_escape(await _dm_name(user.id))
+    head = (f"💬 <b>Reply from {who}</b>\n🆔 <code>{user.id}</code> | "
+            f"{'@' + html_escape(user.username) if user.username else 'no username'}\n\n")
+    await context.bot.send_message(ADMIN_IDS[0], (head + (html_escape(text) if kind == "text" else _DM_LABELS[kind]))[:4000],
+                                   parse_mode="HTML", reply_markup=_bc_kb(
+                                       [_bc_btn("✍️ Reply", f"dm:r:{user.id}"), _bc_btn("📜 History", f"dm:h:{user.id}:0")]))
+    if kind != "text":
+        await context.bot.copy_message(ADMIN_IDS[0], msg.chat_id, msg.message_id)
 
 async def send_character_check_result(bot, chat_id, character, source_message=None):
     code, name, anime, rarity, worth, photo = character
@@ -11747,6 +11937,8 @@ COMMANDS = {
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
     "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
+    "dm": "Owner: message one user through the bot (/dm <user_id> <message>, PM only)",
+    "dmhistory": "Owner: read your chat with a user (/dmhistory <user_id>, PM only)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -12548,6 +12740,10 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("notificationon", notificationon_command))
     app.add_handler(CommandHandler("notificationhistory", notification_history_command))
     app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(dm_callback, pattern=r"^dm:"))
+    app.add_handler(CommandHandler("dm", dm_command))
+    app.add_handler(CommandHandler("dmhistory", dmhistory_command))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, dm_message), group=103)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, bc_message), group=102)
     app.add_handler(CommandHandler("btransfer", block_transfer_pair))
     app.add_handler(CommandHandler("unbtransfer", unblock_transfer_pair))
@@ -12593,7 +12789,7 @@ OWNER_COMMANDS = {
     "delevo", "callcharacter", "clearspawn", "gift", "delete", "discontinue", "continue",
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
-    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton",
+    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton", "dm", "dmhistory",
     "status", "gstats", "cooldown", "cd", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
