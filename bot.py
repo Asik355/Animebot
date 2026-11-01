@@ -10991,13 +10991,27 @@ async def _prepare_log_entry(update, context):
             "needs_confirmation": needs_confirmation, "cfg": cfg, "chat_id": chat.id}
 
 
+LOG_PROMPT_TTL = 600            # an unanswered "upload this log?" prompt expires after 10 minutes
+_LOG_PROMPT_TASKS = set()
+
+
+async def _expire_log_prompt(bot, token, user_id, message_id):
+    """After 10 minutes: if the prompt is still unanswered, discard it and remove the message."""
+    await asyncio.sleep(LOG_PROMPT_TTL)
+    try:
+        if await asyncio.to_thread(mongo_db.pop_log_prompt, token, user_id) is not None:
+            await bot.delete_message(user_id, message_id)
+    except Exception as e:
+        print("Log prompt expiry error:", e)
+
+
 async def _send_log_prompt(context, user_id, text, category, command, chat_id):
     """Send the Owner the Yes/No prompt (pending approval is stored in MongoDB, so it survives restarts)."""
     token = str(uuid.uuid4())
     await asyncio.to_thread(
         mongo_db.create_log_prompt, token, user_id,
         {"text": text, "category": category, "command": command, "chat_id": chat_id})
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id=user_id,
         text="📝 Do you want to upload this action log to the log channel?\n\n" + text,
         reply_markup=InlineKeyboardMarkup([[
@@ -11005,6 +11019,9 @@ async def _send_log_prompt(context, user_id, text, category, command, chat_id):
             InlineKeyboardButton("❌ No", callback_data=f"lg:n:{token}"),
         ]]),
     )
+    task = asyncio.create_task(_expire_log_prompt(context.bot, token, user_id, sent.message_id))
+    _LOG_PROMPT_TASKS.add(task)
+    task.add_done_callback(_LOG_PROMPT_TASKS.discard)
 
 
 def _purge_pending_conv(app):
@@ -11117,6 +11134,16 @@ async def log_prompt_callback(update, context):
         except Exception:
             pass
         return
+    created = doc.get("created_at")
+    if created is not None:                          # tapped after 10 minutes (e.g. the bot restarted meanwhile): expired
+        created = created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - created).total_seconds() > LOG_PROMPT_TTL:
+            await query.answer(PROMPT_EXPIRED, show_alert=True)
+            try:
+                await query.message.delete()
+            except Exception:
+                pass
+            return
     text = (doc.get("action_data") or {}).get("text", "")
     if choice == "n":
         # Discard entirely: nothing goes to the log channel, no notification, and no record is kept
@@ -11146,7 +11173,7 @@ async def log_prompt_callback(update, context):
     enqueue_log_routed(context.application, cfg, text, data.get("command"), data.get("category"))
     await query.answer("Logged.")
     try:
-        await query.edit_message_text("✅ Confirmed — action log queued for the log channel.\n\n" + text)
+        await query.message.delete()                 # no confirmation message is left behind
     except Exception:
         pass
 
