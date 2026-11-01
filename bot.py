@@ -54,6 +54,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputMediaPhoto,
+    MessageEntity,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -749,7 +750,7 @@ async def auto_approve_group(context, chat, added_by=None):
         owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
         if owner_id:
             try:
-                who = html_escape(display_user(added_by)) if added_by else "Unknown"
+                who = code_ids_html(html_escape(display_user(added_by))) if added_by else "Unknown"
                 members = f"👥 Members: {count}\n" if count is not None else ""
                 group_link = await get_group_link(context.bot, context.application, cid, chat)
                 await context.bot.send_message(
@@ -1476,7 +1477,7 @@ async def track_bot_membership(update, context):
                             "🔔 New Group Approval Request\n"
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
                             f"🆔 Group ID: {group_id_html(chat.id)}\n"
-                            f"👤 Requested by: {html_escape(added_by_text)}\n"
+                            f"👤 Requested by: {code_ids_html(html_escape(added_by_text))}\n"
                             + (f"{html_escape(aa_note)}\n" if aa_note else "") +
                             ("" if group_link else f"\n{html_escape(GROUP_NO_LINK_NOTE)}\n") +
                             f"\nApprove with: <code>/approve {html_escape(str(chat.id))}</code>"
@@ -1509,7 +1510,8 @@ async def track_bot_membership(update, context):
                 if owner_id:
                     try:
                         group_link = await get_group_link(context.bot, context.application, chat.id, chat, allow_fetch=False)
-                        await context.bot.send_message(chat_id=owner_id, text=notice, reply_markup=open_group_markup(group_link))
+                        await context.bot.send_message(chat_id=owner_id, text=notice, entities=copyable_ids(notice),
+                                                       reply_markup=open_group_markup(group_link))
                     except Exception as e:
                         print("Owner bot-removed notification error:", e)
                 cfg = await get_log_config()
@@ -1835,6 +1837,7 @@ def _build_help_text_raw():
         "/start — Register / start the bot\n"
         "/help — Show this command list\n"
         "/mycollection — View your collection\n"
+        "/see <user_id or @username> — View another user's collection (hidden if they turned Privacy ON)\n"
         "/myfav <code/name> — Set or change favourite character\n"
         "/mystats — View your stats and collection progress\n"
         "/characters — List all characters by rarity\n"
@@ -2207,6 +2210,18 @@ def india_timestamp():
 def india_today_key():
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(timezone.utc).astimezone(ist).date().isoformat()
+
+# User IDs (after "ID: ") and group IDs ("(-100…)") become tap-to-copy in plain-text messages.
+_COPY_ID_RE = re.compile(r"(?<=ID: )-?\d{5,}|(?<=\()-100\d{5,}(?=\))")
+
+def copyable_ids(text):
+    """'code' entities for the IDs in `text`, to pass as entities=/caption_entities= (no parse_mode needed)."""
+    return [MessageEntity(MessageEntity.CODE, len(text[:m.start()].encode("utf-16-le")) // 2,
+                          len(m.group().encode("utf-16-le")) // 2) for m in _COPY_ID_RE.finditer(text)]
+
+def code_ids_html(escaped_text):
+    """The same for HTML messages: wrap each user ID in <code>."""
+    return re.sub(r"(?<=ID: )-?\d{5,}", lambda m: f"<code>{m.group()}</code>", escaped_text)
 
 def display_user(user):
     username = f"@{user.username}" if user.username else "No username"
@@ -3933,39 +3948,50 @@ def _parse_coll_mode(value):
     return action, (tier if tier in COLLECTION_TIERS else None)
 
 
-def collection_tier_keyboard(user_id):
+def collection_tier_keyboard(user_id, prefix="coll"):
     """The tier menu shown after tapping 🔹 Tier: one tier per row, then Back to the full collection."""
-    rows = [[InlineKeyboardButton(rarity_text(r), callback_data=f"coll:{user_id}:tier~{r}:0")] for r in COLLECTION_TIERS]
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"coll:{user_id}:tier:0")])
+    rows = [[InlineKeyboardButton(rarity_text(r), callback_data=f"{prefix}:{user_id}:tier~{r}:0")] for r in COLLECTION_TIERS]
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{prefix}:{user_id}:tier:0")])
     return InlineKeyboardMarkup(rows)
 
 
-def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity=None):
+def _coll_private(user_id):
+    """True when the user turned 🔒 Privacy ON (only the bot owner can then see their collection with /see)."""
+    doc = _mc(mongo_db.USERS).find_one({"_id": int(user_id)}, {"collection_private": 1}) or {}
+    return bool(doc.get("collection_private"))
+
+
+def collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity=None, viewer=False, private=False):
+    """viewer=True is the read-only /see version: paging and sorting only (no Sell, Favourite or Privacy)."""
+    p = "cv" if viewer else "coll"
     suffix = f"~{rarity}" if rarity else ""          # the tier filter travels inside the button data
     buttons = []
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"coll:{user_id}:{sort_mode}{suffix}:{page-1}"))
-    nav.append(InlineKeyboardButton(f"📖 {page+1}/{total_pages}", callback_data=f"coll:{user_id}:nochange:0"))
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"{p}:{user_id}:{sort_mode}{suffix}:{page-1}"))
+    nav.append(InlineKeyboardButton(f"📖 {page+1}/{total_pages}", callback_data=f"{p}:{user_id}:nochange:0"))
     if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"coll:{user_id}:{sort_mode}{suffix}:{page+1}"))
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"{p}:{user_id}:{sort_mode}{suffix}:{page+1}"))
     buttons.append(nav)
 
     buttons.append([
-        InlineKeyboardButton("🔹 Tier", callback_data=f"coll:{user_id}:tiermenu:0"),
-        InlineKeyboardButton("🔤 Name", callback_data=f"coll:{user_id}:name{suffix}:0"),
+        InlineKeyboardButton("🔹 Tier", callback_data=f"{p}:{user_id}:tiermenu:0"),
+        InlineKeyboardButton("🔤 Name", callback_data=f"{p}:{user_id}:name{suffix}:0"),
     ])
-    buttons.append([
-        InlineKeyboardButton("🔢 Quantity", callback_data=f"coll:{user_id}:qty{suffix}:0"),
-        InlineKeyboardButton("🕒 Recent", callback_data=f"coll:{user_id}:time{suffix}:0"),
-    ])
+    last = [InlineKeyboardButton("🔢 Quantity", callback_data=f"{p}:{user_id}:qty{suffix}:0")]
+    if not viewer:
+        last.append(InlineKeyboardButton("🔒 Privacy: ON" if private else "🔓 Privacy: OFF",
+                                         callback_data=f"coll:{user_id}:privacy:0"))
+    buttons.append(last)
+    if viewer:
+        return InlineKeyboardMarkup(buttons)
 
     if favorite_code:
         buttons.append([
-            InlineKeyboardButton("⭐ Favourite", callback_data=f"coll:{user_id}:nochange:0"),
-            InlineKeyboardButton("❌ Clear Favourite", callback_data=f"coll:{user_id}:clearfav{suffix}:0"),
+            InlineKeyboardButton("⭐ Favourite", callback_data=f"{p}:{user_id}:nochange:0"),
+            InlineKeyboardButton("❌ Clear Favourite", callback_data=f"{p}:{user_id}:clearfav{suffix}:0"),
         ])
-    buttons.append([InlineKeyboardButton("💰 Sell", callback_data=f"coll:{user_id}:sell:0")])
+    buttons.append([InlineKeyboardButton("💰 Sell", callback_data=f"{p}:{user_id}:sell:0")])
     return InlineKeyboardMarkup(buttons)
 
 def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name="Player", tier_filter=None):
@@ -4001,7 +4027,8 @@ def build_collection_text(rows, page, per_page, sort_mode, favorite_code, total_
             text += f"\n⭐ Favourite: {fav[1]} [{fav[0]}]"
     return text, total_pages, page
 
-async def send_collection(update_or_query, context, user_id, page=0, sort_mode="tier", edit=False, owner_name=None, rarity=None):
+async def send_collection(update_or_query, context, user_id, page=0, sort_mode="tier", edit=False, owner_name=None, rarity=None,
+                          viewer=False):
     rows = await get_collection_rows(user_id, sort_mode, rarity)
     if not rows and rarity:      # the last copy of that tier was sold/moved meanwhile: fall back to the full collection
         rarity = None
@@ -4012,7 +4039,8 @@ async def send_collection(update_or_query, context, user_id, page=0, sort_mode="
     if sender_message is None and hasattr(update_or_query, "message"):
         sender_message = update_or_query.message
     if not rows:
-        message = add_display_name_header(sender_message, "📚 Your collection is empty. Catch a character with /spawn then use /add.")
+        message = (f"📭 {html_escape(owner_name or 'This user')} has no characters yet." if viewer else
+                   add_display_name_header(sender_message, "📚 Your collection is empty. Catch a character with /spawn then use /add."))
         if edit:
             await update_or_query.edit_message_text(message)
         else:
@@ -4033,7 +4061,8 @@ async def send_collection(update_or_query, context, user_id, page=0, sort_mode="
         rows, page, per_page, sort_mode, favorite_code, total_copies, owner_name, rarity
     )
     text = add_display_name_header(sender_message, text)
-    keyboard = collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity)
+    private = False if viewer else await asyncio.to_thread(_coll_private, user_id)
+    keyboard = collection_keyboard(user_id, page, total_pages, sort_mode, favorite_code, rarity, viewer, private)
 
     photo = None
     if favorite_code:
@@ -4226,6 +4255,19 @@ async def collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "nochange":
         await query.answer()
         return
+    if action == "privacy":                          # 🔒 Privacy: flip it and update just that button
+        now_private = not await asyncio.to_thread(_coll_private, user_id)
+        await asyncio.to_thread(_mc(mongo_db.USERS).update_one, {"_id": user_id}, {"$set": {"collection_private": now_private}})
+        await query.answer("🔒 Privacy ON. Only the owner can see your collection." if now_private else
+                           "🔓 Privacy OFF. Anyone can see your collection with /see.", show_alert=True)
+        label = "🔒 Privacy: ON" if now_private else "🔓 Privacy: OFF"
+        rows = [[InlineKeyboardButton(label, callback_data=b.callback_data) if (b.callback_data or "").endswith(":privacy:0") else b
+                 for b in row] for row in query.message.reply_markup.inline_keyboard]
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows))
+        except Exception as e:
+            print("Privacy button update error:", e)
+        return
     if action == "tiermenu":                         # 🔹 Tier: swap the buttons for the tier list (text stays)
         await query.answer()
         try:
@@ -4257,6 +4299,54 @@ async def collection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         query, context, user_id, page, action, edit=True,
         owner_name=query.from_user.first_name or "Player", rarity=rarity
     )
+
+async def see_command(update, context):
+    """/see <user_id or @username>  or reply to someone's message with /see: view their collection (read only)."""
+    msg, viewer = update.effective_message, update.effective_user
+    await save_user_async(viewer)
+    reply = msg.reply_to_message
+    if context.args:
+        uid = await _dm_target(context.args[0])
+    elif reply and reply.from_user:
+        uid = reply.from_user.id
+    else:
+        await safe_reply_text(msg, "Usage: /see <user_id or @username>, or reply to someone's message with /see")
+        return
+    if uid is None:
+        await safe_reply_text(msg, DM_UNKNOWN_TEXT)
+        return
+    if uid != viewer.id and not is_owner(viewer.id) and await asyncio.to_thread(_coll_private, uid):
+        await safe_reply_text(msg, "🔒 This collection is private.")
+        return
+    await send_collection(update, context, uid, 0, "tier", edit=False, owner_name=await _dm_name(uid), viewer=True)
+
+async def collview_callback(update, context):
+    """Buttons of a /see collection: paging and sorting only. Re-checks privacy on every tap."""
+    query, parts = update.callback_query, (update.callback_query.data or "").split(":")
+    if len(parts) != 4 or not parts[1].lstrip("-").isdigit() or not parts[3].isdigit():
+        await query.answer()
+        return
+    owner_id, page, viewer_id = int(parts[1]), int(parts[3]), query.from_user.id
+    if viewer_id != owner_id and not is_owner(viewer_id) and await asyncio.to_thread(_coll_private, owner_id):
+        await query.answer("🔒 This collection is private.", show_alert=True)
+        return
+    action, rarity = _parse_coll_mode(parts[2])
+    if action == "nochange":
+        await query.answer()
+        return
+    if action == "tiermenu":
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=collection_tier_keyboard(owner_id, "cv"))
+        except Exception as e:
+            print("Tier menu error:", e)
+        return
+    if rarity and not await get_collection_rows(owner_id, "tier", rarity):
+        await query.answer(f"❌ No {rarity} characters.", show_alert=True)
+        return
+    await query.answer()
+    await send_collection(query, context, owner_id, page, action if action in COLLECTION_SORTS else "tier", edit=True,
+                          owner_name=await _dm_name(owner_id), rarity=rarity, viewer=True)
 
 async def mystats(update, context):
     (await save_user_async(update.effective_user))
@@ -5110,6 +5200,21 @@ async def _dm_name(uid):
         row = ("", "", "")
     return " ".join(p for p in row[:2] if p).strip() or f"User {uid}"
 
+DM_UNKNOWN_TEXT = ("⚠️ I couldn't find that user. Send a numeric user ID, or the @username of someone who has used "
+                   "the bot before.")
+
+async def _dm_target(text):
+    """User ID from '123456' or '@username'. A username must belong to exactly one person who used the bot."""
+    text = (text or "").strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    name = text.lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,32}", name):
+        return None
+    rows = await asyncio.to_thread(lambda: list(mongo_db.col(mongo_db.USERS).find(
+        {"username": {"$regex": f"^{name}$", "$options": "i"}}, {"_id": 1}).limit(2)))
+    return rows[0]["_id"] if len(rows) == 1 else None
+
 async def _dm_recent(app):
     """{user id: time of the owner's last message to them}. Loaded from the database once, then kept in memory."""
     if "dm_recent" not in app.bot_data:
@@ -5176,7 +5281,7 @@ def _dm_panel():
             _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:hist")], [_bc_btn("🔙 Back", "bc:h")]))
 
 async def dm_command(update, context):
-    """/dm <user_id> <message>   or reply to a message with /dm <user_id>"""
+    """/dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
     msg = update.effective_message
     if not is_owner(update.effective_user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
@@ -5186,20 +5291,28 @@ async def dm_command(update, context):
         return
     text = " ".join(context.args[1:]).strip()
     src = msg.reply_to_message
-    if not context.args or not context.args[0].lstrip("-").isdigit() or not (src or text):
-        await safe_reply_text(msg, "Usage:\n/dm <user_id> <message>\nOr reply to a message with /dm <user_id>")
+    if not context.args or not (src or text):
+        await safe_reply_text(msg, "Usage:\n/dm <user_id or @username> <message>\nOr reply to a message with /dm <user_id or @username>")
         return
-    await safe_reply_text(msg, await _dm_result(context, int(context.args[0]), src if not text else None, text), parse_mode="HTML")
+    uid = await _dm_target(context.args[0])
+    if uid is None:
+        await safe_reply_text(msg, DM_UNKNOWN_TEXT)
+        return
+    await safe_reply_text(msg, await _dm_result(context, uid, src if not text else None, text), parse_mode="HTML")
 
 async def dmhistory_command(update, context):
     msg = update.effective_message
     if not is_owner(update.effective_user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
         return
-    if update.effective_chat.type != "private" or not context.args or not context.args[0].lstrip("-").isdigit():
-        await safe_reply_text(msg, "Usage in the bot's PM: /dmhistory <user_id>")
+    if update.effective_chat.type != "private" or not context.args:
+        await safe_reply_text(msg, "Usage in the bot's PM: /dmhistory <user_id or @username>")
         return
-    text, markup = await _dm_history(int(context.args[0]), 0)
+    uid = await _dm_target(context.args[0])
+    if uid is None:
+        await safe_reply_text(msg, DM_UNKNOWN_TEXT)
+        return
+    text, markup = await _dm_history(uid, 0)
     await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 async def dm_callback(update, context):
@@ -5226,7 +5339,7 @@ async def dm_callback(update, context):
         await show(*_dm_panel())
     elif act in ("new", "hist"):
         _dm_state[uid] = {"step": "id" if act == "new" else "hist"}
-        await show("<b>💬 DM</b>\n\nSend the user ID of the person" + (" you want to message." if act == "new" else
+        await show("<b>💬 DM</b>\n\nSend the user ID or @username of the person" + (" you want to message." if act == "new" else
                    " whose chat you want to see."), cancel)
     elif act == "r" and a.lstrip("-").isdigit():
         _dm_state[uid] = {"step": "msg", "to": int(a)}
@@ -5248,14 +5361,14 @@ async def dm_message(update, context):
         if st["step"] == "msg":
             _dm_state.pop(user.id, None)
             await safe_reply_text(msg, await _dm_result(context, st["to"], msg), parse_mode="HTML")
-        elif not (msg.text or "").strip().lstrip("-").isdigit():
-            await safe_reply_text(msg, "⚠️ Please send the numeric user ID.")
+        elif (target := await _dm_target(msg.text)) is None:
+            await safe_reply_text(msg, DM_UNKNOWN_TEXT)
         elif st["step"] == "hist":
             _dm_state.pop(user.id, None)
-            out, markup = await _dm_history(int(msg.text), 0)
+            out, markup = await _dm_history(target, 0)
             await msg.reply_text(out, parse_mode="HTML", reply_markup=markup)
         else:
-            st.update(step="msg", to=int(msg.text))
+            st.update(step="msg", to=target)
             await safe_reply_text(msg, f"✍️ Send your message for <b>{html_escape(await _dm_name(st['to']))}</b>.",
                                   parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "dm:x")]))
         return
@@ -7165,7 +7278,8 @@ async def _notify_owner_possible_deleted(app, uid, signal, strikes, token):
         "Nothing has been deleted. Choose what to do with this user's data:"
     )
     try:
-        await app.bot.send_message(chat_id=owner_id, text=text, reply_markup=_deleted_review_keyboard(uid, token))
+        await app.bot.send_message(chat_id=owner_id, text=text, entities=copyable_ids(text),
+                                   reply_markup=_deleted_review_keyboard(uid, token))
         return True
     except Exception as e:
         print(f"Possible-deleted-account notification error for {uid}:", e)
@@ -9004,7 +9118,8 @@ async def notify_admins(context, text, photo_file_id=None):
             if photo_file_id:
                 if len(text) <= 1024:
                     await asyncio.wait_for(
-                        context.bot.send_photo(chat_id=staff_id, photo=photo_file_id, caption=text),
+                        context.bot.send_photo(chat_id=staff_id, photo=photo_file_id, caption=text,
+                                               caption_entities=copyable_ids(text)),
                         timeout=15,
                     )
                 else:
@@ -9017,11 +9132,11 @@ async def notify_admins(context, text, photo_file_id=None):
                         timeout=15,
                     )
                     await asyncio.wait_for(
-                        context.bot.send_message(chat_id=staff_id, text=text), timeout=15
+                        context.bot.send_message(chat_id=staff_id, text=text, entities=copyable_ids(text)), timeout=15
                     )
             else:
                 await asyncio.wait_for(
-                    context.bot.send_message(chat_id=staff_id, text=text), timeout=15
+                    context.bot.send_message(chat_id=staff_id, text=text, entities=copyable_ids(text)), timeout=15
                 )
             delivered += 1
             print(f"Staff notification delivered to {staff_id}")
@@ -10768,7 +10883,7 @@ async def _post_to_log_channel(app, chat_id, text):
     """Send one message to the log channel, honouring Telegram flood control. True when delivered."""
     for _attempt in range(LOG_SEND_ATTEMPTS):
         try:
-            await app.bot.send_message(chat_id=chat_id, text=text[:4096])
+            await app.bot.send_message(chat_id=chat_id, text=text[:4096], entities=copyable_ids(text[:4096]))
             return True
         except RetryAfter as e:
             delay = getattr(e, "retry_after", 5)
@@ -11872,6 +11987,7 @@ COMMANDS = {
     "spawn": "Spawn a character (group only)",
     "add": "Catch the spawned character (group only)",
     "mycollection": "View your collection",
+    "see": "View another user's collection (/see <user_id or @username>)",
     "removechar": "Remove a character from any user collection",
     "myfav": "Set favourite character",
     "mystats": "View your stats",
@@ -11937,8 +12053,8 @@ COMMANDS = {
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
     "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
-    "dm": "Owner: message one user through the bot (/dm <user_id> <message>, PM only)",
-    "dmhistory": "Owner: read your chat with a user (/dmhistory <user_id>, PM only)",
+    "dm": "Owner: message one user through the bot (/dm <user_id or @username> <message>, PM only)",
+    "dmhistory": "Owner: read your chat with a user (/dmhistory <user_id or @username>, PM only)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -11974,7 +12090,7 @@ COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 
 PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
-    "start", "help", "spawn", "add", "mycollection", "myfav", "mystats", "addlist",
+    "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
@@ -13031,6 +13147,7 @@ def main():
         ("spawn", spawn),
         ("add", add),
         ("mycollection", mycollection),
+        ("see", see_command),
         ("myfav", myfav),
         ("mystats", mystats),
         ("addlist", addlist),
@@ -13185,6 +13302,7 @@ def main():
     app.add_handler(CommandHandler("skip", skip_conversation))
 
     app.add_handler(CallbackQueryHandler(collection_callback, pattern=r"^coll:"))
+    app.add_handler(CallbackQueryHandler(collview_callback, pattern=r"^cv:"))
     app.add_handler(CallbackQueryHandler(shop_callback, pattern=r"^shop:"))
 
     print("✅ Anime Character Bot is running...")
