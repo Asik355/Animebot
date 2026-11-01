@@ -1287,7 +1287,7 @@ async def get_group_link(bot, app, chat_id, chat=None, allow_fetch=True):
         return None
 
 
-GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot must be an admin with the 'Invite users' right to share one. "
+GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot must be an admin with the 'Add users' right to share one. "
                       "No characters spawn in this group until the bot is an admin.")
 
 # Characters spawn only in groups where the bot is an admin. Set to False to turn this rule off.
@@ -1370,7 +1370,7 @@ async def group_link_callback(update, context):
         return
     link = await get_group_link(context.bot, context.application, cid)
     if not link:
-        await query.answer("Still no link. Make the bot an admin with the 'Invite users' right, then tap again.",
+        await query.answer("Still no link. Make the bot an admin with the 'Add users' right, then tap again.",
                            show_alert=True)
         return
     await query.answer("Link ready.")
@@ -1836,6 +1836,7 @@ def _build_help_text_raw():
         "👤 Profile & Collection\n"
         "/start — Register / start the bot\n"
         "/help — Show this command list\n"
+        "/message — Send a message to the bot staff (private chat)\n"
         "/mycollection — View your collection\n"
         "/see <user_id or @username> — View another user's collection (hidden if they turned Privacy ON)\n"
         "/myfav <code/name> — Set or change favourite character\n"
@@ -5221,7 +5222,7 @@ async def _dm_recent(app):
         since = int(time.time()) - DM_WINDOW
         try:
             rows = await asyncio.to_thread(lambda: list(_mc(DM_COLL).aggregate(
-                [{"$match": {"out": True, "t": {"$gte": since}}}, {"$group": {"_id": "$uid", "t": {"$max": "$t"}}}])))
+                [{"$match": {"t": {"$gte": since}}}, {"$group": {"_id": "$uid", "t": {"$max": "$t"}}}])))
             app.bot_data["dm_recent"] = {r["_id"]: r["t"] for r in rows}
         except Exception as e:
             print("DM recent load error:", e)
@@ -5349,7 +5350,7 @@ async def dm_callback(update, context):
         await show(*await _dm_history(int(a), int(b)))
 
 async def dm_message(update, context):
-    """The owner's next message in a DM step, or a user's reply to the bot (forwarded to the owner)."""
+    """The owner's next message in a DM step, or a user's message to the bot staff (forwarded to the owner)."""
     msg, user = update.effective_message, update.effective_user
     if not msg or not user:
         return
@@ -5372,18 +5373,72 @@ async def dm_message(update, context):
             await safe_reply_text(msg, f"✍️ Send your message for <b>{html_escape(await _dm_name(st['to']))}</b>.",
                                   parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "dm:x")]))
         return
-    if not ADMIN_IDS or time.time() - (await _dm_recent(context.application)).get(user.id, 0) > DM_WINDOW:
-        return                                  # only people the owner messaged in the last 24 h are forwarded
-    kind = _dm_kind(msg)
+    if (waiting := _msg_wait.pop(user.id, None)) is not None and time.monotonic() - waiting < MSG_WAIT:   # after /message
+        if await _dm_forward(context, msg, user, "📩 Message from"):
+            (await _dm_recent(context.application))[user.id] = time.time()
+            await safe_reply_text(msg, "✅ Sent to the bot staff. You can keep writing here for the next 24 hours.")
+        else:
+            await safe_reply_text(msg, "❌ Couldn't deliver your message right now. Please try again later.")
+        return
+    if ADMIN_IDS and time.time() - (await _dm_recent(context.application)).get(user.id, 0) <= DM_WINDOW:
+        await _dm_forward(context, msg, user, "💬 Reply from")      # only people already chatting with the bot staff
+
+async def _dm_forward(context, msg, user, title, text=None):
+    """Send a user's message to the owner with ✍️ Reply / 📜 History buttons. True when it was delivered."""
+    text = (text if text is not None else (msg.text or msg.caption or "")).strip()
+    kind = "text" if text and not msg else _dm_kind(msg)
     await _dm_log(user.id, False, kind, text)
     who = html_escape(await _dm_name(user.id))
-    head = (f"💬 <b>Reply from {who}</b>\n🆔 <code>{user.id}</code> | "
+    head = (f"{title} <b>{who}</b>\n🆔 <code>{user.id}</code> | "
             f"{'@' + html_escape(user.username) if user.username else 'no username'}\n\n")
-    await context.bot.send_message(ADMIN_IDS[0], (head + (html_escape(text) if kind == "text" else _DM_LABELS[kind]))[:4000],
-                                   parse_mode="HTML", reply_markup=_bc_kb(
-                                       [_bc_btn("✍️ Reply", f"dm:r:{user.id}"), _bc_btn("📜 History", f"dm:h:{user.id}:0")]))
-    if kind != "text":
-        await context.bot.copy_message(ADMIN_IDS[0], msg.chat_id, msg.message_id)
+    try:
+        await context.bot.send_message(ADMIN_IDS[0], (head + (html_escape(text) if kind == "text" else _DM_LABELS[kind]))[:4000],
+                                       parse_mode="HTML", reply_markup=_bc_kb(
+                                           [_bc_btn("✍️ Reply", f"dm:r:{user.id}"), _bc_btn("📜 History", f"dm:h:{user.id}:0")]))
+        if kind != "text":
+            await context.bot.copy_message(ADMIN_IDS[0], msg.chat_id, msg.message_id)
+    except TelegramError as e:
+        print("DM forward error:", e)
+        return False
+    return True
+
+MSG_WAIT, MSG_COOLDOWN = 300, 30           # /message waits 5 minutes for the text; one use per user per 30 seconds
+_msg_wait = {}                             # user id -> when they typed /message
+_msg_last = {}                             # user id -> last /message use
+
+async def message_command(update, context):
+    """/message [text]: a user writes to the bot staff. Their next message (or the text after the command) is forwarded."""
+    msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
+    if chat.type != "private":
+        await safe_reply_text(msg, "Please use /message in my private chat.")
+        return
+    if is_owner(user.id) or not ADMIN_IDS:
+        await safe_reply_text(msg, "Use 💬 DM in /help → 📣 Broadcast to message people.")
+        return
+    if time.monotonic() - _msg_last.get(user.id, -999.0) < MSG_COOLDOWN:
+        await safe_reply_text(msg, "⏳ Please wait a few seconds before using /message again.")
+        return
+    _msg_last[user.id] = time.monotonic()
+    text = " ".join(context.args).strip()
+    if text:
+        ok = await _dm_forward(context, None, user, "📩 Message from", text=text)
+        if ok:
+            (await _dm_recent(context.application))[user.id] = time.time()
+        await safe_reply_text(msg, "✅ Sent to the bot staff. You can keep writing here for the next 24 hours." if ok else
+                              "❌ Couldn't deliver your message right now. Please try again later.")
+        return
+    _msg_wait[user.id] = time.monotonic()
+    await safe_reply_text(msg, "✍️ Send your message for the bot staff. Text, photo, video or a file all work.",
+                          reply_markup=_bc_kb([_bc_btn("❌ Cancel", "um:x")]))
+
+async def message_cancel_callback(update, context):
+    query = update.callback_query
+    _msg_wait.pop(query.from_user.id, None)
+    await query.answer("Cancelled.")
+    try:
+        await query.message.delete()
+    except TelegramError:
+        pass
 
 async def send_character_check_result(bot, chat_id, character, source_message=None):
     code, name, anime, rarity, worth, photo = character
@@ -8437,7 +8492,7 @@ GSTATS_JOIN_LINK_TTL = 12 * 3600
 
 async def _gstats_join_link(context, chat_id, info, links):
     """(url, joinable). joinable=True: the link lets a non-member join (public name, the group's invite link, or a link the
-    bot creates when it is an admin with the 'Invite users' right). Otherwise a members-only link (or None)."""
+    bot creates when it is an admin with the 'Add users' right). Otherwise a members-only link (or None)."""
     username = (info.get("username") or "").lstrip("@").strip()
     if username:
         return f"https://t.me/{username}", True
@@ -8479,7 +8534,7 @@ async def _gstats_show_group(update, context, chat_id, page):
             f"🔐 Approval: {'✅ Approved' if approved else '❌ Not Approved'}")
     if not joinable:
         text += ("\n\n⚠️ No join link. The link below opens only for members. "
-                 "To get a join link, make the bot an admin with the “Invite users” right.")
+                 "To get a join link, make the bot an admin with the “Add users” right.")
     rows = []
     if link:
         rows.append([InlineKeyboardButton("🔗 Open Link" if joinable else "🔗 Open (members only)", url=link)])
@@ -12015,6 +12070,7 @@ COMMANDS = {
     "add": "Catch the spawned character (group only)",
     "mycollection": "View your collection",
     "see": "View another user's collection (/see <user_id or @username>)",
+    "message": "Send a message to the bot staff (private chat)",
     "removechar": "Remove a character from any user collection",
     "myfav": "Set favourite character",
     "mystats": "View your stats",
@@ -12117,7 +12173,7 @@ COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 
 PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
-    "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
+    "start", "help", "spawn", "add", "mycollection", "see", "message", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
@@ -12884,6 +12940,7 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("notificationhistory", notification_history_command))
     app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))
     app.add_handler(CallbackQueryHandler(dm_callback, pattern=r"^dm:"))
+    app.add_handler(CallbackQueryHandler(message_cancel_callback, pattern=r"^um:x$"))
     app.add_handler(CommandHandler("dm", dm_command))
     app.add_handler(CommandHandler("dmhistory", dmhistory_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, dm_message), group=103)
@@ -13175,6 +13232,7 @@ def main():
         ("add", add),
         ("mycollection", mycollection),
         ("see", see_command),
+        ("message", message_command),
         ("myfav", myfav),
         ("mystats", mystats),
         ("addlist", addlist),
