@@ -49,6 +49,7 @@ from dotenv import load_dotenv
 from telegram import (
     Update,
     BotCommand,
+    BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     InlineKeyboardButton,
@@ -5282,7 +5283,7 @@ def _dm_panel():
             _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:hist")], [_bc_btn("🔙 Back", "bc:h")]))
 
 async def dm_command(update, context):
-    """/dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
+    """/dm opens the DM menu.  /dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
     msg = update.effective_message
     if not is_owner(update.effective_user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
@@ -5292,6 +5293,10 @@ async def dm_command(update, context):
         return
     text = " ".join(context.args[1:]).strip()
     src = msg.reply_to_message
+    if not context.args and not src:                 # plain /dm: shortcut to the 💬 DM menu
+        text, markup = _dm_panel()
+        await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
+        return
     if not context.args or not (src or text):
         await safe_reply_text(msg, "Usage:\n/dm <user_id or @username> <message>\nOr reply to a message with /dm <user_id or @username>")
         return
@@ -12136,7 +12141,7 @@ COMMANDS = {
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
     "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
-    "dm": "Owner: message one user through the bot (/dm <user_id or @username> <message>, PM only)",
+    "dm": "Owner: open the DM menu, or /dm <user_id or @username> <message> (PM only)",
     "dmhistory": "Owner: read your chat with a user (/dmhistory <user_id or @username>, PM only)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
@@ -12173,12 +12178,14 @@ COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 
 PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
-    "start", "help", "spawn", "add", "mycollection", "see", "message", "myfav", "mystats", "addlist",
+    "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
     "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
     "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about", "dailytask",
 }
+
+PRIVATE_ONLY_COMMANDS = {"message"}      # shown in the command menu of private chats only, never in groups
 
 def make_bot_commands(names):
     return badge_banner.fit_command_menu([BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS])   # Telegram: max 100
@@ -12207,13 +12214,13 @@ async def refresh_command_menu(bot, user_id):
     if is_owner(user_id):
         names = PUBLIC_COMMANDS | OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS
     elif is_executive(user_id):
-        names = PUBLIC_COMMANDS | EXECUTIVE_COMMANDS
+        names = PUBLIC_COMMANDS | EXECUTIVE_COMMANDS | PRIVATE_ONLY_COMMANDS
         if (await asyncio.to_thread(has_group_approval_permission, user_id)):
             names |= {"approve", "removeapprove"}
     elif (await asyncio.to_thread(is_scout, user_id)):
-        names = PUBLIC_COMMANDS | SCOUT_COMMANDS
+        names = PUBLIC_COMMANDS | SCOUT_COMMANDS | PRIVATE_ONLY_COMMANDS
     else:
-        names = PUBLIC_COMMANDS
+        names = PUBLIC_COMMANDS | PRIVATE_ONLY_COMMANDS
     try:
         await bot.set_my_commands(
             make_bot_commands(sorted(names)),
@@ -12396,6 +12403,11 @@ async def startup_init(app):
         )
     except Exception as e:
         print("Default command menu setup error:", e)
+    try:                                              # private chats also get the private-only commands (/message)
+        await app.bot.set_my_commands(make_bot_commands(sorted(PUBLIC_COMMANDS | PRIVATE_ONLY_COMMANDS)),
+                                      scope=BotCommandScopeAllPrivateChats())
+    except Exception as e:
+        print("Private command menu setup error:", e)
 
     async def _refresh_staff_menus():
         try:
@@ -12486,7 +12498,7 @@ def _known_command_names(app):
     cached = app.bot_data.get("_known_command_names")
     if cached is None:
         cached = {str(c).lower() for c in known_commands(app)}
-        cached |= set(PUBLIC_COMMANDS) | set(OWNER_COMMANDS) | set(EXECUTIVE_COMMANDS) | set(SCOUT_COMMANDS)
+        cached |= set(PUBLIC_COMMANDS) | PRIVATE_ONLY_COMMANDS | set(OWNER_COMMANDS) | set(EXECUTIVE_COMMANDS) | set(SCOUT_COMMANDS)
         app.bot_data["_known_command_names"] = cached
     return cached
 
