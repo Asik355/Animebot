@@ -568,9 +568,34 @@ def restriction_notice(expiry, info):
         "Think it's a mistake? Use /appeal"
     )
 
+def restricted_by_label(info):
+    """What the restricted person sees as 'Restricted by': Anonymous when the Owner did it."""
+    info = info if isinstance(info, dict) else {}
+    try:
+        by_id = int(info.get("restricted_by") or 0)
+    except (TypeError, ValueError):
+        by_id = 0
+    if by_id and is_owner(by_id):
+        return "Anonymous"
+    return info.get("restricted_by_name") or "Unknown"
+
+def _duration_seconds(text):
+    import re as _re
+    m = _re.fullmatch(r"([1-9]\d{0,3})([hd])", str(text or "").lower())
+    return int(m.group(1)) * (3600 if m.group(2) == "h" else 86400) if m else None
+
+async def notify_restricted_user(context, user_id, text):
+    """PM the restricted person. False when Telegram refuses (they never pressed Start, or blocked the bot)."""
+    try:
+        await context.bot.send_message(int(user_id), text)
+        return True
+    except Exception as e:
+        print("Restriction PM error:", e)
+        return False
+
 async def get_restricted_message(update):
     user = getattr(update, "effective_user", None)
-    if not user or is_owner(user.id) or is_executive(user.id):
+    if not user or is_owner(user.id):
         return None
     cached = _RESTRICTION_CACHE.get(user.id)
     if cached and time.monotonic() - cached[0] < _RESTRICTION_TTL:
@@ -2050,7 +2075,7 @@ HELP_MODULES = {
         ("restrict", "🚫 Restrictions", _help_page(
             "🚫 Restrictions (Owner & Executive)",
             "Temporarily stop a user from spawning, catching, transferring and exchanging characters (durations: 1h, 10h, 1d up to 365d; they expire automatically), or stop character transfers between two specific users.",
-            [("/restrict <duration> [reason]", "Reply to the user"),
+            [("/restrict <duration> [reason]", "Reply to the user (run it again on a restricted user to change the duration; the old reason is kept if you add none)"),
              ("/restrict <user_id> <duration> [reason]", "By user ID"),
              ("/unrestrict", "Reply to the user to lift the restriction"),
              ("/unrestrict <user_id>", "Lift by user ID"),
@@ -12862,34 +12887,71 @@ async def restrict(update, context):
     if seconds > 365 * 86400:
         await safe_reply_text(update.message, "❌ Maximum restriction is 365 days.")
         return
-    if target.id == uid or is_owner(target.id) or is_executive(target.id):
-        await safe_reply_text(update.message, "❌ You cannot restrict the Owner or an Executive.")
+    if target.id == uid:
+        await safe_reply_text(update.message, "❌ You cannot restrict yourself.")
+        return
+    if is_owner(target.id):
+        await safe_reply_text(update.message, "❌ The Owner cannot be restricted.")
+        return
+    if is_executive(target.id) and not is_owner(uid):
+        await safe_reply_text(update.message, "❌ Only the Owner can restrict an Executive.")
         return
 
-    expiry = int(datetime.now().timestamp()) + seconds
+    now_ts = int(datetime.now().timestamp())
+    new_label = f"{amount}{unit}"
+    expiry = now_ts + seconds
     data = (await asyncio.to_thread(load_restrictions))
-    data[str(target.id)] = {
+    old = data.get(str(target.id))
+    old = old if isinstance(old, dict) and int(old.get("expiry", 0)) > now_ts else None     # an active restriction is being changed
+    old_label = (old.get("duration") or "") if old else ""
+    if old and not reason:
+        reason = str(old.get("reason") or "").strip()          # no new reason typed: keep the old one
+    entry = {
         "expiry": expiry,
-        "duration": f"{amount}{unit}",
+        "duration": new_label,
         "reason": reason,
         "restricted_by": uid,
         "restricted_by_name": update.effective_user.first_name or "Unknown",
         "restricted_by_username": update.effective_user.username or "",
         "target_name": target.first_name or "Unknown",
         "target_username": getattr(target, "username", "") or "",
-        "created_at": int(datetime.now().timestamp()),
+        "created_at": now_ts,
     }
+    if old_label:
+        entry["previous_duration"] = old_label
+    data[str(target.id)] = entry
     (await asyncio.to_thread(save_restrictions, data))
-    await safe_reply_text(update.message,
-        f"🔒 {target.first_name} restricted for {amount}{unit}.\n"
-        f"📝 Reason: {reason or 'Not provided'}"
-    )
+
+    by_label = restricted_by_label(entry)
+    reason_shown = reason or "Not provided"
+    if old:
+        old_secs = _duration_seconds(old_label)
+        if old_secs is None:
+            old_secs = max(0, int(old.get("expiry", 0)) - now_ts)
+        if seconds < old_secs:
+            head, verb = "✅ Your restriction was reduced.", "reduced"
+        elif seconds > old_secs:
+            head, verb = "⚠️ Your restriction was extended.", "extended"
+        else:
+            head, verb = "🔄 Your restriction was renewed.", "renewed"
+        pm_text = (f"{head}\n{old_label or '?'} → {new_label}\n⏳ Time left: {new_label}\n"
+                   f"📝 Reason: {reason_shown}\n👮 Restricted by: {by_label}")
+        reply_text = (f"🔒 {target.first_name}'s restriction changed: {old_label or '?'} → {new_label}.\n"
+                      f"📝 Reason: {reason_shown}")
+    else:
+        verb = "restricted"
+        pm_text = ("🚫 You have been restricted.\n"
+                   f"⏳ Duration: {new_label}\n📝 Reason: {reason_shown}\n👮 Restricted by: {by_label}\n"
+                   "Think it's a mistake? Use /appeal")
+        reply_text = f"🔒 {target.first_name} restricted for {new_label}.\n📝 Reason: {reason_shown}"
+    sent = await notify_restricted_user(context, target.id, pm_text)
+    await safe_reply_text(update.message, reply_text + ("" if sent else "\n⚠️ Couldn't notify the user."))
     target_handle = f"@{getattr(target, 'username', '')}" if getattr(target, 'username', '') else "No username"
     await notify_staff_action(
         context,
-        f"🔒 USER RESTRICTED\n"
+        f"{'🔄 USER RESTRICTION CHANGED (' + (old_label or '?') + ' → ' + new_label + ')' if old else '🔒 USER RESTRICTED'}\n"
         f"👤 User: {target.first_name} | ID: {target.id} | {target_handle}\n"
-        f"⏳ Duration: {amount}{unit}\n"
+        f"⏳ Duration: {new_label}\n"
         f"📝 Reason: {reason or 'Not provided'}\n"
         f"👮 Restricted by: {display_user(update.effective_user)}",
         actor_id=update.effective_user.id,
@@ -12906,9 +12968,10 @@ async def restrictions_list(update, context):
         info = info if isinstance(info, dict) else {}
         await safe_reply_text(update.effective_message,
             "🔒 Your Restriction\n"
-            f"⏳ Duration: {info.get('duration') or 'Unknown'} | Remaining: {format_remaining(expiry - int(datetime.now().timestamp()))}\n"
+            f"⏳ Duration: {info.get('duration') or 'Unknown'}{(' (was ' + info['previous_duration'] + ')') if info.get('previous_duration') else ''}"
+            f" | Remaining: {format_remaining(expiry - int(datetime.now().timestamp()))}\n"
             f"📝 Reason: {str(info.get('reason') or '').strip() or 'Not provided'}\n"
-            f"👮 Restricted by: {info.get('restricted_by_name') or 'Unknown'}\n"
+            f"👮 Restricted by: {restricted_by_label(info)}\n"
             "Think it's a mistake? Use /appeal")
         return
 
@@ -12936,7 +12999,7 @@ async def restrictions_list(update, context):
         if isinstance(entry, dict):
             name = entry.get("target_name") or "Unknown"
             username = entry.get("target_username") or ""
-            duration = entry.get("duration") or "Unknown"
+            duration = (entry.get("duration") or "Unknown") + (f" (was {entry['previous_duration']})" if entry.get("previous_duration") else "")
             reason = entry.get("reason") or "Not provided"
             by_name = entry.get("restricted_by_name") or "Unknown"
             by_username = entry.get("restricted_by_username") or ""
@@ -12985,12 +13048,17 @@ async def unrestrict(update, context):
             await safe_reply_text(update.message, "ℹ️ This user is not currently restricted.")
             return
 
+    if is_executive(target_id) and not is_owner(uid):
+        await safe_reply_text(update.message, "❌ Only the Owner can lift an Executive's restriction.")
+        return
     removed_entry = data.get(str(target_id), {})
     data.pop(str(target_id), None)
     (await asyncio.to_thread(save_restrictions, data))
+    sent = await notify_restricted_user(context, target_id,
+        "🔓 Your restriction has been lifted.\nYou can use the bot normally again.")
     await safe_reply_text(update.message,
         f"🔓 User {target_name} restriction removed successfully.\n"
-        f"🆔 User ID: {target_id}"
+        f"🆔 User ID: {target_id}" + ("" if sent else "\n⚠️ Couldn't notify the user.")
     )
     removed_name = target_name
     removed_username = ""
