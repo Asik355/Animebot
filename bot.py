@@ -5625,7 +5625,7 @@ async def send_character_check_result(bot, chat_id, character, source_message=No
         u = owner_names.get(int(uid))
         first, last, username = u if u else ("Unknown", "", "")
         display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
-        handle = f"@{username}" if username else "No username"
+        handle = f"<code>@{html_escape(username)}</code>" if username else "No username"      # inside <code>: shown, but never pings
         lines.append(f"• {display} ({handle}) ×{qty}")
     if not owners:
         lines.append("• No owners yet")
@@ -8860,9 +8860,12 @@ def format_staff_list(title, rows):
     if not rows:
         lines.append("None assigned yet.")
     for i, (uid, name, username) in enumerate(rows, 1):
-        handle = f" (@{html_escape(username)})" if username else ""
-        link = f"https://t.me/{username}" if username else f"tg://user?id={uid}"
-        lines.append(f'{i}. <a href="{html_escape(link, quote=True)}">{html_escape(name)}</a>{handle} - ID: <code>{uid}</code>')
+        handle = f" (<code>@{html_escape(username)}</code>)" if username else ""            # inside <code>: shown, but never pings
+        if username:                                                                         # normal profile link: opens the profile, does not ping
+            name_html = f'<a href="{html_escape("https://t.me/" + username, quote=True)}">{html_escape(name)}</a>'
+        else:
+            name_html = html_escape(name)                                                    # no tg://user link: that one would ping
+        lines.append(f'{i}. {name_html}{handle} - ID: <code>{uid}</code>')
     return "\n".join(lines)
 
 
