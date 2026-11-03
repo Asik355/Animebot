@@ -508,6 +508,10 @@ def set_notifications_enabled_for(user_id, enabled):
 _RESTRICTION_CACHE = {}
 _RESTRICTION_TTL = 5.0
 
+# A restricted member is blocked ONLY from these commands (and from the Accept buttons of transfers / exchanges).
+RESTRICTED_COMMANDS = {"spawn", "add", "transfer", "berrytransfer", "exchange"}
+RESTRICTED_CALLBACK_PREFIXES = ("tr_accept:", "ex_accept:")
+
 def load_restrictions():
     return mongo_db.load_restrictions()
 
@@ -515,22 +519,33 @@ def save_restrictions(data):
     _RESTRICTION_CACHE.clear()
     return _mongo_safe(mongo_db.replace_restrictions, data)
 
-def get_restriction_expiry(user_id):
-    # Called on many updates, so keep a very short per-user cache (cleared on every write).
+def _restriction_lookup(user_id):
+    """(expiry, entry) of the user's active restriction, or (None, None). Short per-user cache (cleared on every write)."""
     now_mono = time.monotonic()
     cached = _RESTRICTION_CACHE.get(user_id)
     if cached and now_mono - cached[0] < _RESTRICTION_TTL:
-        return cached[1]
+        return cached[1], cached[2]
     entry = mongo_db.get_restriction(user_id)
-    expiry = None
+    expiry, info = None, None
     if entry:
         value = int(entry.get("expiry", 0))
         if value <= int(datetime.now().timestamp()):
             mongo_db.remove_restriction(user_id)
         else:
-            expiry = value
-    _RESTRICTION_CACHE[user_id] = (now_mono, expiry)
-    return expiry
+            expiry, info = value, entry
+            if "reason" not in info:       # make sure the full saved record (reason, duration, who) is available
+                try:
+                    full = load_restrictions().get(str(user_id))
+                    if isinstance(full, dict):
+                        info = full
+                except Exception:
+                    pass
+    _RESTRICTION_CACHE[user_id] = (now_mono, expiry, info)
+    return expiry, info
+
+def get_restriction_expiry(user_id):
+    # Called on many updates, so keep a very short per-user cache (cleared on every write).
+    return _restriction_lookup(user_id)[0]
 
 def format_remaining(seconds):
     seconds = max(0, int(seconds))
@@ -544,23 +559,27 @@ def format_remaining(seconds):
     if not parts: parts.append(f"{seconds}s")
     return " ".join(parts)
 
+def restriction_notice(expiry, info):
+    reason = str((info or {}).get("reason") or "").strip() if isinstance(info, dict) else ""
+    return (
+        "🚫 You are restricted.\n"
+        f"📝 Reason: {reason or 'Not provided'}\n"
+        f"⏳ {format_remaining(expiry - int(datetime.now().timestamp()))} left\n"
+        "Think it's a mistake? Use /appeal"
+    )
+
 async def get_restricted_message(update):
     user = getattr(update, "effective_user", None)
     if not user or is_owner(user.id) or is_executive(user.id):
         return None
     cached = _RESTRICTION_CACHE.get(user.id)
     if cached and time.monotonic() - cached[0] < _RESTRICTION_TTL:
-        expiry = cached[1]
+        expiry, info = cached[1], cached[2]
     else:
-        expiry = await asyncio.to_thread(get_restriction_expiry, user.id)
+        expiry, info = await asyncio.to_thread(_restriction_lookup, user.id)
     if not expiry:
         return None
-    remaining = format_remaining(expiry - int(datetime.now().timestamp()))
-    return (
-        "🚫 You are currently restricted.\n"
-        f"⏳ Time remaining: {remaining}\n"
-        "Your restriction will expire automatically after this time."
-    )
+    return restriction_notice(expiry, info)
 
 def has_group_approval_permission(user_id):
     if is_owner(user_id):
@@ -1883,6 +1902,7 @@ def _build_help_text_raw():
         "📝 Support\n"
         "/issue — Report an issue\n"
         "/idea — Send a suggestion\n"
+        "/restrictions — View your restriction details\n"
         "/appeal — Appeal a restriction\n"
         "/cancel — Cancel the current action\n\n"
     )
@@ -2029,12 +2049,12 @@ HELP_MODULES = {
     "executive": [
         ("restrict", "🚫 Restrictions", _help_page(
             "🚫 Restrictions (Owner & Executive)",
-            "Temporarily block a user from the bot (durations: 1h, 10h, 1d up to 365d; they expire automatically), or stop character transfers between two specific users.",
+            "Temporarily stop a user from spawning, catching, transferring and exchanging characters (durations: 1h, 10h, 1d up to 365d; they expire automatically), or stop character transfers between two specific users.",
             [("/restrict <duration> [reason]", "Reply to the user"),
              ("/restrict <user_id> <duration> [reason]", "By user ID"),
              ("/unrestrict", "Reply to the user to lift the restriction"),
              ("/unrestrict <user_id>", "Lift by user ID"),
-             ("/restrictions", "View all active restrictions"),
+             ("/restrictions", "View all active restrictions (members see only their own)"),
              ("/btransfer <user_id_1> <user_id_2>", "Block character transfers between the pair"),
              ("/unbtransfer <user_id_1> <user_id_2>", "Remove the transfer block")])),
         ("groupctl", "🤖 Group Control", _help_page(
@@ -4756,6 +4776,7 @@ async def daily_shop_reset_job(_context):
         print(f"🔔 Notification history reset complete for {history_deleted} old rows.")
     except Exception as e:
         print("Daily shop reset error:", e)
+    await dm_cleanup()      # also drop DM messages older than 5 days
 
 async def characters(update, context):
     rows = (await asyncio.to_thread(get_all_characters))
@@ -5188,6 +5209,7 @@ async def bc_message(update, context):
 # A user can only be messaged after they pressed Start in the bot (Telegram rule).
 # ---------------------------------------------------------------------------
 DM_COLL, DM_WINDOW, DM_PAGE = "dm_log", 24 * 3600, 10   # replies are forwarded for 24 h after your last message
+DM_KEEP, DM_COUNTER, DM_LIST_PAGE = 5 * 24 * 3600, "dm_counter", 10   # DM messages are kept for 5 days only
 _dm_state = {}   # owner id -> {"step": "id" | "hist" | "msg", "to": user id}
 _DM_LABELS = {"photo": "📷 photo", "video": "🎬 video", "animation": "🎞 gif", "document": "📄 file", "audio": "🎵 audio",
               "voice": "🎤 voice", "video_note": "⏺ video note", "sticker": "🏷 sticker", "poll": "📊 poll"}
@@ -5230,24 +5252,68 @@ async def _dm_recent(app):
             app.bot_data["dm_recent"] = {}
     return app.bot_data["dm_recent"]
 
-async def _dm_log(uid, out, kind, text):
+def _dm_cutoff():
+    return int(time.time()) - DM_KEEP
+
+async def dm_cleanup():
+    """Delete DM messages older than 5 days (runs at startup and every day)."""
     try:
-        await asyncio.to_thread(_mc(DM_COLL).insert_one,
-                                {"uid": uid, "out": out, "kind": kind, "text": text[:500], "t": int(time.time())})
+        res = await asyncio.to_thread(_mc(DM_COLL).delete_many, {"t": {"$lt": _dm_cutoff()}})
+        if res.deleted_count:
+            print(f"💬 DM cleanup removed {res.deleted_count} old messages.")
+    except Exception as e:
+        print("DM cleanup error:", e)
+
+def _dm_preview(m):
+    """Short text of a Telegram message: its text/caption, or a label for media."""
+    if m is None:
+        return ""
+    t = (getattr(m, "text", None) or getattr(m, "caption", None) or "").strip()
+    if t:
+        return t
+    k = _dm_kind(m)
+    return _DM_LABELS.get(k, "") if k != "text" else ""
+
+async def _dm_next_n(uid):
+    """Next message number (#1, #2, ...) in the chat with this user."""
+    try:
+        from pymongo import ReturnDocument
+        doc = await asyncio.to_thread(lambda: _mc(DM_COUNTER).find_one_and_update(
+            {"_id": uid}, {"$inc": {"n": 1}}, upsert=True, return_document=ReturnDocument.AFTER))
+        return int(doc["n"])
+    except Exception as e:
+        print("DM counter error:", e)
+        return None
+
+async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev=""):
+    n = await _dm_next_n(uid)
+    row = {"uid": uid, "out": out, "kind": kind, "text": text[:500], "t": int(time.time())}
+    if n is not None:
+        row["n"] = n                          # message number in this chat
+    if mid is not None:
+        row["mid"] = mid                      # message id in the user's Telegram chat (used to match replies)
+    if reply_n is not None:
+        row["rto"] = reply_n                  # number of YOUR message they replied to
+    if reply_prev:
+        row["rprev"] = reply_prev[:100]
+    try:
+        await asyncio.to_thread(_mc(DM_COLL).insert_one, row)
     except Exception as e:
         print("DM log error:", e)
+    return n
 
 async def _dm_send(context, uid, src=None, text=None):
     """Send a copy of message `src` (or plain `text`) to the user. False if they never started the bot or blocked it."""
     try:
         if src is not None:
-            await context.bot.copy_message(uid, src.chat_id, src.message_id)
+            sent = await context.bot.copy_message(uid, src.chat_id, src.message_id)
         else:
-            await context.bot.send_message(uid, text)
+            sent = await context.bot.send_message(uid, text)
     except TelegramError:
         return False
     await _dm_log(uid, True, _dm_kind(src) if src is not None else "text",
-                  ((src.text or src.caption or "") if src is not None else text).strip())
+                  ((src.text or src.caption or "") if src is not None else text).strip(),
+                  mid=getattr(sent, "message_id", None))
     (await _dm_recent(context.application))[uid] = time.time()
     return True
 
@@ -5260,7 +5326,7 @@ async def _dm_result(context, uid, src=None, text=None):
 async def _dm_history(uid, page):
     """(text, keyboard) with the chat, newest page first (10 messages per page, oldest at the top of each page)."""
     rows = await asyncio.to_thread(lambda: list(
-        _mc(DM_COLL).find({"uid": uid}).sort("t", -1).skip(page * DM_PAGE).limit(DM_PAGE + 1)))
+        _mc(DM_COLL).find({"uid": uid, "t": {"$gte": _dm_cutoff()}}).sort("t", -1).skip(page * DM_PAGE).limit(DM_PAGE + 1)))
     more, rows = len(rows) > DM_PAGE, rows[:DM_PAGE][::-1]
     name = html_escape(await _dm_name(uid))
     if rows:
@@ -5269,18 +5335,64 @@ async def _dm_history(uid, page):
             body = html_escape((r.get("text") or "")[:150])
             if r.get("kind", "text") != "text":
                 body = (_DM_LABELS.get(r["kind"], r["kind"]) + " " + body).strip()
+            num = f"#{r['n']} " if r.get("n") is not None else ""
+            ref = ""
+            if not r["out"]:
+                if r.get("rto") is not None:
+                    ref = f" (↩️ #{r['rto']})"
+                elif r.get("rprev"):
+                    ref = " (↩️ reply)"
             lines.append(f"🕒 {datetime.fromtimestamp(r['t'], IST).strftime('%d %b, %I:%M %p')}\n"
-                         f"<b>{'You' if r['out'] else name}:</b> {body}")
+                         f"<b>{num}{'You' if r['out'] else name}</b>{ref}: {body}")
         text = f"<b>📜 Chat with {name}</b> (<code>{uid}</code>)\n\n" + "\n\n".join(lines)
     else:
-        text = f"📜 No messages with <b>{name}</b> yet."
+        text = f"📜 No messages with <b>{name}</b> in the last 5 days."
     nav = ([_bc_btn("◀ Older", f"dm:h:{uid}:{page + 1}")] if more else []) + \
           ([_bc_btn("Newer ▶", f"dm:h:{uid}:{page - 1}")] if page else [])
-    return text, _bc_kb(*([nav] if nav else []), [_bc_btn("✍️ Reply", f"dm:r:{uid}"), _bc_btn("🔙 Back", "dm:m")])
+    return text, _bc_kb(*([nav] if nav else []), [_bc_btn("✍️ Reply", f"dm:r:{uid}"), _bc_btn("🔙 Back", "dm:l:0")])
+
+def _dm_ago(t):
+    d = max(0, int(time.time()) - int(t))
+    if d < 60:
+        return "just now"
+    if d < 3600:
+        return f"{d // 60} min ago"
+    if d < 86400:
+        return f"{d // 3600} h ago"
+    return f"{d // 86400} d ago"
+
+async def _dm_list(page):
+    """(text, keyboard): everyone you messaged or who messaged you in the last 5 days, newest first."""
+    cutoff = _dm_cutoff()
+    rows = await asyncio.to_thread(lambda: list(_mc(DM_COLL).aggregate([
+        {"$match": {"t": {"$gte": cutoff}}},
+        {"$sort": {"t": -1}},
+        {"$group": {"_id": "$uid", "t": {"$first": "$t"}, "out": {"$first": "$out"}}},
+        {"$sort": {"t": -1}},
+        {"$skip": page * DM_LIST_PAGE},
+        {"$limit": DM_LIST_PAGE + 1},
+    ])))
+    more, rows = len(rows) > DM_LIST_PAGE, rows[:DM_LIST_PAGE]
+    find_row = [_bc_btn("🔎 Find by ID/@username", "dm:hist")]
+    back_row = [_bc_btn("🔙 Back", "dm:m")]
+    if not rows:
+        return ("<b>📜 DM History</b>\n\nNo chats in the last 5 days.", _bc_kb(find_row, back_row))
+    try:
+        names = await asyncio.to_thread(mongo_db.get_users_by_ids, [r["_id"] for r in rows]) or {}
+    except Exception:
+        names = {}
+    buttons = []
+    for r in rows:
+        nm = " ".join(p for p in (names.get(r["_id"]) or ("", ""))[:2] if p).strip() or f"User {r['_id']}"
+        buttons.append([_bc_btn(f"{'📤' if r['out'] else '📥'} {nm[:28]} · {_dm_ago(r['t'])}", f"dm:h:{r['_id']}:0")])
+    nav = ([_bc_btn("◀ Newer", f"dm:l:{page - 1}")] if page else []) + ([_bc_btn("Older ▶", f"dm:l:{page + 1}")] if more else [])
+    text = ("<b>📜 DM History</b>\n\nPeople you messaged or who messaged you (last 5 days, newest first).\n"
+            "📤 your message was the latest · 📥 their message was the latest")
+    return text, _bc_kb(*buttons, *([nav] if nav else []), find_row, back_row)
 
 def _dm_panel():
-    return ("<b>💬 DM</b>\n\nMessage one person through the bot and read the whole chat with them.",
-            _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:hist")], [_bc_btn("🔙 Back", "bc:h")]))
+    return ("<b>💬 DM</b>\n\nMessage one person through the bot and see everyone you have chatted with (last 5 days).",
+            _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:l:0")], [_bc_btn("🔙 Back", "bc:h")]))
 
 async def dm_command(update, context):
     """/dm opens the DM menu.  /dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
@@ -5351,6 +5463,8 @@ async def dm_callback(update, context):
         _dm_state[uid] = {"step": "msg", "to": int(a)}
         await context.bot.send_message(q.message.chat.id, f"✍️ Send your message for <b>{html_escape(await _dm_name(int(a)))}</b>. "
                                        "Text, photo, video or a file all work.", parse_mode="HTML", reply_markup=cancel)
+    elif act == "l":
+        await show(*await _dm_list(int(a) if a.isdigit() else 0))
     elif act == "h" and a.lstrip("-").isdigit() and b.isdigit():
         await show(*await _dm_history(int(a), int(b)))
 
@@ -5392,10 +5506,29 @@ async def _dm_forward(context, msg, user, title, text=None):
     """Send a user's message to the owner with ✍️ Reply / 📜 History buttons. True when it was delivered."""
     text = (text if text is not None else (msg.text or msg.caption or "")).strip()
     kind = "text" if text and not msg else _dm_kind(msg)
-    await _dm_log(user.id, False, kind, text)
+    reply_n, reply_prev, mine = None, "", False
+    rm = getattr(msg, "reply_to_message", None) if msg is not None else None
+    if rm is not None:                                   # they replied to one of the messages in this chat
+        reply_prev = _dm_preview(rm)
+        try:
+            prow = await asyncio.to_thread(lambda: _mc(DM_COLL).find_one({"uid": user.id, "out": True, "mid": rm.message_id}))
+        except Exception:
+            prow = None
+        if prow:
+            mine, reply_n = True, prow.get("n")
+            reply_prev = (prow.get("text") or "").strip() or _DM_LABELS.get(prow.get("kind"), "") or reply_prev
+    n = await _dm_log(user.id, False, kind, text, mid=getattr(msg, "message_id", None), reply_n=reply_n, reply_prev=reply_prev)
     who = html_escape(await _dm_name(user.id))
     head = (f"{title} <b>{who}</b>\n🆔 <code>{user.id}</code> | "
-            f"{'@' + html_escape(user.username) if user.username else 'no username'}\n\n")
+            f"{'@' + html_escape(user.username) if user.username else 'no username'}"
+            f"{f' | #{n}' if n is not None else ''}\n")
+    if reply_prev or reply_n is not None:
+        short = html_escape(reply_prev[:100] + ("…" if len(reply_prev) > 100 else ""))
+        if mine:
+            head += f"↩️ Replying to your message{f' #{reply_n}' if reply_n is not None else ''}" + (f': "{short}"' if short else "") + "\n"
+        else:
+            head += "↩️ Replying to" + (f': "{short}"' if short else " a message") + "\n"
+    head += "\n"
     try:
         await context.bot.send_message(ADMIN_IDS[0], (head + (html_escape(text) if kind == "text" else _DM_LABELS[kind]))[:4000],
                                        parse_mode="HTML", reply_markup=_bc_kb(
@@ -5791,11 +5924,6 @@ async def sell_input_handler(update, context):
         return
     if chat.type in ("group", "supergroup") and not await asyncio.to_thread(is_bot_enabled, chat.id):
         return
-    restricted = await get_restricted_message(update)
-    if restricted:
-        PENDING_SELL_INPUT.pop(key, None)
-        await safe_reply_text(msg, restricted)
-        return
     await save_user_async(user)
     await _sell_begin(update, context, msg.text)
 
@@ -6028,11 +6156,6 @@ async def rem_command(update, context):
     if chat.type in ("group", "supergroup"):
         if not await is_group_approved(chat.id) or not await asyncio.to_thread(is_bot_enabled, chat.id):
             return                                          # unapproved / OFF group: stay silent like the other commands
-    restricted = await get_restricted_message(update)
-    if restricted:
-        await safe_reply_text(msg, restricted)
-        return
-
     count = int(digits) if digits else None
     if count == 0:
         await _rem_notice(context, chat.id, "❌ The number must be at least 1. Example: /rem 10")
@@ -12149,7 +12272,7 @@ COMMANDS = {
     "gstats": "Owner: list groups where bot is added",
     "restrict": "Owner/Executive: restrict by reply or user ID + duration + optional reason",
     "unrestrict": "Owner/Executive: remove restriction by reply or user ID",
-    "restrictions": "Owner/Executive: view active restrictions",
+    "restrictions": "View your restriction (Owner/Executive: all active restrictions)",
     "notifications": "PM: Your personal staff notification ON/OFF",
     "notificationoff": "Owner/Executive/Scout: turn your own PM notifications OFF",
     "notificationon": "Owner/Executive/Scout: turn your own PM notifications ON",
@@ -12180,7 +12303,7 @@ PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
-    "appeal", "cancel", "event", "redeem", "berrytransfer", "berry",
+    "appeal", "restrictions", "cancel", "event", "redeem", "berrytransfer", "berry",
     "shop", "exchange", "guess_num", "nguess", "rules",
     "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about", "dailytask",
 }
@@ -12383,6 +12506,8 @@ async def startup_init(app):
             name="deleted-account-sweep-loop",
         )
 
+        app.bot_data["dm_cleanup_task"] = asyncio.create_task(dm_cleanup(), name="dm-cleanup")   # DM messages: keep 5 days
+
         if app.job_queue is not None:
             app.job_queue.run_daily(
                 daily_shop_reset_job,
@@ -12551,7 +12676,7 @@ async def block_unapproved_group(update, context):
         raise ApplicationHandlerStop         # /cooldown and /cd: anyone but the Owner is ignored, no reply at all
 
     if not chat or chat.type not in ("group", "supergroup"):
-        if command_name:
+        if command_name in RESTRICTED_COMMANDS:
             restricted = await get_restricted_message(update)
             if restricted:
                 await safe_reply_text(msg, restricted)
@@ -12587,18 +12712,27 @@ async def block_unapproved_group(update, context):
                 print("Bot OFF warning error:", e)
         raise ApplicationHandlerStop
 
-    restricted = await get_restricted_message(update)
-    if restricted:
-        try:
-            await safe_reply_text(msg, restricted)
-        except Exception as e:
-            print("Restriction warning error:", e)
-        raise ApplicationHandlerStop
+    if command_name in RESTRICTED_COMMANDS:
+        restricted = await get_restricted_message(update)
+        if restricted:
+            try:
+                await safe_reply_text(msg, restricted)
+            except Exception as e:
+                print("Restriction warning error:", e)
+            raise ApplicationHandlerStop
 
 
 async def block_unapproved_callback(update, context):
     query = update.callback_query
     chat = query.message.chat if query and query.message else None
+    if query is not None and (query.data or "").startswith(RESTRICTED_CALLBACK_PREFIXES):
+        restricted = await get_restricted_message(update)      # restricted members cannot accept transfers / exchanges
+        if restricted:
+            try:
+                await query.answer(restricted[:200], show_alert=True)
+            except Exception:
+                pass
+            raise ApplicationHandlerStop
     if not chat or chat.type not in ("group", "supergroup"):
         return
     if not await is_group_approved(chat.id):
@@ -12616,15 +12750,6 @@ async def block_unapproved_callback(update, context):
     if not (await asyncio.to_thread(is_bot_enabled, chat.id)):
         try:
             await query.answer("Bot is OFF in this group. Owner can use /boton.", show_alert=True)
-        except Exception:
-            pass
-        raise ApplicationHandlerStop
-    msg = await get_restricted_message(update)
-    if msg:
-        try:
-            await query.answer("You are currently restricted.", show_alert=True)
-            if _warning_allowed(context.application, chat.id, interval=10):
-                await safe_reply_text(query.message, msg)
         except Exception:
             pass
         raise ApplicationHandlerStop
@@ -12755,13 +12880,9 @@ async def restrict(update, context):
         "created_at": int(datetime.now().timestamp()),
     }
     (await asyncio.to_thread(save_restrictions, data))
-    reason_line = f"\n📝 Reason: {reason}" if reason else "\n📝 Reason: Not provided"
     await safe_reply_text(update.message,
-        f"🔒 User {target.first_name} has been restricted successfully.\n"
-        f"⏳ Duration: {amount}{unit}\n"
-        f"⌛ Remaining: {format_remaining(seconds)}"
-        f"{reason_line}\n"
-        "The restriction will expire automatically."
+        f"🔒 {target.first_name} restricted for {amount}{unit}.\n"
+        f"📝 Reason: {reason or 'Not provided'}"
     )
     target_handle = f"@{getattr(target, 'username', '')}" if getattr(target, 'username', '') else "No username"
     await notify_staff_action(
@@ -12777,7 +12898,18 @@ async def restrict(update, context):
 async def restrictions_list(update, context):
     uid = update.effective_user.id
     if not (is_owner(uid) or is_executive(uid)):
-        await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        # Normal members: only their own restriction details.
+        expiry, info = await asyncio.to_thread(_restriction_lookup, uid)
+        if not expiry:
+            await safe_reply_text(update.effective_message, "✅ You are not restricted.")
+            return
+        info = info if isinstance(info, dict) else {}
+        await safe_reply_text(update.effective_message,
+            "🔒 Your Restriction\n"
+            f"⏳ Duration: {info.get('duration') or 'Unknown'} | Remaining: {format_remaining(expiry - int(datetime.now().timestamp()))}\n"
+            f"📝 Reason: {str(info.get('reason') or '').strip() or 'Not provided'}\n"
+            f"👮 Restricted by: {info.get('restricted_by_name') or 'Unknown'}\n"
+            "Think it's a mistake? Use /appeal")
         return
 
     data = (await asyncio.to_thread(load_restrictions))
@@ -12932,7 +13064,7 @@ async def scout_list_command(update, context):
     await safe_reply_text(update.effective_message, format_staff_list("Scouts", rows), parse_mode="HTML")
 
 EXECUTIVE_COMMANDS = {
-    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict", "restrictions",
+    "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
     "btransfer", "unbtransfer", "setrules",
 } | badge_banner.STAFF_COMMANDS
