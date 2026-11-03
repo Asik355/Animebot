@@ -5625,8 +5625,7 @@ async def send_character_check_result(bot, chat_id, character, source_message=No
         u = owner_names.get(int(uid))
         first, last, username = u if u else ("Unknown", "", "")
         display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
-        handle = f"<code>@{html_escape(username)}</code>" if username else "No username"      # inside <code>: shown, but never pings
-        lines.append(f"• {display} ({handle}) ×{qty}")
+        lines.append(f"• {display} ×{qty}")
     if not owners:
         lines.append("• No owners yet")
 
