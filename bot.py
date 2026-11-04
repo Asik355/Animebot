@@ -5321,8 +5321,28 @@ async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev="", n
 
 _DM_CAPTIONABLE = {"photo", "video", "animation", "document", "audio", "voice"}
 
-def _dm_tag(n):
-    return f"\n\n#{n} · Swipe-reply to this message or use /reply {n}"
+def _dm_header(n):
+    return f"📩 Message from Bot Staff · #{n}"
+
+def _dm_guide(n):
+    return f"💬 How to reply\n\n1. Swipe-reply to this message\n\n2. Or send /reply {n} and then your message"
+
+def _dm_u16(s):
+    """Length in UTF-16 units (what Telegram uses for entity offsets)."""
+    return len(s.encode("utf-16-le")) // 2
+
+def _dm_shift(entities, delta):
+    """The message's formatting entities moved `delta` units to the right (text was added in front). None if none/failed."""
+    out = []
+    try:
+        from telegram import MessageEntity
+        for e in entities or ():
+            d = e.to_dict()
+            d["offset"] = e.offset + delta
+            out.append(MessageEntity.de_json(d, None))
+    except Exception:
+        return None
+    return out or None
 
 async def _dm_find_sent(uid, mid):
     """The owner's DM (log row) that has this message id in the user's chat, or None."""
@@ -5341,33 +5361,38 @@ async def _dm_find_n(uid, n):
         return None
 
 async def _dm_send(context, uid, src=None, text=None):
-    """Send a copy of message `src` (or plain `text`) to the user with its number (#3) so they can answer it.
+    """Send a copy of message `src` (or plain `text`) to the user as:
+        📩 Message from Bot Staff · #3  /  the message  /  💬 How to reply + the two steps
     False if they never started the bot or blocked it."""
     n = await _dm_next_n(uid)
-    tag = _dm_tag(n) if n is not None else ""
     kind = _dm_kind(src) if src is not None else "text"
     body = ((src.text or src.caption or "") if src is not None else text).strip()
+    head, guide = (_dm_header(n), _dm_guide(n)) if n is not None else ("", "")
     sent = sent2 = None
     try:
         try:
-            if tag and (src is None or src.text):
+            if head and (src is None or src.text):
                 plain = src.text if src is not None else text
-                if len(plain) + len(tag) <= 4096:
-                    sent = await context.bot.send_message(uid, plain + tag, entities=(src.entities or None) if src is not None else None)
-            elif tag and kind in _DM_CAPTIONABLE and len(src.caption or "") + len(tag) <= 1024:
-                cap = (src.caption + tag) if src.caption else tag.strip()
-                sent = await context.bot.copy_message(uid, src.chat_id, src.message_id, caption=cap,
-                                                      caption_entities=(src.caption_entities or None))
+                full = f"{head}\n\n{plain}\n\n\n{guide}"
+                if len(full) <= 4096:
+                    ents = _dm_shift(src.entities, _dm_u16(head + "\n\n")) if src is not None else None
+                    sent = await context.bot.send_message(uid, full, entities=ents)
+            elif head and kind in _DM_CAPTIONABLE:
+                cap_body = src.caption or ""
+                cap = f"{head}\n\n{cap_body}\n\n\n{guide}" if cap_body else f"{head}\n\n{guide}"
+                if len(cap) <= 1024:
+                    ents = _dm_shift(src.caption_entities, _dm_u16(head + "\n\n")) if cap_body else None
+                    sent = await context.bot.copy_message(uid, src.chat_id, src.message_id, caption=cap, caption_entities=ents)
         except TelegramError:
             sent = None
-        if sent is None:      # no room for the number (sticker, poll, long text...): plain copy + a small numbered line
+        if sent is None:      # sticker, poll, video note, too long...: plain copy + a small message with the header and steps
             if src is not None:
                 sent = await context.bot.copy_message(uid, src.chat_id, src.message_id)
             else:
                 sent = await context.bot.send_message(uid, text)
-            if tag:
+            if head:
                 try:
-                    sent2 = await context.bot.send_message(uid, tag.strip())
+                    sent2 = await context.bot.send_message(uid, f"{head}\n\n{guide}")
                 except TelegramError:
                     sent2 = None
     except TelegramError:
