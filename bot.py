@@ -1881,7 +1881,7 @@ def _build_help_text_raw():
         "👤 Profile & Collection\n"
         "/start — Register / start the bot\n"
         "/help — Show this command list\n"
-        "/message — Send a message to the bot staff (private chat)\n"
+        "/reply — Send a message to the bot staff (private chat)\n"
         "/mycollection — View your collection\n"
         "/see <user_id or @username> — View another user's collection (hidden if they turned Privacy ON)\n"
         "/myfav <code/name> — Set or change favourite character\n"
@@ -5230,10 +5230,10 @@ async def bc_message(update, context):
 
 # ---------------------------------------------------------------------------
 # DM (/help -> 📣 Broadcast -> 💬 DM, Owner only): message one user through the bot and read the whole chat.
-# Their replies come to the owner with a ✍️ Reply button. Everything is saved in the dm_log collection.
+# A user's message reaches the owner ONLY when they swipe-reply to one of the owner's DMs or use /reply. Everything is saved in dm_log.
 # A user can only be messaged after they pressed Start in the bot (Telegram rule).
 # ---------------------------------------------------------------------------
-DM_COLL, DM_WINDOW, DM_PAGE = "dm_log", 24 * 3600, 10   # replies are forwarded for 24 h after your last message
+DM_COLL, DM_PAGE = "dm_log", 10
 DM_KEEP, DM_COUNTER, DM_LIST_PAGE = 5 * 24 * 3600, "dm_counter", 10   # DM messages are kept for 5 days only
 _dm_state = {}   # owner id -> {"step": "id" | "hist" | "msg", "to": user id}
 _DM_LABELS = {"photo": "📷 photo", "video": "🎬 video", "animation": "🎞 gif", "document": "📄 file", "audio": "🎵 audio",
@@ -5263,19 +5263,6 @@ async def _dm_target(text):
     rows = await asyncio.to_thread(lambda: list(mongo_db.col(mongo_db.USERS).find(
         {"username": {"$regex": f"^{name}$", "$options": "i"}}, {"_id": 1}).limit(2)))
     return rows[0]["_id"] if len(rows) == 1 else None
-
-async def _dm_recent(app):
-    """{user id: time of the owner's last message to them}. Loaded from the database once, then kept in memory."""
-    if "dm_recent" not in app.bot_data:
-        since = int(time.time()) - DM_WINDOW
-        try:
-            rows = await asyncio.to_thread(lambda: list(_mc(DM_COLL).aggregate(
-                [{"$match": {"t": {"$gte": since}}}, {"$group": {"_id": "$uid", "t": {"$max": "$t"}}}])))
-            app.bot_data["dm_recent"] = {r["_id"]: r["t"] for r in rows}
-        except Exception as e:
-            print("DM recent load error:", e)
-            app.bot_data["dm_recent"] = {}
-    return app.bot_data["dm_recent"]
 
 def _dm_cutoff():
     return int(time.time()) - DM_KEEP
@@ -5310,36 +5297,83 @@ async def _dm_next_n(uid):
         print("DM counter error:", e)
         return None
 
-async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev=""):
-    n = await _dm_next_n(uid)
+async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev="", n=None, mid2=None, about=False):
+    if n is None:
+        n = await _dm_next_n(uid)
     row = {"uid": uid, "out": out, "kind": kind, "text": text[:500], "t": int(time.time())}
     if n is not None:
         row["n"] = n                          # message number in this chat
     if mid is not None:
         row["mid"] = mid                      # message id in the user's Telegram chat (used to match replies)
+    if mid2 is not None:
+        row["mid2"] = mid2                    # id of the small "#n" line sent after a sticker/poll/long message
     if reply_n is not None:
         row["rto"] = reply_n                  # number of YOUR message they replied to
     if reply_prev:
         row["rprev"] = reply_prev[:100]
+    if about:
+        row["rabout"] = True                  # they pointed at a normal bot message with /reply
     try:
         await asyncio.to_thread(_mc(DM_COLL).insert_one, row)
     except Exception as e:
         print("DM log error:", e)
     return n
 
-async def _dm_send(context, uid, src=None, text=None):
-    """Send a copy of message `src` (or plain `text`) to the user. False if they never started the bot or blocked it."""
+_DM_CAPTIONABLE = {"photo", "video", "animation", "document", "audio", "voice"}
+
+def _dm_tag(n):
+    return f"\n\n#{n} · Swipe-reply to this message or use /reply {n}"
+
+async def _dm_find_sent(uid, mid):
+    """The owner's DM (log row) that has this message id in the user's chat, or None."""
     try:
-        if src is not None:
-            sent = await context.bot.copy_message(uid, src.chat_id, src.message_id)
-        else:
-            sent = await context.bot.send_message(uid, text)
+        return await asyncio.to_thread(lambda: _mc(DM_COLL).find_one(
+            {"uid": uid, "out": True, "t": {"$gte": _dm_cutoff()}, "$or": [{"mid": mid}, {"mid2": mid}]}))
+    except Exception:
+        return None
+
+async def _dm_find_n(uid, n):
+    """The owner's DM number `n` to this user, or None."""
+    try:
+        return await asyncio.to_thread(lambda: _mc(DM_COLL).find_one(
+            {"uid": uid, "out": True, "n": n, "t": {"$gte": _dm_cutoff()}}))
+    except Exception:
+        return None
+
+async def _dm_send(context, uid, src=None, text=None):
+    """Send a copy of message `src` (or plain `text`) to the user with its number (#3) so they can answer it.
+    False if they never started the bot or blocked it."""
+    n = await _dm_next_n(uid)
+    tag = _dm_tag(n) if n is not None else ""
+    kind = _dm_kind(src) if src is not None else "text"
+    body = ((src.text or src.caption or "") if src is not None else text).strip()
+    sent = sent2 = None
+    try:
+        try:
+            if tag and (src is None or src.text):
+                plain = src.text if src is not None else text
+                if len(plain) + len(tag) <= 4096:
+                    sent = await context.bot.send_message(uid, plain + tag, entities=(src.entities or None) if src is not None else None)
+            elif tag and kind in _DM_CAPTIONABLE and len(src.caption or "") + len(tag) <= 1024:
+                cap = (src.caption + tag) if src.caption else tag.strip()
+                sent = await context.bot.copy_message(uid, src.chat_id, src.message_id, caption=cap,
+                                                      caption_entities=(src.caption_entities or None))
+        except TelegramError:
+            sent = None
+        if sent is None:      # no room for the number (sticker, poll, long text...): plain copy + a small numbered line
+            if src is not None:
+                sent = await context.bot.copy_message(uid, src.chat_id, src.message_id)
+            else:
+                sent = await context.bot.send_message(uid, text)
+            if tag:
+                try:
+                    sent2 = await context.bot.send_message(uid, tag.strip())
+                except TelegramError:
+                    sent2 = None
     except TelegramError:
         return False
-    await _dm_log(uid, True, _dm_kind(src) if src is not None else "text",
-                  ((src.text or src.caption or "") if src is not None else text).strip(),
-                  mid=getattr(sent, "message_id", None))
-    (await _dm_recent(context.application))[uid] = time.time()
+    await _dm_log(uid, True, kind, body, mid=getattr(sent, "message_id", None), n=n,
+                  mid2=getattr(sent2, "message_id", None))
     return True
 
 async def _dm_result(context, uid, src=None, text=None):
@@ -5365,6 +5399,8 @@ async def _dm_history(uid, page):
             if not r["out"]:
                 if r.get("rto") is not None:
                     ref = f" (↩️ #{r['rto']})"
+                elif r.get("rabout"):
+                    ref = " (↩️ bot msg)"
                 elif r.get("rprev"):
                     ref = " (↩️ reply)"
             lines.append(f"🕒 {datetime.fromtimestamp(r['t'], IST).strftime('%d %b, %I:%M %p')}\n"
@@ -5374,7 +5410,8 @@ async def _dm_history(uid, page):
         text = f"📜 No messages with <b>{name}</b> in the last 5 days."
     nav = ([_bc_btn("◀ Older", f"dm:h:{uid}:{page + 1}")] if more else []) + \
           ([_bc_btn("Newer ▶", f"dm:h:{uid}:{page - 1}")] if page else [])
-    return text, _bc_kb(*([nav] if nav else []), [_bc_btn("✍️ Reply", f"dm:r:{uid}"), _bc_btn("🔙 Back", "dm:l:0")])
+    actions = [_bc_btn("✍️ Reply", f"dm:r:{uid}")] + ([_bc_btn("🗑 Remove", f"dm:dh:{uid}")] if rows else [])
+    return text, _bc_kb(*([nav] if nav else []), actions, [_bc_btn("🔙 Back", "dm:l:0")])
 
 def _dm_ago(t):
     d = max(0, int(time.time()) - int(t))
@@ -5492,6 +5529,38 @@ async def dm_callback(update, context):
         await show(*await _dm_list(int(a) if a.isdigit() else 0))
     elif act == "h" and a.lstrip("-").isdigit() and b.isdigit():
         await show(*await _dm_history(int(a), int(b)))
+    elif act == "d" and a.lstrip("-").isdigit():        # 🗑 Remove on a "Reply from" message: step 1, ask first
+        await context.bot.send_message(
+            q.message.chat.id, f"🗑 Remove chat with <b>{html_escape(await _dm_name(int(a)))}</b>?\n"
+            "All saved messages with them will be deleted. This can't be undone.", parse_mode="HTML",
+            reply_markup=_bc_kb([_bc_btn("✅ Yes, remove", f"dm:dy:{a}:{q.message.message_id}"), _bc_btn("❌ Cancel", "dm:dn")]))
+    elif act == "dh" and a.lstrip("-").isdigit():       # 🗑 Remove on the chat history screen: step 1, ask first
+        await show(f"🗑 Remove chat with <b>{html_escape(await _dm_name(int(a)))}</b>?\n\n"
+                   "All saved messages with them will be deleted. This can't be undone.",
+                   _bc_kb([_bc_btn("✅ Yes, remove", f"dm:dy:{a}:0"), _bc_btn("❌ Cancel", f"dm:h:{a}:0")]))
+    elif act == "dn":                                   # cancelled: just drop the question
+        try:
+            await q.message.delete()
+        except TelegramError:
+            pass
+    elif act == "dy" and a.lstrip("-").isdigit():       # step 2: confirmed
+        target = int(a)
+        name = html_escape(await _dm_name(target))
+        try:
+            res = await asyncio.to_thread(_mc(DM_COLL).delete_many, {"uid": target})
+            deleted = res.deleted_count
+        except Exception as e:
+            print("DM remove error:", e)
+            await show(f"❌ Couldn't remove the chat with <b>{name}</b> right now. Please try again.",
+                       _bc_kb([_bc_btn("📜 History", "dm:l:0")]))
+            return
+        await show(f"✅ Chat with <b>{name}</b> removed ({deleted} saved message{'s' if deleted != 1 else ''} deleted).",
+                   _bc_kb([_bc_btn("📜 History", "dm:l:0")]))
+        if b.isdigit() and int(b):                      # drop the old buttons from the message the question came from
+            try:
+                await context.bot.edit_message_reply_markup(q.message.chat.id, int(b), reply_markup=None)
+            except TelegramError:
+                pass
 
 async def dm_message(update, context):
     """The owner's next message in a DM step, or a user's message to the bot staff (forwarded to the owner)."""
@@ -5517,47 +5586,45 @@ async def dm_message(update, context):
             await safe_reply_text(msg, f"✍️ Send your message for <b>{html_escape(await _dm_name(st['to']))}</b>.",
                                   parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "dm:x")]))
         return
-    if (waiting := _msg_wait.pop(user.id, None)) is not None and time.monotonic() - waiting < MSG_WAIT:   # after /message
-        if await _dm_forward(context, msg, user, "📩 Message from"):
-            (await _dm_recent(context.application))[user.id] = time.time()
-            await safe_reply_text(msg, "✅ Sent to the bot staff. You can keep writing here for the next 24 hours.")
-        else:
-            await safe_reply_text(msg, "❌ Couldn't deliver your message right now. Please try again later.")
+    if (waiting := _rp_wait.pop(user.id, None)) is not None and time.monotonic() - waiting["t"] < RP_WAIT:   # after /reply
+        ok = await _dm_forward(context, msg, user, "💬 Reply from", ref=waiting["ref"], about=waiting["about"])
+        await safe_reply_text(msg, "✅ Sent to the bot staff." if ok else "❌ Couldn't deliver your message right now. Please try again later.")
         return
-    if ADMIN_IDS and time.time() - (await _dm_recent(context.application)).get(user.id, 0) <= DM_WINDOW:
-        await _dm_forward(context, msg, user, "💬 Reply from")      # only people already chatting with the bot staff
+    rm = getattr(msg, "reply_to_message", None)
+    if ADMIN_IDS and rm is not None and (ref := await _dm_find_sent(user.id, rm.message_id)) is not None:
+        # they swiped on one of the owner's DMs = a reply. Nothing else they type is forwarded.
+        ok = await _dm_forward(context, msg, user, "💬 Reply from", ref=ref)
+        await safe_reply_text(msg, "✅ Sent to the bot staff." if ok else "❌ Couldn't deliver your message right now. Please try again later.")
 
-async def _dm_forward(context, msg, user, title, text=None):
-    """Send a user's message to the owner with ✍️ Reply / 📜 History buttons. True when it was delivered."""
+async def _dm_forward(context, msg, user, title, text=None, ref=None, about=None):
+    """Send a user's message to the owner with ✍️ Reply / 📜 History / 🗑 Remove buttons. True when it was delivered.
+    ref = the owner's numbered DM (log row) it answers; about = preview of a normal bot message they pointed at."""
     text = (text if text is not None else (msg.text or msg.caption or "")).strip()
     kind = "text" if text and not msg else _dm_kind(msg)
-    reply_n, reply_prev, mine = None, "", False
-    rm = getattr(msg, "reply_to_message", None) if msg is not None else None
-    if rm is not None:                                   # they replied to one of the messages in this chat
-        reply_prev = _dm_preview(rm)
-        try:
-            prow = await asyncio.to_thread(lambda: _mc(DM_COLL).find_one({"uid": user.id, "out": True, "mid": rm.message_id}))
-        except Exception:
-            prow = None
-        if prow:
-            mine, reply_n = True, prow.get("n")
-            reply_prev = (prow.get("text") or "").strip() or _DM_LABELS.get(prow.get("kind"), "") or reply_prev
-    n = await _dm_log(user.id, False, kind, text, mid=getattr(msg, "message_id", None), reply_n=reply_n, reply_prev=reply_prev)
+    reply_n, reply_prev, is_about = None, "", False
+    if ref is not None:
+        reply_n = ref.get("n")
+        reply_prev = (ref.get("text") or "").strip() or _DM_LABELS.get(ref.get("kind"), "")
+    elif about is not None:
+        reply_prev, is_about = about, True
+    n = await _dm_log(user.id, False, kind, text, mid=getattr(msg, "message_id", None), reply_n=reply_n,
+                      reply_prev=reply_prev, about=is_about)
     who = html_escape(await _dm_name(user.id))
     head = (f"{title} <b>{who}</b>\n🆔 <code>{user.id}</code> | "
             f"{'@' + html_escape(user.username) if user.username else 'no username'}"
             f"{f' | #{n}' if n is not None else ''}\n")
-    if reply_prev or reply_n is not None:
+    if ref is not None or is_about:
         short = html_escape(reply_prev[:100] + ("…" if len(reply_prev) > 100 else ""))
-        if mine:
+        if ref is not None:
             head += f"↩️ Replying to your message{f' #{reply_n}' if reply_n is not None else ''}" + (f': "{short}"' if short else "") + "\n"
         else:
-            head += "↩️ Replying to" + (f': "{short}"' if short else " a message") + "\n"
+            head += "↩️ About a bot message" + (f': "{short}"' if short else "") + "\n"
     head += "\n"
     try:
         await context.bot.send_message(ADMIN_IDS[0], (head + (html_escape(text) if kind == "text" else _DM_LABELS[kind]))[:4000],
                                        parse_mode="HTML", reply_markup=_bc_kb(
-                                           [_bc_btn("✍️ Reply", f"dm:r:{user.id}"), _bc_btn("📜 History", f"dm:h:{user.id}:0")]))
+                                           [_bc_btn("✍️ Reply", f"dm:r:{user.id}"), _bc_btn("📜 History", f"dm:h:{user.id}:0")],
+                                           [_bc_btn("🗑 Remove", f"dm:d:{user.id}")]))
         if kind != "text":
             await context.bot.copy_message(ADMIN_IDS[0], msg.chat_id, msg.message_id)
     except TelegramError as e:
@@ -5565,38 +5632,53 @@ async def _dm_forward(context, msg, user, title, text=None):
         return False
     return True
 
-MSG_WAIT, MSG_COOLDOWN = 300, 30           # /message waits 5 minutes for the text; one use per user per 30 seconds
-_msg_wait = {}                             # user id -> when they typed /message
-_msg_last = {}                             # user id -> last /message use
+RP_WAIT, RP_COOLDOWN = 300, 30           # /reply waits 5 minutes for the message; one use per user per 30 seconds
+_rp_wait = {}                            # user id -> {"t": when they typed /reply, "ref": owner DM row or None, "about": preview or None}
+_rp_last = {}                            # user id -> last /reply use
 
-async def message_command(update, context):
-    """/message [text]: a user writes to the bot staff. Their next message (or the text after the command) is forwarded."""
+async def reply_command(update, context):
+    """/reply [text] writes to the bot staff.  /reply 3 [text] (or #3) answers the staff's DM #3.
+    /reply on a swiped message points at it (a staff DM = answer to it; any other bot message = "about" it)."""
     msg, user, chat = update.effective_message, update.effective_user, update.effective_chat
     if chat.type != "private":
-        await safe_reply_text(msg, "Please use /message in my private chat.")
+        await safe_reply_text(msg, "Please use /reply in my private chat.")
         return
     if is_owner(user.id) or not ADMIN_IDS:
         await safe_reply_text(msg, "Use 💬 DM in /help → 📣 Broadcast to message people.")
         return
-    if time.monotonic() - _msg_last.get(user.id, -999.0) < MSG_COOLDOWN:
-        await safe_reply_text(msg, "⏳ Please wait a few seconds before using /message again.")
+    if time.monotonic() - _rp_last.get(user.id, -999.0) < RP_COOLDOWN:
+        await safe_reply_text(msg, "⏳ Please wait a few seconds before using /reply again.")
         return
-    _msg_last[user.id] = time.monotonic()
-    text = " ".join(context.args).strip()
-    if text:
-        ok = await _dm_forward(context, None, user, "📩 Message from", text=text)
-        if ok:
-            (await _dm_recent(context.application))[user.id] = time.time()
-        await safe_reply_text(msg, "✅ Sent to the bot staff. You can keep writing here for the next 24 hours." if ok else
-                              "❌ Couldn't deliver your message right now. Please try again later.")
+    parts = (msg.text or "").split(None, 1)
+    rest = parts[1].strip() if len(parts) > 1 else ""
+    ref, about = None, None
+    if (m := re.match(r"#?(\d{1,9})(?:\s+(.*))?$", rest, re.S)):
+        num, rest = int(m.group(1)), (m.group(2) or "").strip()
+        ref = await _dm_find_n(user.id, num)
+        if ref is None:
+            await safe_reply_text(msg, f"❌ I can't find message #{num}. Check the number, or use /reply on its own to send a normal message.")
+            return
+    elif (rm := msg.reply_to_message) is not None:
+        ref = await _dm_find_sent(user.id, rm.message_id)
+        if ref is None and not (rm.from_user and rm.from_user.id == user.id):
+            about = _dm_preview(rm)                      # a normal bot message
+    _rp_last[user.id] = time.monotonic()
+    if rest:
+        ok = await _dm_forward(context, None, user, "💬 Reply from", text=rest, ref=ref, about=about)
+        await safe_reply_text(msg, "✅ Sent to the bot staff." if ok else "❌ Couldn't deliver your message right now. Please try again later.")
         return
-    _msg_wait[user.id] = time.monotonic()
-    await safe_reply_text(msg, "✍️ Send your message for the bot staff. Text, photo, video or a file all work.",
-                          reply_markup=_bc_kb([_bc_btn("❌ Cancel", "um:x")]))
+    _rp_wait[user.id] = {"t": time.monotonic(), "ref": ref, "about": about}
+    if ref is not None and ref.get("n") is not None:
+        ask = f"✍️ Send your reply to message #{ref['n']}."
+    elif about is not None:
+        ask = "✍️ Send your message about that bot message."
+    else:
+        ask = "✍️ Send your message for the bot staff."
+    await safe_reply_text(msg, ask + " Text, photo, video or a file all work.", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "um:x")]))
 
-async def message_cancel_callback(update, context):
+async def reply_cancel_callback(update, context):
     query = update.callback_query
-    _msg_wait.pop(query.from_user.id, None)
+    _rp_wait.pop(query.from_user.id, None)
     await query.answer("Cancelled.")
     try:
         await query.message.delete()
@@ -12225,7 +12307,7 @@ COMMANDS = {
     "add": "Catch the spawned character (group only)",
     "mycollection": "View your collection",
     "see": "View another user's collection (/see <user_id or @username>)",
-    "message": "Send a message to the bot staff (private chat)",
+    "reply": "Send a message to the bot staff (private chat)",
     "removechar": "Remove a character from any user collection",
     "myfav": "Set favourite character",
     "mystats": "View your stats",
@@ -12335,7 +12417,7 @@ PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
     "evolution", "evolve", "item", "stone", "stonetask", "claimstone", "about", "dailytask",
 }
 
-PRIVATE_ONLY_COMMANDS = {"message"}      # shown in the command menu of private chats only, never in groups
+PRIVATE_ONLY_COMMANDS = {"reply"}      # shown in the command menu of private chats only, never in groups
 
 def make_bot_commands(names):
     return badge_banner.fit_command_menu([BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS])   # Telegram: max 100
@@ -12555,7 +12637,7 @@ async def startup_init(app):
         )
     except Exception as e:
         print("Default command menu setup error:", e)
-    try:                                              # private chats also get the private-only commands (/message)
+    try:                                              # private chats also get the private-only commands (/reply)
         await app.bot.set_my_commands(make_bot_commands(sorted(PUBLIC_COMMANDS | PRIVATE_ONLY_COMMANDS)),
                                       scope=BotCommandScopeAllPrivateChats())
     except Exception as e:
@@ -13154,7 +13236,7 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("notificationhistory", notification_history_command))
     app.add_handler(CallbackQueryHandler(bc_callback, pattern=r"^bc:"))
     app.add_handler(CallbackQueryHandler(dm_callback, pattern=r"^dm:"))
-    app.add_handler(CallbackQueryHandler(message_cancel_callback, pattern=r"^um:x$"))
+    app.add_handler(CallbackQueryHandler(reply_cancel_callback, pattern=r"^um:x$"))
     app.add_handler(CommandHandler("dm", dm_command))
     app.add_handler(CommandHandler("dmhistory", dmhistory_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, dm_message), group=103)
@@ -13446,7 +13528,7 @@ def main():
         ("add", add),
         ("mycollection", mycollection),
         ("see", see_command),
-        ("message", message_command),
+        ("reply", reply_command),
         ("myfav", myfav),
         ("mystats", mystats),
         ("addlist", addlist),
