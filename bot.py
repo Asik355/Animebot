@@ -3589,12 +3589,22 @@ def anime_page_markup(token, page):
         keyboard.append(nav)
     return InlineKeyboardMarkup(keyboard)
 
-async def reply_anime_character_list(update, action, anime_query):
-    """Handles /check (Anime) and /view (Anime). Returns the single character if only one matches, else None."""
+def _owned_character_codes(user_id):
+    return {str(c) for c in mongo_db.col(mongo_db.COLLECTIONS).distinct("character_code", {"user_id": int(user_id)})}
+
+async def reply_anime_character_list(update, action, anime_query, owned_only=False):
+    """Handles /check (Anime) and /view (Anime). Returns the single character if only one matches, else None.
+    owned_only=True (/view): list only the characters the user owns."""
     rows = list(await asyncio.to_thread(mongo_db.find_characters_by_anime, anime_query))
     if not rows:
         await safe_reply_text(update.message, "❌ Anime not found.")
         return None
+    if owned_only:
+        owned = await asyncio.to_thread(_owned_character_codes, update.effective_user.id)
+        rows = [r for r in rows if str(r[0]) in owned]
+        if not rows:
+            await safe_reply_text(update.message, "❌ You don't own any characters from this anime.")
+            return None
     if len(rows) == 1:
         return rows[0]
     token = uuid.uuid4().hex[:8]
@@ -4944,7 +4954,7 @@ async def view(update, context):
     anime_query = parse_anime_query(query)
 
     if anime_query:
-        character = await reply_anime_character_list(update, "view", anime_query)
+        character = await reply_anime_character_list(update, "view", anime_query, owned_only=True)
         if not character:
             return
     elif query.isdigit():
