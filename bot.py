@@ -4961,6 +4961,12 @@ async def view(update, context):
         character = (await asyncio.to_thread(get_character_by_code, query))
     else:
         name_rows = (await asyncio.to_thread(find_characters_by_name_parts, query))
+        if name_rows:
+            owned = await asyncio.to_thread(_owned_character_codes, update.effective_user.id)
+            name_rows = [r for r in name_rows if str(r[0]) in owned]   # /view: only characters in your collection
+            if not name_rows:
+                await safe_reply_text(update.message, "❌ You don't own any character matching that name.")
+                return
         if len(name_rows) == 1:
             character = name_rows[0]
         elif len(name_rows) > 1:
