@@ -34,6 +34,7 @@ import re
 import time
 import unicodedata
 import uuid
+from types import SimpleNamespace as _NS
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone, time as dt_time
@@ -1886,9 +1887,9 @@ def _build_help_text_raw():
         "/see <user_id or @username> — View another user's collection (hidden if they turned Privacy ON)\n"
         "/myfav <code/name> — Set or change favourite character\n"
         "/mystats — View your stats and collection progress\n"
-        "/characters — List all characters by rarity\n"
-        "/view <code/name> — View a character's full details and image\n"
-        "/check <code/name> — Check character details and owners\n"
+        "/characters [tier] — List all characters, or one tier (/characters legendary)\n"
+        "/view <code/name> — View a character's full details and image (anime list: /view (Naruto))\n"
+        "/check <code/name> — Check character details and owners (anime list: /check (Naruto))\n"
         "/addlist — View character add/edit ranking\n\n"
         "🎯 Catching & Rewards\n"
         "/spawn — Spawn a character in the group\n"
@@ -3555,8 +3556,82 @@ CALLCHAR_CHARACTER, CALLCHAR_GROUP = range(600, 602)
 def character_selection_keyboard(user_id, action, rows):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{name} [{code}]", callback_data=f"charselect:{action}:{user_id}:{code}")]
-        for code, name, anime, rarity, worth, photo in rows
+        for code, name, anime, rarity, worth, photo in list(rows)[:99]   # Telegram allows at most 100 buttons
     ])
+
+ANIME_PAGE_SIZE = 20
+_ANIME_PAGES = {}   # token -> {"uid", "action", "rows", "title"}; kept in memory, oldest dropped first
+
+def parse_anime_query(query):
+    """'(Naruto)' or '[Naruto]' -> 'Naruto'.  Anything else -> None (normal character-name search)."""
+    m = re.fullmatch(r"\s*[\(\[]\s*(.+?)\s*[\)\]]\s*", query or "")
+    return m.group(1) if m else None
+
+def anime_page_markup(token, page):
+    data = _ANIME_PAGES.get(token)
+    if not data:
+        return None
+    rows, uid, action = data["rows"], data["uid"], data["action"]
+    pages = max(1, (len(rows) + ANIME_PAGE_SIZE - 1) // ANIME_PAGE_SIZE)
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * ANIME_PAGE_SIZE:(page + 1) * ANIME_PAGE_SIZE]
+    keyboard = [
+        [InlineKeyboardButton(f"{name} [{code}]", callback_data=f"charselect:{action}:{uid}:{code}")]
+        for code, name, anime, rarity, worth, photo in chunk
+    ]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️ Back", callback_data=f"charpage:{token}:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"charpage:{token}:{page}"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ➡️", callback_data=f"charpage:{token}:{page + 1}"))
+        keyboard.append(nav)
+    return InlineKeyboardMarkup(keyboard)
+
+async def reply_anime_character_list(update, action, anime_query):
+    """Handles /check (Anime) and /view (Anime). Returns the single character if only one matches, else None."""
+    rows = list(await asyncio.to_thread(mongo_db.find_characters_by_anime, anime_query))
+    if not rows:
+        await safe_reply_text(update.message, "❌ Anime not found.")
+        return None
+    if len(rows) == 1:
+        return rows[0]
+    token = uuid.uuid4().hex[:8]
+    _ANIME_PAGES[token] = {"uid": update.effective_user.id, "action": action, "rows": rows}
+    while len(_ANIME_PAGES) > 300:
+        _ANIME_PAGES.pop(next(iter(_ANIME_PAGES)))
+    await safe_reply_text(
+        update.message,
+        f"📺 {len(rows)} characters found for \"{anime_query}\". Select one:",
+        reply_markup=anime_page_markup(token, 0),
+    )
+    return None
+
+async def character_page_callback(update, context):
+    query = update.callback_query
+    parts = (query.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "charpage":
+        await query.answer()
+        return
+    token = parts[1]
+    data = _ANIME_PAGES.get(token)
+    if not data:
+        await query.answer("⚠️ This list is outdated. Please run the command again.", show_alert=True)
+        return
+    if query.from_user.id != data["uid"]:
+        await query.answer("❌ This selection belongs to another user.", show_alert=True)
+        return
+    try:
+        page = int(parts[2])
+    except ValueError:
+        await query.answer()
+        return
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=anime_page_markup(token, page))
+    except Exception:
+        pass   # same page tapped again: Telegram says "message is not modified"
 
 async def character_selection_callback(update, context):
     query = update.callback_query
@@ -3590,6 +3665,11 @@ async def character_selection_callback(update, context):
         return CALLCHAR_GROUP
     if action == "check":
         await send_character_check_result(context.bot, query.message.chat_id, character, query.message)
+        return
+    if action == "view":
+        # header should show the person who tapped, not the bot that owns the button message
+        who = _NS(from_user=query.from_user)
+        await send_character_view_result(context.bot, query.message.chat_id, query.from_user.id, character, who)
         return
     if action == "edit":
         if await asyncio.to_thread(mongo_db.is_evolution_character, code):   # normal characters only
@@ -4803,35 +4883,71 @@ async def daily_shop_reset_job(_context):
         print("Daily shop reset error:", e)
     await dm_cleanup()      # also drop DM messages older than 5 days
 
+def _match_rarity(text):
+    """'legendary' / 'Mythcal' / 'cel' -> the real tier name, or None."""
+    import difflib
+    t = (text or "").strip().lower()
+    names = list(SYMBOL.keys())
+    for n in names:
+        if n.lower() == t:
+            return n
+    pref = [n for n in names if t and n.lower().startswith(t)]
+    if len(pref) == 1:
+        return pref[0]
+    close = difflib.get_close_matches(t, [n.lower() for n in names], n=1, cutoff=0.7)
+    return next((n for n in names if n.lower() == close[0]), None) if close else None
+
 async def characters(update, context):
-    rows = (await asyncio.to_thread(get_all_characters))
+    header = "🎭 Character List"
+    if context.args:
+        tier = _match_rarity(" ".join(context.args))
+        if not tier:
+            await safe_reply_text(update.message,
+                "❌ Unknown tier. Use: " + ", ".join(SYMBOL.keys()) + "\nExample: /characters legendary")
+            return
+        rows = [r for r in (await asyncio.to_thread(get_all_characters)) if r[3] == tier]   # full list, not just the spawn pool
+        header = f"🎭 {SYMBOL[tier]} {tier} Characters ({len(rows or [])})"
+        if not rows:
+            await safe_reply_text(update.message, f"❌ No {tier} characters found.")
+            return
+    else:
+        rows = (await asyncio.to_thread(get_all_characters))
+        if not rows:
+            await safe_reply_text(update.message, "❌ No characters found.")
+            return
 
-    if not rows:
-        await safe_reply_text(update.message, "❌ No characters found.")
-        return
-
-    text = "🎭 Character List\n\n"
-    text += "\n".join(
+    lines = [
         f"{i}. {rarity_text(r)} {name} [{code}]"
         for i, (code, name, anime, r, worth, photo) in enumerate(rows, 1)
-    )
-
-    for i in range(0, len(text), 3800):
-        await safe_reply_text(update.message, text[i:i + 3800])
+    ]
+    chunk = header + "\n\n"
+    for line in lines:
+        if len(chunk) + len(line) + 1 > 3800:
+            await safe_reply_text(update.message, chunk)
+            chunk = ""
+        chunk += line + "\n"
+    if chunk.strip():
+        await safe_reply_text(update.message, chunk)
 
 async def view(update, context):
     (await save_user_async(update.effective_user))
     if not context.args:
         await safe_reply_text(update.message,
             "Usage: /view <4-digit code, first name, last name, or full name>\n"
-            "Examples: /view 1001, /view Yuji, /view Itadori, /view Yuji Itadori"
+            "Examples: /view 1001, /view Yuji, /view Itadori, /view Yuji Itadori\n"
+            "Anime list: /view (Naruto)"
         )
         return
 
     query = " ".join(context.args).strip()
     character = None
+    anime_query = parse_anime_query(query)
 
-    if query.isdigit():
+    if anime_query:
+        character = await reply_anime_character_list(update, "view", anime_query)
+        if not character:
+            return
+    elif query.isdigit():
         character = (await asyncio.to_thread(get_character_by_code, query))
     else:
         name_rows = (await asyncio.to_thread(find_characters_by_name_parts, query))
@@ -4839,28 +4955,24 @@ async def view(update, context):
             character = name_rows[0]
         elif len(name_rows) > 1:
             await safe_reply_text(update.message,
-                "❓ Multiple characters found. Please use the 4-digit code."
+                "❓ Multiple characters found. Select one:",
+                reply_markup=character_selection_keyboard(update.effective_user.id, "view", name_rows),
             )
             return
-        else:
-            rows = (await asyncio.to_thread(mongo_db.find_characters_by_anime, query))
-            if len(rows) == 1:
-                character = rows[0]
-            elif len(rows) > 1:
-                await safe_reply_text(update.message,
-                    "❓ Multiple characters found. Please use the 4-digit code."
-                )
-                return
 
     if not character:
         await safe_reply_text(update.message, "❌ Character not found.")
         return
 
+    await send_character_view_result(context.bot, update.message.chat_id, update.effective_user.id, character, update.message)
+
+async def send_character_view_result(bot, chat_id, user_id, character, source_message=None):
+    """The /view result for ONE character (used by /view and by the name-selection buttons)."""
     code, name, anime, rarity, worth, photo = character
 
-    owned = (await asyncio.to_thread(mongo_db.user_owns, update.effective_user.id, str(code)))
+    owned = (await asyncio.to_thread(mongo_db.user_owns, user_id, str(code)))
     if not owned:
-        await safe_reply_text(update.message, "❌ This character is not in your collection.")
+        await bot.send_message(chat_id=chat_id, text="❌ This character is not in your collection.")
         return
 
     text = (
@@ -4874,14 +4986,15 @@ async def view(update, context):
         text += "\n🚫 Discontinued — no longer spawns"
 
     if photo:
-        await context.bot.send_photo(
-            chat_id=update.message.chat_id,
+        await bot.send_photo(
+            chat_id=chat_id,
             photo=photo,
-            caption=add_display_name_header(update.message, text),
+            caption=add_display_name_header(source_message, text) if source_message else text,
             parse_mode="HTML",
         )
     else:
-        await safe_reply_text(update.message, text + "\n📷 Photo: Not added")
+        text += "\n📷 Photo: Not added"
+        await bot.send_message(chat_id=chat_id, text=add_display_name_header(source_message, text) if source_message else text)
 
 # ---------------------------------------------------------------------------
 # Broadcast (/help -> 📣 Broadcast): targets -> message -> pin -> summary -> Confirm.
@@ -5949,13 +6062,19 @@ async def check(update, context):
     if not query:
         await safe_reply_text(
             update.message,
-            "Usage: /check <4-digit code, first name, last name, or full name>",
+            "Usage: /check <4-digit code, first name, last name, or full name>\n"
+            "Anime list: /check (Naruto)",
         )
         return
 
     character = None
+    anime_query = parse_anime_query(query)
 
-    if query.isdigit():
+    if anime_query:
+        character = await reply_anime_character_list(update, "check", anime_query)
+        if not character:
+            return
+    elif query.isdigit():
         character = (await asyncio.to_thread(get_character_by_code, query))
     else:
         matches = (await asyncio.to_thread(find_characters_by_name_parts, query))
@@ -5970,49 +6089,6 @@ async def check(update, context):
             return
         if len(matches) == 1:
             character = matches[0]
-        else:
-            recruit_matches = (await asyncio.to_thread(find_characters_by_recruit_name_partial, query))
-            if len(recruit_matches) > 1:
-                await safe_reply_text(
-                    update.message,
-                    "❓ Multiple characters found. Select one:",
-                    reply_markup=character_selection_keyboard(
-                        update.effective_user.id, "check", recruit_matches
-                    ),
-                )
-                return
-            if len(recruit_matches) == 1:
-                character = recruit_matches[0]
-
-            if not character:
-                rows = (await asyncio.to_thread(mongo_db.find_characters_by_anime, query))
-
-                if len(rows) > 1:
-                    await safe_reply_text(
-                        update.message,
-                        "❓ Multiple characters found. Select one:",
-                        reply_markup=character_selection_keyboard(
-                            update.effective_user.id, "check", rows
-                        ),
-                    )
-                    return
-                if len(rows) == 1:
-                    character = rows[0]
-
-    if not character:
-        rows = (await asyncio.to_thread(mongo_db.find_characters_by_anime, query))
-
-        if len(rows) == 1:
-            character = rows[0]
-        elif len(rows) > 1:
-            await safe_reply_text(
-                update.message,
-                "❓ Multiple characters found. Select one:",
-                reply_markup=character_selection_keyboard(
-                    update.effective_user.id, "check", rows
-                ),
-            )
-            return
 
     if not character:
         await safe_reply_text(update.message, "❌ Character not found.")
@@ -13757,7 +13833,8 @@ def main():
     # Strict role check for restricted commands: after the approved-group check, before every real handler.
     app.add_handler(MessageHandler(filters.COMMAND & filters.UpdateType.MESSAGE, role_gate), group=-90)
     app.add_handler(CallbackQueryHandler(exchange_callback, pattern=r"^ex_(accept|decline):"))
-    app.add_handler(CallbackQueryHandler(character_selection_callback, pattern=r"^charselect:check:"))
+    app.add_handler(CallbackQueryHandler(character_selection_callback, pattern=r"^charselect:(check|view):"))
+    app.add_handler(CallbackQueryHandler(character_page_callback, pattern=r"^charpage:"))
     app.add_handler(ChatMemberHandler(track_bot_membership, ChatMemberHandler.MY_CHAT_MEMBER), group=-2)
 
     public_handlers = (
