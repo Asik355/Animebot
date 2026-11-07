@@ -116,6 +116,7 @@ import mongo_db
 import fusion  # Special Stone Daily Task System
 import theme   # Bot Theme Customization (Owner: /help -> Owner Commands -> 🎨 Customize Bot)
 import badge_banner  # Character badges + profile banners (all logic lives in badge_banner.py)
+import festival  # Festivals: timed quests + hidden event card/banner (all logic lives in festival.py)
 
 
 def _mc(name):
@@ -1756,13 +1757,14 @@ def set_recruit_names(character_code, names):
     return mongo_db.set_recruit_names(character_code, names)
 
 def find_character_by_recruit_name(value):
-    return mongo_db.find_character_by_recruit_name(value)
+    row = mongo_db.find_character_by_recruit_name(value)
+    return None if row and festival.is_hidden(row[0]) else row      # festival event cards never show in searches
 
 def find_characters_by_recruit_name_partial(value):
     return mongo_db.find_characters_by_recruit_name_partial(value)
 
 def find_characters_by_name_parts(query):
-    return mongo_db.find_characters_by_name_parts(query)
+    return festival.filter_hidden(mongo_db.find_characters_by_name_parts(query))
 
 def get_character(value):
     value = str(value).strip()
@@ -1785,10 +1787,10 @@ def get_character_by_code(code):
     return mongo_db.get_character_by_code(code.zfill(4))
 
 def get_all_characters():
-    return mongo_db.get_all_characters()
+    return festival.filter_hidden(mongo_db.get_all_characters())     # festival event cards stay out of /characters
 
 def get_characters_by_rarity(rarity):
-    return mongo_db.get_characters_by_rarity(rarity)
+    return festival.filter_hidden(mongo_db.get_characters_by_rarity(rarity))     # spawns, /daily and shops never pick event cards
 
 def is_character_discontinued(code):
     return mongo_db.is_character_discontinued(code)
@@ -1919,7 +1921,7 @@ def _build_help_text_raw():
         "/claimstone — Claim the stones of your completed tasks\n"
         "/stone — Stone leaderboard\n"
         "/item — View your items (personal inventory)\n\n"
-        + badge_banner.PUBLIC_HELP_SECTION +
+        + badge_banner.PUBLIC_HELP_SECTION + festival.PUBLIC_HELP_SECTION +
         "📜 Rules\n"
         "/rules — View the bot usage rules (/rules noformat for raw text)\n\n"
         "👥 Staff\n"
@@ -2140,6 +2142,7 @@ def _module_button(label, callback_data):
 HELP_MODULES["owner"].append(("addedit", "🎴 Add & Edit", _addedit_page("owner")))
 HELP_MODULES["executive"].append(("addedit", "🎴 Add & Edit", _addedit_page("executive")))
 HELP_MODULES["executive"].append(badge_banner.help_module())      # 🏅 Badges (copied into the Owner menu by the loop below)
+HELP_MODULES["owner"].append(festival.help_module())              # 🪔 Festival (Owner only)
 
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Please run /help to open your own menu."
 # Executive and Scout modules stay in their own menus AND are copied (same text) into the Owner menu.
@@ -2169,7 +2172,7 @@ def _help_module_visible(key, user_id):
         return False
     if key == "scouts" and is_owner(uid):
         return False
-    if key in ("customize", "autoapprove") and not is_owner(uid):
+    if key in ("customize", "autoapprove", "festival") and not is_owner(uid):
         return False
     return True
 
@@ -2181,6 +2184,8 @@ def help_grid_keyboard(role, owner_id):
             return f"theme:{owner_id}:hub:open"
         if key == "autoapprove":
             return f"aa:{owner_id}:hub"
+        if key == "festival":
+            return f"fs:hub:{owner_id}"          # 🪔 Festival Manager (festival.py)
         if key == "broadcast":
             return "bc:h"
         return f"help:{owner_id}:{role}:{key}"
@@ -4038,6 +4043,7 @@ async def add(update, context):
         user_id, caught_rarity, caught_spawn["code"],
         event_id=(f"catch:{caught_spawn['history_id']}" if caught_spawn.get("history_id") else None),
         chat_id=chat_id, name=_who)  # daily mission progress + "mission complete - claim it" message (never raises)
+    await festival.record(context.bot, user_id, "catch", rarity=caught_rarity, chat_id=chat_id, name=_who)   # festival quests (never raises)
 
 async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
     rows = (await asyncio.to_thread(mongo_db.get_collection_summary, user_id))
@@ -4563,7 +4569,7 @@ def choose_shop_characters(exclude_codes=None, cursor=None):
     for rarity in SHOP_RARITIES:
         taken = exclude | {str(row[0]) for row in chosen}
         pool = [
-            r for r in mongo_db.get_characters_by_rarity(rarity)
+            r for r in festival.filter_hidden(mongo_db.get_characters_by_rarity(rarity))
             if r[3] != "Celestial" and str(r[0]) not in taken
         ]
         if not pool:
@@ -7239,6 +7245,8 @@ async def daily(update, context):
                 )
             except Exception as e:
                 print("Daily photo error:", e)
+    await festival.record(context.bot, user_id, "daily", chat_id=update.message.chat_id,
+                          name=berry_display_name(update.effective_user))     # festival quests (never raises)
 
 ADD_NAME, ADD_RECRUIT, ADD_ANIME, ADD_RARITY, ADD_WORTH, ADD_CODE, ADD_PHOTO = range(7)
 
@@ -7792,6 +7800,7 @@ def purge_user_data(user_id):
         _mc("shop_purchases_v2").delete_many({"user_id": uid}, session=session)
         _mc("shop_free_refresh_v1").delete_one({"_id": uid}, session=session)
         badge_banner.purge_user(uid, session)        # badge claims + equipped banner
+        festival.purge_user(uid, session)            # festival progress, claims, event-banner grants, wishes
         removed = _mc(mongo_db.USERS).delete_one({"_id": uid}, session=session).deleted_count
         return copies, removed
     return mongo_db.run_transaction(_work)
@@ -7986,6 +7995,7 @@ def _archive_user_data(uid):
             ("shop_v3", {"user_id": uid}), ("shop_purchases_v2", {"user_id": uid}),
             ("shop_free_refresh_v1", {"_id": uid})]
     spec += [(name, {key: uid}) for name, key in badge_banner.USER_DATA_SPEC]      # badge claims + equipped banner
+    spec += [(name, {key: uid}) for name, key in festival.USER_DATA_SPEC]          # festival progress, claims, event-banner grants
     data = {name: list(_mc(name).find(flt)) for name, flt in spec}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     doc = {"archived_at": stamp, "user_id": uid,
@@ -8216,7 +8226,7 @@ async def _dacct_answer(q, text=None, alert=False):
 # Same collections (and the same ownership keys) that purge_user_data removes / _archive_user_data saves.
 _RESTORE_SPEC = ((mongo_db.USERS, "_id"), (mongo_db.COLLECTIONS, "user_id"), (mongo_db.FAVORITES, "_id"),
                  (mongo_db.NOTIFICATIONS, "_id"), ("shop_v3", "user_id"), ("shop_purchases_v2", "user_id"),
-                 ("shop_free_refresh_v1", "_id")) + badge_banner.USER_DATA_SPEC
+                 ("shop_free_refresh_v1", "_id")) + badge_banner.USER_DATA_SPEC + festival.USER_DATA_SPEC
 # Review bookkeeping that must never come back with a restored profile (it would leave the user stuck in "deleting").
 _RESTORE_STRIP_USER_FIELDS = ("deleted_review", "deleted_review_at", "deleted_review_reason",
                               "deleted_review_token", "deleted_review_confirm_at", "missing_strikes")
@@ -8520,6 +8530,7 @@ def _move_user_data(plan, old, new):
                         _mc(name).insert_one(nd, session=session)
                         inserted.append((name, new))
             badge_banner.move_user_data(data, new, session, inserted)      # badge claims + equipped banner (never overwrites)
+            festival.move_user_data(data, new, session, inserted)          # festival progress, claims, event-banner grants
             res = _mc(mongo_db.USERS).update_one({"_id": new}, {"$set": carry}, session=session)
             if not res.matched_count:
                 raise ValueError("the new account disappeared")
@@ -12738,8 +12749,9 @@ COMMANDS = {
     "logmappings": "Owner: list command -> log category mappings",
 }
 COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
+COMMANDS.update(festival.COMMAND_DESCRIPTIONS)
 
-PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | {
+PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | festival.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
@@ -13622,7 +13634,7 @@ OWNER_COMMANDS = {
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
     "logroute", "unlogroute", "logroutes", "logdefault",
-}
+} | festival.OWNER_COMMANDS       # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
 def register_owner_commands(app):
@@ -13897,6 +13909,9 @@ def main():
     badge_banner.bind(is_owner=is_owner, is_executive=is_executive, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text,
                       cancel_all=cancel_conversation, mark_success=mark_success, items_per_page=ITEMS_PER_PAGE)
     badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner
+    festival.bind(is_owner=is_owner, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text, cancel_all=cancel_conversation,
+                  mark_success=mark_success, save_user=save_user_async, timestamp=timestamp, rarities=tuple(r for r in SYMBOL if r != "Heavenly"))
+    festival.register(app)       # /quests + owner /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 
     register_executive_commands(app)
     register_owner_commands(app)

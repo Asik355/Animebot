@@ -83,7 +83,8 @@ STAFF_COMMANDS = {"addbanner", "editbanner", "delbanner"}   # Owner + Executive 
 # command, so when a menu is too long these are left OUT of the menu (least essential first). They all keep working
 # when typed, and they stay in /help. Only the first entries needed to get down to the limit are ever dropped.
 MENU_LIMIT = 100
-MENU_TRIM_ORDER = ("delbanner", "editbanner", "addbanner", "scout", "logmappings")
+MENU_TRIM_ORDER = ("delquest", "delfestival", "editquest", "editfestival", "festivals",
+                   "delbanner", "editbanner", "addbanner", "scout", "logmappings")
 
 
 def fit_command_menu(commands, limit=MENU_LIMIT):
@@ -187,9 +188,18 @@ def normalize_banner_code(value):
     return None
 
 
+FESTIVAL_GRANTS = "festival_grants_v1"     # festival.py: permanent event-banner grants {user_id, kind: "banner", token: "FB<code>"}
+
+
 def owned_codes(uid):
-    """Set of character codes the user owns RIGHT NOW (one document per copy in `collections`)."""
-    return {str(c) for c in mongo_db.col(mongo_db.COLLECTIONS).distinct("character_code", {"user_id": int(uid)})}
+    """Set of character codes the user owns RIGHT NOW (one document per copy in `collections`), plus the pseudo codes
+    ("FB<banner code>") of event banners the user earned in a festival (permanent, see festival.py)."""
+    owned = {str(c) for c in mongo_db.col(mongo_db.COLLECTIONS).distinct("character_code", {"user_id": int(uid)})}
+    try:
+        owned |= {str(t) for t in mongo_db.col(FESTIVAL_GRANTS).distinct("token", {"user_id": int(uid), "kind": "banner"})}
+    except Exception as e:      # festival data must never break banners
+        logger.warning("festival banner grants lookup failed: %s", e)
+    return owned
 
 
 def _names(codes):
@@ -405,8 +415,11 @@ def banner_rows(uid):
     eq_code = equipped.get("banner_code") if equipped else None
     rows = []
     for b in banners:
-        rows.append({"banner": b, "unlocked": is_unlocked(b, owned), "owned": owned, "names": names,
-                     "equipped": eq_code == b["_id"] and is_unlocked(b, owned)})
+        unlocked = is_unlocked(b, owned)
+        if b.get("festival_id") and not unlocked:      # event banner: hidden from everyone who did not earn it
+            continue
+        rows.append({"banner": b, "unlocked": unlocked, "owned": owned, "names": names,
+                     "equipped": eq_code == b["_id"] and unlocked})
     return rows
 
 
@@ -428,6 +441,8 @@ def equip_banner(uid, code):
     if banner is None:
         return {"status": "no_banner", "code": code}
     owned = owned_codes(uid)
+    if banner.get("festival_id") and not is_unlocked(banner, owned):
+        return {"status": "no_banner", "code": code}     # event banner you did not earn: invisible
     if not is_unlocked(banner, owned):
         missing = [s for s in banner_slots(banner) if not slot_filled(s, owned)]     # unfilled slots
         return {"status": "locked", "banner": banner, "names": _names(slots_codes(missing)), "missing": missing}
@@ -775,14 +790,18 @@ def _banner_detail(uid, code):
         return None, None
     owned = owned_codes(uid)
     slots = banner_slots(banner)
-    names = _names(slots_codes(slots))
     unlocked = is_unlocked(banner, owned)
+    if banner.get("festival_id") and not unlocked:
+        return None, None                                  # event banner you did not earn: invisible
+    names = _names(slots_codes(slots))
     eq_doc = _col(USER_BANNERS).find_one({"_id": int(uid)})
     equipped = bool(unlocked and eq_doc and eq_doc.get("banner_code") == banner["_id"])
     lines = [f"🎌 {_esc(banner['name'])}", f"Code: {banner['_id']}",
              "Status: " + ("🔓 Unlocked" if unlocked else "🔒 Locked") + ("  ⭐ EQUIPPED" if equipped else ""),
              "", "Required characters:"]
-    for slot in slots:
+    if banner.get("festival_id"):
+        lines.append("🪔 Event banner - earned in a festival quest (permanent).")
+    for slot in ([] if banner.get("festival_id") else slots):
         mark = "✅" if slot_filled(slot, owned) else "❌"
         lines.append(f"{mark} {_label(slot[0], names)}")
         for c in slot[1:]:
