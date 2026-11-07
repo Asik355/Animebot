@@ -1092,8 +1092,8 @@ async def _cancel_flow(update, context):
 # /festivals, /delfestival, /delquest
 # ==========================================================================
 async def festivals_command(update, context):
-    if not await _guard_owner(update):
-        return
+    user = update.effective_user
+    owner = user is not None and _is_owner(user.id)         # everyone can see the festivals; only the owner sees the manage commands
     try:
         fests = await asyncio.to_thread(all_festivals)
         texts = [await asyncio.to_thread(_festival_summary, f) for f in fests]
@@ -1102,12 +1102,12 @@ async def festivals_command(update, context):
         await _reply(update.effective_message, "❌ Could not load festivals right now.")
         return
     if not texts:
-        await _reply(update.effective_message, "No festivals yet. Create one with /addfestival (private chat).")
+        await _reply(update.effective_message, "No festivals yet." + (" Create one with /addfestival (private chat)." if owner else ""))
         return
     body = "\n\n".join(texts)
-    await _reply(update.effective_message, "🎉 Festivals\n\n" + body +
-                 "\n\nManage: /addfestival, /editfestival &lt;code&gt;, /delfestival &lt;code&gt;, "
-                 "/addquest &lt;code&gt;, /editquest &lt;id&gt;, /delquest &lt;id&gt;", parse_mode="HTML")
+    manage = ("\n\nManage: /addfestival, /editfestival &lt;code&gt;, /delfestival &lt;code&gt;, "
+              "/addquest &lt;code&gt;, /editquest &lt;id&gt;, /delquest &lt;id&gt;") if owner else ""
+    await _reply(update.effective_message, "🎉 Festivals\n\n" + body + manage, parse_mode="HTML")
     _ok(update)
 
 
@@ -2430,6 +2430,7 @@ HELP_LABEL = "🪔 Festival"
 PUBLIC_HELP_SECTION = (
     "🪔 Festival Quests\n"
     "/quests — View festival rewards and your progress\n"
+    "/festivals — See running and upcoming festivals: wish phrase, start and end dates, and rewards\n"
     "/special — See every special festival character and banner (/special <name or code> for one)\n\n"
 )
 
@@ -2438,7 +2439,7 @@ def help_page_text():
     entries = [
         ("/festival", "Open the Festival Manager (buttons for everything)"),
         ("/addfestival", "Create a festival (guided, PM only): name, wish phrase, start and end time (India time)"),
-        ("/festivals", "List every festival with its code, status and quests"),
+        ("/festivals", "List every festival with its code, status and quests (everyone can use it; the manage commands show only to you)"),
         ("/editfestival <code>", "Change a festival's name, wish phrase, start or end"),
         ("/delfestival <code>", "Delete a festival and its quests (earned cards and banners are kept)"),
         ("/addtempchar", "Create a SPECIAL-tier event character (hidden from the normal lists; only quests give it out)"),
