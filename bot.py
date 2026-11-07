@@ -2053,7 +2053,7 @@ HELP_MODULES = {
         ("events", "🎉 Events & Codes", _help_page(
             "🎉 Events & Redeem Codes (Owner only)",
             "Run a timed event with a trigger word and reward, and manage redeem codes (members use /redeem <code>).",
-            [("/addevent", "Guided setup: name, code, reward, trigger text, end date and time"),
+            [("/addevent", "Guided setup: name, code, rewards (Berrys + Stones + character), trigger text, claims per user, end date and time"),
              ("/endevent", "End the active event"),
              ("/addredeem", "Guided setup: type, reward, claim limit, expiry, code"),
              ("/deleteredeem CODE", "Disable a code"),
@@ -2341,6 +2341,20 @@ def format_reward(reward_type, reward_value):
             return f"🎭 {character[1]} [{character[0]}]"
         return f"🎭 Character code {reward_value}"
     return str(reward_value)
+
+def event_rewards(ev):
+    """{'berrys': n, 'stones': n, 'card': code} of an event; old single-reward events are converted."""
+    ev = ev or {}
+    if ev.get("rewards"):
+        return ev["rewards"]
+    k = {"coins": "berrys", "stones": "stones", "character": "card"}.get(ev.get("reward_type"))
+    return {k: ev["reward_value"]} if k else {}
+
+def format_event_rewards(rw):
+    parts = [format_reward("character", rw["card"]) if rw.get("card") else None,
+             format_reward("coins", rw["berrys"]) if rw.get("berrys") else None,
+             format_reward("stones", rw["stones"]) if rw.get("stones") else None]
+    return " + ".join(x for x in parts if x)
 
 def get_spawn_lock(app):
     lock = app.bot_data.get("spawn_lock")
@@ -4070,6 +4084,7 @@ async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
     else:
         rows.sort(key=lambda r: (rarity_order.get(r[3], 99), r[1].lower()))
 
+    rows.sort(key=lambda r: r[3] != "Special")      # festival special characters always first, in every sort (stable)
     return rows
 
 def get_favorite_code(user_id):
@@ -10159,20 +10174,25 @@ async def event(update, context):
     except (TypeError, ValueError):
         end_text = end_at or "Not set"
 
-    claimed = (await asyncio.to_thread(_mc("event_claims_v2").find_one, {"event_id": event_id, "user_id": update.effective_user.id})) is not None
+    rw, limit = event_rewards(_ev), int((_ev or {}).get("max_per_user") or 1)
+    _c = (await asyncio.to_thread(_mc("event_claims_v2").find_one, {"event_id": event_id, "user_id": update.effective_user.id}))
+    n = int(_c.get("count") or 1) if _c else 0
 
     text = (
         f"🎉 EVENT: {name}\n\n"
         f"{description or 'Special event is live!'}\n\n"
-        f"🎁 Reward: {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
+        f"🎁 Reward: {(await asyncio.to_thread(format_event_rewards, rw))}\n"
         f"💬 Trigger: {trigger_text}\n"
         f"⏰ Ends: {end_text}"
     )
-    if claimed:
+    if limit > 1:
+        text += f"\n🔁 Claimed: {n}/{limit}"
+    if n >= limit:
         text += "\n\n✅ You have already claimed this event reward."
     await safe_reply_text(update.message, text)
 
-EVENT_NAME, EVENT_CODE, EVENT_REWARD_TYPE, EVENT_REWARD_VALUE, EVENT_TRIGGER, EVENT_END_DAY, EVENT_END_MONTH, EVENT_END_YEAR, EVENT_END_HOUR, EVENT_END_MINUTE = range(400,410)
+EVENT_NAME, EVENT_CODE, EVENT_BERRYS, EVENT_STONES, EVENT_TRIGGER, EVENT_END_DAY, EVENT_END_MONTH, EVENT_END_YEAR, EVENT_END_HOUR, EVENT_END_MINUTE = range(400,410)
+EVENT_CHAR, EVENT_LIMIT = 410, 411
 
 async def add_event_start(update, context):
     if not is_owner(update.effective_user.id):
@@ -10197,32 +10217,43 @@ async def add_event_code(update, context):
         await safe_reply_text(update.message, "❌ This event code is already in use (capital and small letters count as the same). Send another code:")
         return EVENT_CODE
     context.user_data["event_code"]=text
-    await safe_reply_text(update.message, "3️⃣ Reward type: Berrys, Character or Stone")
-    return EVENT_REWARD_TYPE
+    await safe_reply_text(update.message, "3️⃣ Berrys amount (send 0 to skip):")
+    return EVENT_BERRYS
 
-async def add_event_reward_type(update, context):
-    text=update.message.text.strip().lower()
-    if text not in ("coin", "coins", "berrys", "character", "stone", "stones", "special stone", "special stones"):
-        await safe_reply_text(update.message, "❌ Send Berrys, Character or Stone."); return EVENT_REWARD_TYPE
-    context.user_data["event_reward_type"]=("coins" if text in ("coin", "coins", "berrys") else "character" if text == "character" else "stones")
-    await safe_reply_text(update.message, {"coins": "4️⃣ Send Berrys amount:", "stones": "4️⃣ Send Special Stones amount:",
-                                           "character": "4️⃣ Send character code or character name:"}[context.user_data["event_reward_type"]])
-    return EVENT_REWARD_VALUE
+def _amount_or_skip(text):
+    t = (text or "").strip().lower()
+    return 0 if t in ("0", "none", "skip") else _positive_amount(t)
 
-async def add_event_reward_value(update, context):
-    text=update.message.text.strip()
-    if context.user_data.get("event_reward_type") == "character":
+async def add_event_berrys(update, context):
+    amount = _amount_or_skip(update.message.text)
+    if amount is None:
+        await safe_reply_text(update.message, "❌ Send a positive number, or 0 to skip."); return EVENT_BERRYS
+    context.user_data["event_berrys"] = amount
+    await safe_reply_text(update.message, "4️⃣ Special Stones amount (send 0 to skip):")
+    return EVENT_STONES
+
+async def add_event_stones(update, context):
+    amount = _amount_or_skip(update.message.text)
+    if amount is None:
+        await safe_reply_text(update.message, "❌ Send a positive number, or 0 to skip."); return EVENT_STONES
+    context.user_data["event_stones"] = amount
+    await safe_reply_text(update.message, "5️⃣ Character code or name (send none to skip):")
+    return EVENT_CHAR
+
+async def add_event_char(update, context):
+    text = update.message.text.strip()
+    d = context.user_data
+    d["event_card"] = None
+    if text.lower() not in ("none", "skip", "0"):
         character = (await asyncio.to_thread(get_character, text))
         if not character:
-            await safe_reply_text(update.message, "❌ Character not found. Use a 4-digit code, first name, last name, or full name.")
-            return EVENT_REWARD_VALUE
-        context.user_data["event_reward_value"] = int(character[0])
-    else:
-        amount = _positive_amount(text)
-        if amount is None:
-            await safe_reply_text(update.message, "❌ Send a valid positive number."); return EVENT_REWARD_VALUE
-        context.user_data["event_reward_value"]=amount
-    await safe_reply_text(update.message, "5️⃣ Exact trigger phrase users must type:")
+            await safe_reply_text(update.message, "❌ Character not found. Use a 4-digit code, first name, last name, or full name (or none to skip).")
+            return EVENT_CHAR
+        d["event_card"] = int(character[0])
+    if not (d.get("event_berrys") or d.get("event_stones") or d.get("event_card")):
+        await safe_reply_text(update.message, "❌ Give at least one reward. Send the Berrys amount again (0 to skip):")
+        return EVENT_BERRYS
+    await safe_reply_text(update.message, "6️⃣ Exact trigger phrase users must type:")
     return EVENT_TRIGGER
 
 async def add_event_trigger(update, context):
@@ -10230,7 +10261,15 @@ async def add_event_trigger(update, context):
     if not text or text.startswith("/"):
         await safe_reply_text(update.message, "❌ Trigger phrase required and cannot start with /."); return EVENT_TRIGGER
     context.user_data["event_trigger"]=text
-    await safe_reply_text(update.message, "6️⃣ Send end date — DD (day) only:")
+    await safe_reply_text(update.message, "7️⃣ How many times can each user claim the reward? (1-1000):")
+    return EVENT_LIMIT
+
+async def add_event_limit(update, context):
+    n = _positive_amount(update.message.text, 1000)
+    if n is None:
+        await safe_reply_text(update.message, "❌ Send a number from 1 to 1000."); return EVENT_LIMIT
+    context.user_data["event_limit"] = n
+    await safe_reply_text(update.message, "8️⃣ Send end date — DD (day) only:")
     return EVENT_END_DAY
 
 async def _event_end_error(update, message):
@@ -10285,18 +10324,21 @@ async def add_event_end_minute(update, context):
         await safe_reply_text(update.message,"❌ End time must be in the future.")
         return EVENT_END_MINUTE
     end_at=dt.isoformat(timespec="seconds")
+    rw={k: d[f"event_{k}"] for k in ("berrys","stones","card") if d.get(f"event_{k}")}
+    k0=next(iter(rw)); rewards_text=(await asyncio.to_thread(format_event_rewards, rw))
     def _create_event(session):
         _mc("events_v2").update_many({"active": 1}, {"$set": {"active": 0}}, session=session)
         mongo_db.insert_with_id("events_v2", {
             "name": d["event_name"], "event_code": d["event_code"], "description": "",
-            "reward_type": d["event_reward_type"], "reward_value": d["event_reward_value"],
+            "reward_type": {"berrys":"coins","stones":"stones","card":"character"}[k0], "reward_value": rw[k0],
+            "rewards": rw, "max_per_user": d["event_limit"],
             "end_at": end_at, "active": 1, "created_at": timestamp(), "trigger_text": d["event_trigger"],
         }, session=session)
     (await asyncio.to_thread(mongo_db.run_transaction, _create_event))
     _EVENT_CACHE["val"] = None
     context.user_data.clear()
-    await safe_reply_text(update.message, f"✅ Event created!\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 {(await asyncio.to_thread(format_reward, d['event_reward_type'],d['event_reward_value']))}\n💬 Trigger: {d['event_trigger']}\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}", reply_markup=ReplyKeyboardRemove())
-    await notify_staff_action(context, f"🎉 EVENT ADDED\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 Reward: {(await asyncio.to_thread(format_reward, d['event_reward_type'],d['event_reward_value']))}\n💬 Trigger: {d['event_trigger']}\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}\n👤 By: {display_user(update.effective_user)}", actor_id=update.effective_user.id)
+    await safe_reply_text(update.message, f"✅ Event created!\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 {rewards_text}\n💬 Trigger: {d['event_trigger']}\n🔁 Limit: {d['event_limit']} per user\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}", reply_markup=ReplyKeyboardRemove())
+    await notify_staff_action(context, f"🎉 EVENT ADDED\n🎉 {d['event_name']} [{d['event_code']}]\n🎁 Reward: {rewards_text}\n💬 Trigger: {d['event_trigger']}\n🔁 Limit: {d['event_limit']} per user\n⏰ Ends: {dt.strftime('%d %m %y %I:%M %p')}\n👤 By: {display_user(update.effective_user)}", actor_id=update.effective_user.id)
     await release_conv_log(context, update.effective_user.id, "addevent")      # Yes/No prompt only after success
     return ConversationHandler.END
 
@@ -10317,56 +10359,54 @@ async def event_trigger_message(update, context):
         except ValueError: pass
     uid = update.effective_user.id
     claims = _mc("event_claims_v2")
-    # the unique (event_id, user_id) index makes a double claim impossible
+    ev = (await asyncio.to_thread(_mc("events_v2").find_one, {"_id": event_id}))
+    rw, limit = event_rewards(ev), int((ev or {}).get("max_per_user") or 1)
+    def _take_claim():      # one claim row per (event, user) with a counter; the unique index + the $lt filter keep it atomic
+        r = claims.find_one_and_update({"event_id": event_id, "user_id": uid, "count": {"$lt": limit}}, {"$inc": {"count": 1}})
+        if r:
+            return r["_id"], r["count"] + 1
+        return claims.insert_one({"event_id": event_id, "user_id": uid, "count": 1, "claimed_at": timestamp()}).inserted_id, 1
     try:
-        claim_id = (await asyncio.to_thread(claims.insert_one, {"event_id": event_id, "user_id": uid, "claimed_at": timestamp()})).inserted_id
-    except mongo_db.DuplicateKeyError:
+        claim_id, n = (await asyncio.to_thread(_take_claim))
+    except mongo_db.DuplicateKeyError:      # limit reached: tell the user once, then stay silent until the event ends
+        if await asyncio.to_thread(claims.find_one_and_update, {"event_id": event_id, "user_id": uid, "notified": {"$ne": True}}, {"$set": {"notified": True}}):
+            await safe_reply_text(update.message, f"🚫 You have already claimed this event reward the maximum number of times ({limit}/{limit}).")
         return
+    def _undo_claim():
+        claims.update_one({"_id": claim_id}, {"$inc": {"count": -1}})
+        claims.delete_one({"_id": claim_id, "count": {"$lte": 0}})
 
-    granted_id = None
-    coins_given = False
-    stones_given = False
+    undo = []
     try:
-        if reward_type == "coins":
-            if not (await asyncio.to_thread(mongo_db.add_coins, uid, int(reward_value))):
+        if rw.get("berrys"):
+            amt = int(rw["berrys"])
+            if not (await asyncio.to_thread(mongo_db.add_coins, uid, amt)):
                 raise RuntimeError("event reward user missing")
-            coins_given = True
-            reward = f"🪙 {reward_value} Berrys"
-        elif reward_type == "stones":
-            if not (await asyncio.to_thread(mongo_db.add_special_stones, uid, int(reward_value))):
+            undo.append(lambda amt=amt: mongo_db.add_coins(uid, -amt))
+        if rw.get("stones"):
+            amt = int(rw["stones"])
+            if not (await asyncio.to_thread(mongo_db.add_special_stones, uid, amt)):
                 raise RuntimeError("event reward user missing")
-            stones_given = True
-            reward = format_reward("stones", reward_value)
-        else:
-            char_row = (await asyncio.to_thread(mongo_db.get_character_by_code, str(reward_value)))
-            if not char_row:
-                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
-                return
-            granted_id = (await asyncio.to_thread(mongo_db.add_collection, uid, reward_value, timestamp()))
-            reward = f"🎭 {char_row[1]} [{reward_value}]"
+            undo.append(lambda amt=amt: mongo_db.add_special_stones(uid, -amt))
+        if rw.get("card"):
+            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(rw["card"]))):
+                raise RuntimeError("event reward character missing")
+            gid = (await asyncio.to_thread(mongo_db.add_collection, uid, rw["card"], timestamp()))
+            undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
     except Exception as e:
+        for fn in reversed(undo):
+            try:
+                (await asyncio.to_thread(fn))
+            except Exception as undo_err:
+                print("Event reward undo error:", undo_err)
         try:
-            (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
+            (await asyncio.to_thread(_undo_claim))
         except Exception as undo_err:
             print("Event reward undo error:", undo_err)
-        if coins_given:
-            try:
-                (await asyncio.to_thread(mongo_db.add_coins, uid, -int(reward_value)))
-            except Exception as undo_err:
-                print("Event reward undo error:", undo_err)
-        if stones_given:
-            try:
-                (await asyncio.to_thread(mongo_db.add_special_stones, uid, -int(reward_value)))
-            except Exception as undo_err:
-                print("Event reward undo error:", undo_err)
-        if granted_id is not None:
-            try:
-                (await asyncio.to_thread(mongo_db.delete_collection_by_id, granted_id))
-            except Exception as undo_err:
-                print("Event reward undo error:", undo_err)
         print("Event reward error:", e)
         return
-    await safe_reply_text(update.message, f"🎉 Event reward!\n🎁 {reward}")
+    await safe_reply_text(update.message, f"🎉 Event reward!\n🎁 {(await asyncio.to_thread(format_event_rewards, rw))}"
+                          + (f"\n🔁 Claim {n}/{limit}" if limit > 1 else ""))
 
 END_EVENT_CODE = 500
 
@@ -13691,9 +13731,11 @@ def register_owner_commands(app):
         states={
             EVENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_name)],
             EVENT_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_code)],
-            EVENT_REWARD_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_reward_type)],
-            EVENT_REWARD_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_reward_value)],
+            EVENT_BERRYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_berrys)],
+            EVENT_STONES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_stones)],
+            EVENT_CHAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_char)],
             EVENT_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_trigger)],
+            EVENT_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_limit)],
             EVENT_END_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end_day)],
             EVENT_END_MONTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end_month)],
             EVENT_END_YEAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end_year)],
