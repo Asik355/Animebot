@@ -100,7 +100,7 @@ COMMAND_DESCRIPTIONS = {
     "specialtier": "Owner: set the symbol of the Special tier",
     "festival": "Owner: open the Festival Manager (buttons)",
     "addfestival": "Owner: create a festival (guided, PM only)",
-    "festivals": "Owner: list festivals and their quests",
+    "festivals": "See running and upcoming festivals",
     "editfestival": "Owner: edit a festival (/editfestival <code>)",
     "delfestival": "Owner: delete a festival (/delfestival <code>)",
     "addtempchar": "Owner: create a temporary event character (hidden card)",
@@ -108,8 +108,8 @@ COMMAND_DESCRIPTIONS = {
     "editquest": "Owner: edit a quest (/editquest <quest id>)",
     "delquest": "Owner: delete a quest (/delquest <quest id>)",
 }
-PUBLIC_COMMANDS = {"quests", "special"}
-OWNER_COMMANDS = {"festival", "specialtier", "addfestival", "festivals", "editfestival", "delfestival", "addtempchar", "addquest", "editquest", "delquest"}
+PUBLIC_COMMANDS = {"quests", "special", "festivals"}
+OWNER_COMMANDS = {"festival", "specialtier", "addfestival", "editfestival", "delfestival", "addtempchar", "addquest", "editquest", "delquest"}
 
 # User-owned collections: (collection, field holding the user id). Used by /deleteuser, /restoreuser, /moveuser.
 USER_DATA_SPEC = ((PROGRESS, "user_id"), (CLAIMS, "user_id"), (GRANTS, "user_id"), (PAID, "user_id"))
