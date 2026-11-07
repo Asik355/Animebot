@@ -4051,6 +4051,7 @@ async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
         rows = [r for r in rows if r[3] == rarity]
 
     rarity_order = {
+        "Special": -1,          # festival special characters: their own tier at the top of the collection
         "Heavenly": 0,
         "Celestial": 1,
         "Mythical": 2,
@@ -4081,7 +4082,7 @@ def clear_favorite(user_id):
     mongo_db.clear_favorite(user_id)
 
 # Tier menu (🔹 Tier button): highest tier first. Callback mode format: <sort>[~<Rarity>], e.g. "name~Epic".
-COLLECTION_TIERS = ("Heavenly", "Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
+COLLECTION_TIERS = ("Special", "Heavenly", "Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
 COLLECTION_SORTS = {"tier", "time", "name", "qty"}
 
 
@@ -4093,7 +4094,8 @@ def _parse_coll_mode(value):
 
 def collection_tier_keyboard(user_id, prefix="coll"):
     """The tier menu shown after tapping 🔹 Tier: one tier per row, then Back to the full collection."""
-    rows = [[InlineKeyboardButton(rarity_text(r), callback_data=f"{prefix}:{user_id}:tier~{r}:0")] for r in COLLECTION_TIERS]
+    rows = [[InlineKeyboardButton(rarity_text(r), callback_data=f"{prefix}:{user_id}:tier~{r}:0")]
+            for r in COLLECTION_TIERS if r != "Special" or "Special" in SYMBOL]      # Special tier only exists once the owner set its symbol
     rows.append([InlineKeyboardButton("⬅️ Back", callback_data=f"{prefix}:{user_id}:tier:0")])
     return InlineKeyboardMarkup(rows)
 
@@ -7312,7 +7314,7 @@ async def addcharacter_rarity(update, context):
         return ADD_WORTH
     rarity = text.title()
 
-    if rarity not in SYMBOL or rarity == "Heavenly":
+    if rarity not in SYMBOL or rarity in ("Heavenly", "Special"):
         await safe_reply_text(update.message, "❌ Invalid rarity.")
         return ADD_RARITY
 
@@ -7603,7 +7605,7 @@ async def edit_rarity(update, context):
         rarity = context.user_data["edit_character"][3]
     else:
         rarity = text.title()
-        if rarity not in SYMBOL or rarity == "Heavenly":
+        if rarity not in SYMBOL or rarity in ("Heavenly", "Special"):
             await safe_reply_text(update.message, "❌ Invalid rarity.")
             return EDIT_RARITY
     context.user_data["edit_rarity"] = rarity
@@ -13910,7 +13912,9 @@ def main():
                       cancel_all=cancel_conversation, mark_success=mark_success, items_per_page=ITEMS_PER_PAGE)
     badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner
     festival.bind(is_owner=is_owner, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text, cancel_all=cancel_conversation,
-                  mark_success=mark_success, save_user=save_user_async, timestamp=timestamp, rarities=tuple(r for r in SYMBOL if r != "Heavenly"))
+                  mark_success=mark_success, save_user=save_user_async, timestamp=timestamp,
+                  rarities=tuple(r for r in SYMBOL if r not in ("Heavenly", "Special")), symbols=SYMBOL,
+                  items_per_page=ITEMS_PER_PAGE)
     festival.register(app)       # /quests + owner /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 
     register_executive_commands(app)

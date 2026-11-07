@@ -188,6 +188,18 @@ def normalize_banner_code(value):
     return None
 
 
+def resolve_banner_code(value):
+    """Like normalize_banner_code, but a code of exactly 2 digits ('01') that exists as a SPECIAL festival banner stays 2
+    digits. Special banners use 01-99; normal banners are always shown with 3 digits (001-999). A 2-digit input with no
+    special banner behind it still means the normal banner ('12' -> '012'), so nothing that worked before breaks."""
+    v = str(value or "").strip()
+    if v.isdigit() and len(v) == 2 and 1 <= int(v) <= 99:
+        banner = get_banner(v)
+        if banner is not None and banner.get("festival_id"):
+            return v
+    return normalize_banner_code(v)
+
+
 FESTIVAL_GRANTS = "festival_grants_v1"     # festival.py: permanent event-banner grants {user_id, kind: "banner", token: "FB<code>"}
 
 
@@ -828,9 +840,9 @@ async def banner_command(update, context):
     uid = update.effective_user.id
     arg = (context.args[0] if context.args else "").strip()
     if arg:                                             # /banner 001 -> details of that banner
-        code = normalize_banner_code(arg)
+        code = await asyncio.to_thread(resolve_banner_code, arg)
         if code is None:
-            await _reply(update.effective_message, "❌ Invalid banner code. Use a 3-digit code from /banner, e.g. /banner 001")
+            await _reply(update.effective_message, "❌ Invalid banner code. Use the code from /banner, e.g. /banner 001")
             return
         try:
             _b, _dropped = await asyncio.to_thread(get_equipped, uid)    # lazy auto-unequip first
@@ -876,7 +888,7 @@ async def usebanner_command(update, context):
             gone = await asyncio.to_thread(unequip_banner, uid)
             await _reply(msg, "✅ Banner removed." if gone else "ℹ️ You have no banner equipped.")
             return
-        code = normalize_banner_code(arg)
+        code = await asyncio.to_thread(resolve_banner_code, arg)
         if code is None:
             await _reply(msg, "❌ Invalid banner code. Use the code shown in /banner, e.g. /usebanner 001")
             return

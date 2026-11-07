@@ -67,6 +67,11 @@ WISHES = "festival_wishes_v1"
 CLAIMS = "festival_claims_v1"
 GRANTS = "festival_grants_v1"
 PAID = "festival_paid_v1"
+SETTINGS = "festival_settings_v1"       # {_id: "special_tier", symbol}
+FBANNER_SEQ = "festival_banners_v1"     # counter name of the special banner series (01, 02, ...)
+SPECIAL = "Special"                     # name of the special rarity tier
+SYMBOL_MAX = 8
+FBANNER_MAX = 99
 CARDS = "festival_cards_v1"
 BANNERS = "banners_v1"          # badge_banner.py's collection (event banners are stored there, flagged festival_id)
 
@@ -91,6 +96,8 @@ DEFAULT_RARITIES = ("Common", "Rare", "Epic", "Legendary", "Mythical", "Celestia
 
 COMMAND_DESCRIPTIONS = {
     "quests": "View festival quests and your progress",
+    "special": "See every special festival character and banner",
+    "specialtier": "Owner: set the symbol of the Special tier",
     "festival": "Owner: open the Festival Manager (buttons)",
     "addfestival": "Owner: create a festival (guided, PM only)",
     "festivals": "Owner: list festivals and their quests",
@@ -101,8 +108,8 @@ COMMAND_DESCRIPTIONS = {
     "editquest": "Owner: edit a quest (/editquest <quest id>)",
     "delquest": "Owner: delete a quest (/delquest <quest id>)",
 }
-PUBLIC_COMMANDS = {"quests"}
-OWNER_COMMANDS = {"festival", "addfestival", "festivals", "editfestival", "delfestival", "addtempchar", "addquest", "editquest", "delquest"}
+PUBLIC_COMMANDS = {"quests", "special"}
+OWNER_COMMANDS = {"festival", "specialtier", "addfestival", "festivals", "editfestival", "delfestival", "addtempchar", "addquest", "editquest", "delquest"}
 
 # User-owned collections: (collection, field holding the user id). Used by /deleteuser, /restoreuser, /moveuser.
 USER_DATA_SPEC = ((PROGRESS, "user_id"), (CLAIMS, "user_id"), (GRANTS, "user_id"), (PAID, "user_id"))
@@ -122,11 +129,14 @@ _deps = {
     "save_user": None,          # async save_user_async(telegram_user) - makes sure the sender has a profile row
     "timestamp": None,          # bot.timestamp() - the stamp format add_collection expects
     "rarities": DEFAULT_RARITIES,
+    "symbols": None,            # bot.SYMBOL (the rarity -> symbol dict); festival adds / removes the "Special" entry
+    "items_per_page": 5,
 }
 
 
 def bind(**kwargs):
-    """Inject bot.py helpers: is_owner, conv_timeout, safe_reply, cancel_all, mark_success, save_user, timestamp, rarities."""
+    """Inject bot.py helpers: is_owner, conv_timeout, safe_reply, cancel_all, mark_success, save_user, timestamp, rarities,
+    symbols (bot.SYMBOL), items_per_page."""
     _deps.update({k: v for k, v in kwargs.items() if v is not None})
 
 
@@ -278,6 +288,48 @@ def _character_row(code):
         return None
 
 
+# ---------------- Special tier symbol ----------------
+_sym = {"ts": 0.0, "val": None}
+
+
+def special_symbol():
+    """The Special tier's symbol, or None until the owner has sent one (cached; never raises)."""
+    if _sym["ts"] and time.monotonic() - _sym["ts"] < 30:
+        return _sym["val"]
+    try:
+        doc = _col(SETTINGS).find_one({"_id": "special_tier"})
+    except Exception as e:
+        logger.warning("festival symbol lookup failed: %s", e)
+        return _sym["val"]
+    _sym["val"], _sym["ts"] = ((doc or {}).get("symbol") or None), time.monotonic()
+    return _sym["val"]
+
+
+def apply_symbol():
+    """Put the Special tier into bot.SYMBOL (so every rarity label shows its symbol) or take it out if unset."""
+    syms = _deps.get("symbols")
+    if syms is None:
+        return
+    sym = special_symbol()
+    if sym:
+        syms[SPECIAL] = sym
+    else:
+        syms.pop(SPECIAL, None)
+
+
+def set_special_symbol(sym):
+    _col(SETTINGS).update_one({"_id": "special_tier"}, {"$set": {"symbol": sym, "updated_at": _stamp()}}, upsert=True)
+    _sym["ts"] = 0.0
+    apply_symbol()
+
+
+def _clean_symbol(text):
+    t = str(text or "").strip()
+    if not t or len(t) > SYMBOL_MAX or any(ch.isspace() for ch in t) or t.startswith("/"):
+        return None
+    return t
+
+
 # ---------------- festivals / quests ----------------
 def get_festival(code):
     return _col(FESTIVALS).find_one({"_id": str(code)})
@@ -405,13 +457,14 @@ def register_card(code, festival_id):
 
 # ---------------- event banners ----------------
 def create_festival_banner(name, photo, festival_id, creator_id):
-    """Insert an event banner into badge_banner's collection. Returns its 3-digit code, or None when codes ran out."""
+    """Insert a SPECIAL banner into badge_banner's collection with its own 2-digit code series 01, 02, ... (normal
+    banners always have 3 digits, 001-999). Returns its code, or None when the 99 special codes ran out."""
     now = _stamp()
     for _ in range(8):
-        n = mongo_db.next_sequence(BANNERS)         # the same atomic counter badge_banner uses
-        if n > BANNER_MAX_CODE:
+        n = mongo_db.next_sequence(FBANNER_SEQ)
+        if n > FBANNER_MAX:
             return None
-        code = str(n).zfill(3)
+        code = str(n).zfill(2)
         try:
             _col(BANNERS).insert_one({
                 "_id": code, "code": code, "name": name, "photo_file_id": photo,
@@ -472,6 +525,64 @@ def quest_rewards_text(q):
             parts.append(f"🪙 {rb} Berrys to the person you wish")
         return "; ".join(parts) or "-"
     return ", ".join(lines) or "-"
+
+
+def reward_short_lines(reward):
+    """Compact reward lines for lists (no pictures, no commands)."""
+    r = reward or {}
+    lines = []
+    if r.get("berrys"):
+        lines.append(f"🪙 {int(r['berrys'])} Berrys")
+    if r.get("stones"):
+        n = int(r["stones"])
+        lines.append(f"💎 {n} Special Stone" + ("" if n == 1 else "s"))
+    if r.get("card"):
+        row = _character_row(r["card"])
+        lines.append(f"🎭 {_esc(str(row[1]))}" if row else f"🎭 [{r['card']}]")
+    if r.get("banner"):
+        b = get_banner(r["banner"])
+        lines.append(f"🎌 {_esc(str((b or {}).get('name') or r['banner']))}")
+    return lines
+
+
+def quest_rewards_short(q):
+    lines = reward_short_lines(q.get("reward"))
+    if q["qtype"] == "wish_pay":
+        parts = [", ".join(lines) + " per wish"] if lines else []
+        rb = int(q.get("receiver_berrys") or 0)
+        if rb:
+            parts.append(f"🪙 {rb} Berrys to the person you wish")
+        return "; ".join(parts) or "-"
+    return ", ".join(lines) or "-"
+
+
+def festival_reward_lines(qs):
+    """'🎁 ...' lines of every reward of a festival (no quest text), duplicates removed."""
+    out, seen = [], set()
+    for q in qs:
+        t = quest_rewards_short(q)
+        if t and t != "-" and t not in seen:
+            seen.add(t)
+            out.append("🎁 " + t)
+    return out
+
+
+def progress_line(uid, f, q):
+    """'🪔 Diwali Quest: 2/20' (capped at the target)."""
+    target = int(q["target"])
+    return f"{QUEST_TYPES.get(q['qtype'], ('🎁',))[0]} {_esc(str(f['name']))} Quest: {min(quest_count(uid, f, q), target)}/{target}"
+
+
+def progress_lines(uid, hits, skip_ids=()):
+    """Progress lines for [(festival, quest)] hits, leaving out quests that just completed or were already paid out."""
+    out = []
+    for f, q in hits:
+        if q["_id"] in skip_ids:
+            continue
+        if q["qtype"] != "wish_pay" and is_claimed(uid, q["_id"]):
+            continue
+        out.append(progress_line(uid, f, q))
+    return out
 
 
 def quest_count(uid, f, q):
@@ -568,8 +679,8 @@ def evaluate(uid, only_types=None):
 
 
 def _bump(uid, kind, rarity):
-    """+1 on every live quest of this kind. Returns True when at least one quest counted it."""
-    hit = False
+    """+1 on every live quest of this kind. Returns the [(festival, quest)] that counted it."""
+    hits = []
     for f, qs in live_festivals():
         for q in qs:
             if q["qtype"] != kind or is_claimed(uid, q["_id"]):
@@ -580,8 +691,8 @@ def _bump(uid, kind, rarity):
                 {"_id": f"{int(uid)}:{q['_id']}"},
                 {"$inc": {"count": 1}, "$setOnInsert": {"user_id": int(uid), "quest_id": q["_id"], "festival_id": f["_id"]}},
                 upsert=True)
-            hit = True
-    return hit
+            hits.append((f, q))
+    return hits
 
 
 def _pay_once(q, uid, side, other_id, berrys, stones, cap):
@@ -725,38 +836,41 @@ def _mention(uid, name):
     return f'<a href="tg://user?id={int(uid)}">{_esc(str(name or "Player"))}</a>'
 
 
+async def _send(bot, chat_id, text, thread=None):
+    try:
+        await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", message_thread_id=thread)
+        return True
+    except Exception as e:
+        logger.info("festival message failed (%s): %s", chat_id, e)
+        return False
+
+
 async def _announce(bot, uid, chat_id, name, done, thread=None):
-    """'Quest complete' message for each paid-out quest, in the chat where it happened (DM if no chat)."""
+    """'Quest completed' message for each paid-out quest, in the chat where it happened (DM if no chat)."""
     for f, q, lines in done:
-        text = (f"🪔 {_mention(uid, name)} completed a {_esc(str(f['name']))} quest!\n"
-                f"{quest_label(f, q)}\n🎁 " + "\n🎁 ".join(lines or ["Reward"]))
-        try:
-            await bot.send_message(chat_id=chat_id or uid, text=text, parse_mode="HTML",
-                                   message_thread_id=thread if chat_id else None)
-        except Exception as e:
-            logger.info("festival announce failed (%s): %s", uid, e)
-            if chat_id:                      # last resort: DM
-                try:
-                    await bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
-                except Exception:
-                    pass
+        text = (f"🎉 {_mention(uid, name)}, your {_esc(str(f['name']))} quest is complete!\n"
+                f"{progress_line(uid, f, q)}\n"
+                f"🎁 Reward: " + ", ".join(lines or ["-"]) + "\n"
+                "✅ Your reward has been added to your account.")
+        if not await _send(bot, chat_id or uid, text, thread if chat_id else None) and chat_id:
+            await _send(bot, uid, text)          # last resort: DM
 
 
-async def _announce_pay(bot, chat_id, sender, receiver, s_lines, r_lines, thread=None):
-    """One short message per paid wish (sender and wished person)."""
+async def _announce_wish(bot, chat_id, sender, receiver, s_pay, r_pay, s_prog, r_prog, thread=None):
+    """ONE message per wish: who wished whom, what was paid, and the progress line of each quest that moved."""
     sname = sender.full_name if hasattr(sender, "full_name") else sender.first_name
     rname = receiver.full_name if hasattr(receiver, "full_name") else receiver.first_name
-    parts = []
-    if s_lines:
-        parts.append(f"🪔 {_mention(sender.id, sname)} wished {_mention(receiver.id, rname)}!  🎁 " + ", ".join(s_lines))
-    if r_lines:
-        parts.append(f"🎁 {_mention(receiver.id, rname)} received " + ", ".join(r_lines))
-    if not parts:
+    if not (s_pay or r_pay or s_prog or r_prog):
         return
-    try:
-        await bot.send_message(chat_id=chat_id, text="\n".join(parts), parse_mode="HTML", message_thread_id=thread)
-    except Exception as e:
-        logger.info("festival pay announce failed: %s", e)
+    head = f"🪔 {_mention(sender.id, sname)} wished {_mention(receiver.id, rname)}!"
+    if s_pay:
+        head += "  🎁 " + ", ".join(s_pay)
+    lines = [head]
+    if r_pay:
+        lines.append(f"🎁 {_mention(receiver.id, rname)} received " + ", ".join(r_pay))
+    lines += s_prog
+    lines += [f"{_mention(receiver.id, rname)}: {x}" for x in r_prog]
+    await _send(bot, chat_id, "\n".join(lines), thread)
 
 
 # ==========================================================================
@@ -770,9 +884,13 @@ async def record(bot, uid, kind, rarity=None, chat_id=None, name=None):
         live = await asyncio.to_thread(live_festivals)
         if not live:
             return
-        if not await asyncio.to_thread(_bump, uid, kind, rarity):
+        hits = await asyncio.to_thread(_bump, uid, kind, rarity)
+        if not hits:
             return
         done = await asyncio.to_thread(evaluate, uid, {kind})
+        lines = await asyncio.to_thread(progress_lines, uid, hits, {q["_id"] for _f, q, _l in done})
+        if lines:
+            await _send(bot, chat_id or uid, _mention(uid, name) + "\n" + "\n".join(lines))
         if done:
             await _announce(bot, uid, chat_id, name, done)
     except Exception as e:
@@ -802,20 +920,27 @@ async def wish_handler(update, context):
                 await save(sender)
             except Exception as e:
                 logger.info("festival save_user failed: %s", e)
-        fresh = []
         quests_by_festival = {f["_id"]: qs for f, qs in live}
+        fresh = []
         for f in matched:
             if await asyncio.to_thread(add_wish, f["_id"], sender.id, target.id):
                 fresh.append(f)
         if not fresh:
             return
         thread = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+        s_pay, r_pay, s_hits, r_hits = [], [], [], []
         for f in fresh:                                   # per-wish payouts happen immediately
-            s_lines, r_lines = await asyncio.to_thread(pay_wish, quests_by_festival[f["_id"]], sender.id, target.id)
-            if s_lines or r_lines:
-                await _announce_pay(context.bot, msg.chat_id, sender, target, s_lines, r_lines, thread=thread)
+            qs = quests_by_festival[f["_id"]]
+            sl, rl = await asyncio.to_thread(pay_wish, qs, sender.id, target.id)
+            s_pay += sl
+            r_pay += rl
+            s_hits += [(f, q) for q in qs if q["qtype"] in ("wish_send", "wish_pay")]
+            r_hits += [(f, q) for q in qs if q["qtype"] == "wish_receive"]
         sent = await asyncio.to_thread(evaluate, sender.id, {"wish_send"})
         got = await asyncio.to_thread(evaluate, target.id, {"wish_receive"})
+        s_prog = await asyncio.to_thread(progress_lines, sender.id, s_hits, {q["_id"] for _f, q, _l in sent})
+        r_prog = await asyncio.to_thread(progress_lines, target.id, r_hits, {q["_id"] for _f, q, _l in got})
+        await _announce_wish(context.bot, msg.chat_id, sender, target, s_pay, r_pay, s_prog, r_prog, thread=thread)
         sname = sender.full_name if hasattr(sender, "full_name") else sender.first_name
         tname = target.full_name if hasattr(target, "full_name") else target.first_name
         if sent:
@@ -830,6 +955,7 @@ async def wish_handler(update, context):
 # /quests (everyone)
 # ==========================================================================
 def _quests_text(uid):
+    """Players see each festival's REWARDS (no quest descriptions) with their progress next to every reward."""
     now = _stamp()
     blocks = []
     for f in all_festivals():
@@ -839,28 +965,26 @@ def _quests_text(uid):
         qs = quests_of(f["_id"])
         if not qs:
             continue
-        if st == "upcoming":
-            head = f"🪔 {_esc(f['name'])} - starts {fmt_when(f['start_at'])}"
-        else:
-            head = f"🪔 {_esc(f['name'])} - ends {fmt_when(f['end_at'])}"
-        lines = [head, ""]
-        for i, q in enumerate(qs, 1):
+        head = (f"🪔 {_esc(f['name'])} - starts {fmt_when(f['start_at'])}" if st == "upcoming"
+                else f"🪔 {_esc(f['name'])} - ends {fmt_when(f['end_at'])}")
+        lines = [head]
+        if st == "live" and any(q["qtype"] in ("wish_send", "wish_receive", "wish_pay") for q in qs):
+            lines.append(f"💡 Reply “{_esc(f['phrase'])}” to someone to wish them.")
+        lines.append("")
+        for q in qs:
             target = int(q["target"])
+            emoji = QUEST_TYPES.get(q["qtype"], ("🎁",))[0]
             if q["qtype"] != "wish_pay" and is_claimed(uid, q["_id"]):
                 prog = "Done ✅"
             elif st == "live":
                 prog = f"{min(quest_count(uid, f, q), target)}/{target}" + (" paid" if q["qtype"] == "wish_pay" else "")
             else:
                 prog = f"0/{target}"
-            lines.append(f"{i}. {quest_label(f, q)}")
-            lines.append(f"   📈 {prog}   🎁 " + quest_rewards_text(q))
-        if st == "live":
-            lines.append("")
-            lines.append(f"💡 Reply “{_esc(f['phrase'])}” to someone to wish them.")
+            lines.append(f"{emoji} {quest_rewards_short(q)}  ·  {prog}")
         blocks.append("\n".join(lines))
     if not blocks:
-        return "🪔 No festival quests are running right now."
-    return "\n\n".join(blocks) + "\n\nRewards are given automatically. Event cards and banners are permanent once earned."
+        return "🪔 No festival quests are running right now.\n\nSee past and upcoming special rewards with /special."
+    return "\n\n".join(blocks) + "\n\nRewards are added to your account automatically. See every special reward with /special."
 
 
 async def quests_command(update, context):
@@ -931,6 +1055,7 @@ def _is_none_word(text):
 
 
 def _festival_summary(f, with_quests=True):
+    """Festival details + its REWARDS only (the quests themselves are behind the 🎯 Quests button)."""
     st = status_of(f)
     icon = {"live": "🟢 LIVE", "upcoming": "🕒 Upcoming", "ended": "🔴 Ended"}[st]
     lines = [f"🪔 {_esc(f['name'])}  [{f['_id']}]  {icon}",
@@ -939,10 +1064,10 @@ def _festival_summary(f, with_quests=True):
     if with_quests:
         qs = quests_of(f["_id"])
         if not qs:
-            lines.append("No quests yet. Add one with /addquest " + f["_id"])
-        for q in qs:
-            lines.append(f"• {q['_id']}: {quest_label(f, q)}")
-            lines.append("   🎁 " + quest_rewards_text(q))
+            lines.append("No rewards yet - add a quest to this festival.")
+        else:
+            lines.append("")
+            lines += festival_reward_lines(qs)
     return "\n".join(lines)
 
 
@@ -1045,6 +1170,16 @@ async def fs_callback(update, context):
                 deleted = await asyncio.to_thread(delete_quest, target)
                 await q.answer("Deleted." if deleted else "Already deleted.", show_alert=not deleted)
                 await _edit(q, f"🗑 Quest {target} deleted." if deleted else f"ℹ️ Quest {target} no longer exists.", back)
+        elif kind == "sp":                                   # /special screens (public, edited in place)
+            page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+            text, kb = await asyncio.to_thread(_special_panel, parts[3] if len(parts) > 3 else "h", page, uid)
+            await q.answer()
+            await _edit(q, text, kb)
+        elif kind == "sd":                                   # picture + details of one special item (new message)
+            msg = q.message
+            thread = msg.message_thread_id if msg is not None and getattr(msg, "is_topic_message", False) else None
+            await q.answer()
+            await _send_special_detail(context.bot, msg.chat_id, thread, parts[3], parts[4], uid)
         elif kind in PANEL_KINDS:
             if not _is_owner(uid):
                 await q.answer(DENIED_TEXT, show_alert=True)
@@ -1792,8 +1927,8 @@ def _panel_cut(text):
 
 def _hub_kb(uid):
     return InlineKeyboardMarkup([
-        [_btn("➕ New Festival", f"fs:go:{uid}:addfestival"), _btn("🎭 New Temp Character", f"fs:go:{uid}:addtempchar")],
-        [_btn("📋 Festivals & Quests", f"fs:ls:{uid}:0")],
+        [_btn("➕ New Festival", f"fs:go:{uid}:addfestival"), _btn("🎭 New Special Character", f"fs:go:{uid}:addtempchar")],
+        [_btn("📋 Festivals & Quests", f"fs:ls:{uid}:0"), _btn("✨ Special Tier Symbol", f"fs:go:{uid}:specialtier")],
         [_btn("📖 Command Help", f"fs:hp:{uid}"), _btn("« Owner Commands", f"help:{uid}:owner")]])
 
 
@@ -1806,8 +1941,9 @@ def _hub_text():
             f"🟢 Live: {counts['live']}    🕒 Upcoming: {counts['upcoming']}    🔴 Ended: {counts['ended']}\n\n"
             "Create festivals, quests, temporary event characters and banners with the buttons below. "
             "Everything is asked step by step, so there are no commands to remember.\n\n"
-            "Typical order:\n1️⃣ 🎭 New Temp Character (the event card)\n2️⃣ ➕ New Festival\n"
-            "3️⃣ open the festival → ➕ Add Quest (card, banner, pay per wish)")
+            "Typical order:\n1️⃣ 🎭 New Special Character (the first time it asks for the Special tier symbol)\n"
+            "2️⃣ ➕ New Festival\n3️⃣ open the festival → ➕ Add Quest (card, banner, pay per wish)\n\n"
+            "Everyone can see all special characters and banners with /special.")
 
 
 def _panel(kind, parts, uid):
@@ -1898,6 +2034,8 @@ async def _go_entry(update, context, expected):
         return await addfestival_start(update, context)
     if expected == "addtempchar":
         return await addtempchar_start(update, context)
+    if expected == "specialtier":
+        return await specialtier_start(update, context)
     if expected == "addquest":
         return await addquest_start(update, context, code=arg)
     if expected == "editfestival":
@@ -1917,11 +2055,248 @@ def _go_pattern(action, arg=""):
 
 
 # ==========================================================================
-# /addtempchar  (name -> anime -> rarity -> worth -> code -> photo)
-# Creates a normal character that is registered as an EVENT CARD from the first second: it never shows in the character
-# list, shop, spawns or searches. Only quests give it out (use its code in /addquest).
+# /special (everyone): catalog of every special festival character and banner (past, live and upcoming)
+#   /special            -> two buttons: 🎭 Characters / 🎌 Banners, then lists in the same style as /banner
+#   /special <name|code> -> straight to one item (picture + details); several matches -> selection buttons
+# Callback data:  fs:sp:<uid>:<h|c|b>[:<page>]  (screens)   fs:sd:<uid>:<c|b>:<code>  (picture + details)
 # ==========================================================================
-TC_NAME, TC_ANIME, TC_RARITY, TC_WORTH, TC_CODE, TC_PHOTO = range(60, 66)
+def _special_sym():
+    syms = _deps.get("symbols") or {}
+    return syms.get(SPECIAL) or special_symbol() or "✨"
+
+
+def _festival_names():
+    return {f["_id"]: f for f in _col(FESTIVALS).find({})}
+
+
+def special_cards():
+    """Event cards that are the reward of some quest (a temp character that no quest uses yet stays secret)."""
+    fests = _festival_names()
+    out, seen = [], set()
+    for q in sorted(_col(QUESTS).find({}), key=_qkey):
+        code = (q.get("reward") or {}).get("card")
+        if not code or str(code) in seen:
+            continue
+        row = _character_row(code)
+        if not row:
+            continue
+        seen.add(str(code))
+        out.append({"code": str(code), "row": row, "festival": fests.get(q["festival_id"])})
+    return out
+
+
+def special_banners():
+    fests = _festival_names()
+    banners = [b for b in _col(BANNERS).find({}) if b.get("festival_id")]
+    banners.sort(key=lambda b: (len(str(b["_id"])), str(b["_id"])))
+    for b in banners:
+        b["_festival"] = fests.get(b.get("festival_id"))
+    return banners
+
+
+def _owned_for(uid):
+    """Character codes the user owns + 'FB<code>' tokens of the special banners they earned."""
+    uid = int(uid)
+    owned = {str(c) for c in mongo_db.col(mongo_db.COLLECTIONS).distinct("character_code", {"user_id": uid})}
+    owned |= {str(t) for t in _col(GRANTS).distinct("token", {"user_id": uid, "kind": "banner"})}
+    return owned
+
+
+def _equipped_banner(uid):
+    doc = mongo_db.col("user_banners_v1").find_one({"_id": int(uid)})
+    return (doc or {}).get("banner_code")
+
+
+def _special_per_page():
+    try:
+        return max(1, int(_deps.get("items_per_page") or 5))
+    except (TypeError, ValueError):
+        return 5
+
+
+def _special_home(uid):
+    cards, banners = special_cards(), special_banners()
+    text = ("✨ Special Collection\n\n"
+            "Characters and banners you can win in festival events - past ones and coming ones.\n\n"
+            f"🎭 Characters: {len(cards)}    🎌 Banners: {len(banners)}")
+    return text, InlineKeyboardMarkup([[_btn("🎭 Characters", f"fs:sp:{uid}:c:0"), _btn("🎌 Banners", f"fs:sp:{uid}:b:0")]])
+
+
+def _special_list(kind, page, uid):
+    """Same look as the /banner list: numbered lines, 🔓/🔒 state, page buttons - plus number buttons to open an item."""
+    cards = kind == "c"
+    items = special_cards() if cards else special_banners()
+    owned = _owned_for(uid)
+    eq = None if cards else _equipped_banner(uid)
+    per = _special_per_page()
+    pages = max(1, -(-len(items) // per))
+    page = min(max(page, 0), pages - 1)
+    lines = [("🎭 Special Characters" if cards else "🎌 Special Banners") + f" (page {page + 1}/{pages})", ""]
+    if not items:
+        lines.append("Nothing here yet - watch for the next festival!")
+    nums = []
+    for i, it in enumerate(items[page * per:(page + 1) * per], page * per + 1):
+        if cards:
+            code, name = it["code"], str(it["row"][1])
+            lines.append(f"{i}. {_esc(name)} — {code} {_special_sym()} " + ("✅" if code in owned else "🔒"))
+        else:
+            code, name = str(it["_id"]), str(it.get("name"))
+            unlocked = banner_token(code) in owned
+            lines.append(f"{i}. {_esc(name)} — {code} " + ("🔓" if unlocked else "🔒") + (" ⭐" if unlocked and eq == code else ""))
+        nums.append(_btn(str(i), f"fs:sd:{uid}:{kind}:{code}"))
+    if items:
+        lines += ["", "Tap a number to see the picture and details.",
+                  "✅/🔓 = you own it    🔒 = not earned yet"]
+    rows = [nums[k:k + 5] for k in range(0, len(nums), 5)]
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("◀️ Prev", f"fs:sp:{uid}:{kind}:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{pages}", "fs:noop"))
+        if page < pages - 1:
+            nav.append(_btn("Next ▶️", f"fs:sp:{uid}:{kind}:{page + 1}"))
+        rows.append(nav)
+    rows.append([_btn("« Back", f"fs:sp:{uid}:h")])
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+def _special_panel(arg, page, uid):
+    return _special_home(uid) if arg == "h" else _special_list("b" if arg == "b" else "c", page, uid)
+
+
+def special_detail(kind, code, uid):
+    """(caption HTML, photo file id) of one special item, or (None, None) when it is not a special item."""
+    owned = _owned_for(uid)
+    if kind == "c":
+        it = next((c for c in special_cards() if c["code"] == str(code)), None)
+        if it is None:
+            return None, None
+        row, fest = it["row"], it["festival"]
+        lines = [f"🎭 {_esc(str(row[1]))}"]
+        if row[2]:
+            lines.append(f"🎬 {_esc(str(row[2]))}")
+        lines.append(f"🏷 {_esc(_special_sym())} {SPECIAL}")
+        lines.append(f"🔢 Code: {it['code']}")
+        if fest:
+            lines.append(f"🪔 From: {_esc(str(fest['name']))}")
+        lines.append("✅ You own this character." if it["code"] in owned else "🔒 You don't own this character yet.")
+        return "\n".join(lines), (row[5] if len(row) > 5 else None)
+    b = next((x for x in special_banners() if str(x["_id"]) == str(code)), None)
+    if b is None:
+        return None, None
+    unlocked = banner_token(b["_id"]) in owned
+    equipped = unlocked and _equipped_banner(uid) == b["_id"]
+    lines = [f"🎌 {_esc(str(b['name']))}", f"Code: {b['_id']}"]
+    if b.get("_festival"):
+        lines.append(f"🪔 From: {_esc(str(b['_festival']['name']))}")
+    lines.append("Status: " + ("🔓 Unlocked" if unlocked else "🔒 Not earned yet") + ("  ⭐ EQUIPPED" if equipped else ""))
+    if unlocked and not equipped:
+        lines += ["", f"Equip it with /usebanner {b['_id']}"]
+    return "\n".join(lines), b.get("photo_file_id")
+
+
+def _special_search(arg):
+    """[(kind, code, label)] of special items whose code or name matches."""
+    q = " ".join(str(arg).split()).casefold()
+    out = []
+    raw = str(arg).strip()
+    two = raw.isdigit() and len(raw) == 2 and 1 <= int(raw) <= 99        # exactly 2 digits = a special banner code
+    code4 = normalize_char_code(raw) if raw.isdigit() and not two else None
+    scode = raw if two else None
+    for c in special_cards():
+        name = str(c["row"][1])
+        if (code4 and c["code"] == code4) or (not code4 and q in name.casefold()):
+            out.append(("c", c["code"], name))
+    for b in special_banners():
+        name = str(b.get("name"))
+        if (scode and str(b["_id"]) == scode) or (not scode and not code4 and q in name.casefold()):
+            out.append(("b", str(b["_id"]), name))
+    return out
+
+
+async def _send_special_detail(bot, chat_id, thread, kind, code, uid):
+    caption, photo = await asyncio.to_thread(special_detail, kind, code, uid)
+    if caption is None:
+        await _send(bot, chat_id, "❌ That special item no longer exists. See /special.", thread)
+        return
+    if photo and len(caption) <= CAPTION_LIMIT:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=photo, caption=caption, parse_mode="HTML", message_thread_id=thread)
+            return
+        except Exception as e:
+            logger.info("special photo failed: %s", e)
+    await _send(bot, chat_id, caption, thread)
+
+
+async def special_command(update, context):
+    msg, uid = update.effective_message, update.effective_user.id
+    arg = " ".join(context.args or []).strip()
+    thread = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
+    try:
+        if not arg:
+            text, kb = await asyncio.to_thread(_special_home, uid)
+            await _reply(msg, text, reply_markup=kb)
+            _ok(update)
+            return
+        matches = await asyncio.to_thread(_special_search, arg)
+    except Exception as e:
+        logger.error("special failed: %s", e)
+        await _reply(msg, "❌ Could not load the special collection right now. Please try again.")
+        return
+    if not matches:
+        await _reply(msg, "❌ No special character or banner matches that. See /special.")
+        return
+    if len(matches) == 1:
+        await _send_special_detail(context.bot, msg.chat_id, thread, matches[0][0], matches[0][1], uid)
+        _ok(update)
+        return
+    rows = [[_btn(f"{'🎭' if k == 'c' else '🎌'} {_short(name, 30)} ({code})", f"fs:sd:{uid}:{k}:{code}")]
+            for k, code, name in matches[:10]]
+    await _reply(msg, "Several special items match. Tap the one you want:", reply_markup=InlineKeyboardMarkup(rows))
+    _ok(update)
+
+
+# ==========================================================================
+# /specialtier  (owner): set / change the Special tier symbol
+# ==========================================================================
+ST_INPUT = 70
+
+
+async def specialtier_start(update, context):
+    if not await _guard_owner(update) or not await _guard_private(update):
+        return -1
+    cur = await asyncio.to_thread(special_symbol)
+    await _reply(update.effective_message,
+                 "✨ Special tier\n\n" + (f"Current symbol: {cur}\n\n" if cur else "The Special tier has no symbol yet.\n\n") +
+                 "Send the SYMBOL for the Special tier (one emoji or a short symbol, like 💠 is for Celestial).\n\n"
+                 "Send /cancel to stop.")
+    return ST_INPUT
+
+
+async def specialtier_input(update, context):
+    if not await _guard_owner(update):
+        return -1
+    sym = _clean_symbol(update.effective_message.text)
+    if not sym:
+        await _reply(update.effective_message, f"❌ Send one symbol (max {SYMBOL_MAX} characters, no spaces).")
+        return ST_INPUT
+    try:
+        await asyncio.to_thread(set_special_symbol, sym)
+    except Exception as e:
+        logger.error("set special symbol failed: %s", e)
+        await _reply(update.effective_message, "❌ Database error. Nothing was saved.")
+        return -1
+    await _reply(update.effective_message, f"✅ Special tier symbol saved: {sym}\nSpecial characters now show as “{sym} {SPECIAL}”.",
+                 reply_markup=InlineKeyboardMarkup([[_btn("🪔 Festival Manager", f"fs:hub:{update.effective_user.id}")]]))
+    return -1
+
+
+# ==========================================================================
+# /addtempchar  (name -> anime -> worth -> code -> photo)  [first time: the Special symbol]
+# Creates a character in the SPECIAL tier that is registered as an EVENT CARD from the first second: it never shows in the
+# character list, shop, spawns or searches. Only quests give it out (use its code in /addquest).
+# ==========================================================================
+TC_NAME, TC_ANIME, TC_WORTH, TC_CODE, TC_PHOTO, TC_SYMBOL = range(60, 66)
 _TC = "fs_tc"
 
 
@@ -1929,10 +2304,27 @@ async def addtempchar_start(update, context):
     if not await _guard_owner(update) or not await _guard_private(update):
         return -1
     context.user_data[_TC] = {}
+    if not await asyncio.to_thread(special_symbol):
+        await _reply(update.effective_message,
+                     "✨ The Special tier has no symbol yet.\nSend the SYMBOL for the Special tier (one emoji or a short "
+                     "symbol, like 💠 is for Celestial).\n\nSend /cancel to stop.")
+        return TC_SYMBOL
     await _reply(update.effective_message,
-                 "🎭 New TEMPORARY event character - step 1/6\nSend the character NAME.\n\n"
+                 "🎭 New TEMPORARY special character - step 1/5\nSend the character NAME.\n\n"
                  "It is hidden from every list from the start and is only given out by festival quests.\n"
                  "Send /cancel to stop.")
+    return TC_NAME
+
+
+async def addtempchar_symbol(update, context):
+    if not await _guard_owner(update):
+        return -1
+    sym = _clean_symbol(update.effective_message.text)
+    if not sym:
+        await _reply(update.effective_message, f"❌ Send one symbol (max {SYMBOL_MAX} characters, no spaces).")
+        return TC_SYMBOL
+    await asyncio.to_thread(set_special_symbol, sym)
+    await _reply(update.effective_message, f"✅ Special tier symbol saved: {sym}\n\n🎭 Step 1/5 - send the character NAME.")
     return TC_NAME
 
 
@@ -1944,7 +2336,7 @@ async def addtempchar_name(update, context):
         await _reply(update.effective_message, "❌ Send a valid name (max 60 characters).")
         return TC_NAME
     context.user_data.setdefault(_TC, {})["name"] = name
-    await _reply(update.effective_message, "2/6 - Send the ANIME name, or send skip.")
+    await _reply(update.effective_message, "2/5 - Send the ANIME name, or send skip.")
     return TC_ANIME
 
 
@@ -1953,20 +2345,7 @@ async def addtempchar_anime(update, context):
         return -1
     text = " ".join((update.effective_message.text or "").split())
     context.user_data.setdefault(_TC, {})["anime"] = "" if _is_none_word(text) or len(text) > 80 else text
-    await _reply(update.effective_message, "3/6 - Send the RARITY: " + " / ".join(_rarities()))
-    return TC_RARITY
-
-
-async def addtempchar_rarity(update, context):
-    if not await _guard_owner(update):
-        return -1
-    text = (update.effective_message.text or "").strip()
-    match = next((r for r in _rarities() if r.casefold() == text.casefold()), None)
-    if not match:
-        await _reply(update.effective_message, "❌ Invalid rarity. Send one of: " + ", ".join(_rarities()))
-        return TC_RARITY
-    context.user_data.setdefault(_TC, {})["rarity"] = match
-    await _reply(update.effective_message, "4/6 - Send the WORTH in Berrys (a number).")
+    await _reply(update.effective_message, "3/5 - Send the WORTH in Berrys (a number).")
     return TC_WORTH
 
 
@@ -1978,7 +2357,7 @@ async def addtempchar_worth(update, context):
         await _reply(update.effective_message, "❌ Worth must be a number.")
         return TC_WORTH
     context.user_data.setdefault(_TC, {})["worth"] = n
-    await _reply(update.effective_message, "5/6 - Send a unique 4-digit CODE (0001-9999).")
+    await _reply(update.effective_message, "4/5 - Send a unique 4-digit CODE (0001-9999).")
     return TC_CODE
 
 
@@ -1993,12 +2372,12 @@ async def addtempchar_code(update, context):
         await _reply(update.effective_message, "❌ That code already exists. Send another code.")
         return TC_CODE
     context.user_data.setdefault(_TC, {})["code"] = code
-    await _reply(update.effective_message, "6/6 - Send the character PHOTO, or send skip.")
+    await _reply(update.effective_message, "5/5 - Send the character PHOTO, or send skip.")
     return TC_PHOTO
 
 
 def _create_temp_character(d):
-    mongo_db.insert_character(d["code"], d["name"], d["anime"], d["rarity"], d["worth"], d.get("photo"), [])
+    mongo_db.insert_character(d["code"], d["name"], d["anime"], SPECIAL, d["worth"], d.get("photo"), [])
     register_card(d["code"], None)                  # hidden immediately, even before any quest uses it
 
 
@@ -2027,9 +2406,9 @@ async def addtempchar_photo(update, context):
             logger.error("temp character failed: %s", e)
             await _reply(msg, "❌ Could not create the character. Nothing was created.")
         return -1
-    await _reply(msg, f"✅ Temporary event character created!\n🎭 {_esc(d['name'])}\n🏷 {_esc(d['rarity'])}\n"
+    await _reply(msg, f"✅ Special character created!\n🎭 {_esc(d['name'])}\n🏷 {_esc(_special_sym())} {SPECIAL}\n"
                       f"💰 {d['worth']}\n🔢 {d['code']}\n\n"
-                      f"It is hidden from all lists. Give it out as an event card in a quest (card code {d['code']}).",
+                      f"It is hidden from the normal lists. Give it out as an event card in a quest (card code {d['code']}).",
                  parse_mode="HTML",
                  reply_markup=InlineKeyboardMarkup([[_btn("🪔 Festival Manager", f"fs:hub:{update.effective_user.id}")]]))
     return -1
@@ -2043,7 +2422,8 @@ HELP_LABEL = "🪔 Festival"
 
 PUBLIC_HELP_SECTION = (
     "🪔 Festival Quests\n"
-    "/quests — View festival quests, your progress and the rewards\n\n"
+    "/quests — View festival rewards and your progress\n"
+    "/special — See every special festival character and banner (/special <name or code> for one)\n\n"
 )
 
 
@@ -2054,18 +2434,20 @@ def help_page_text():
         ("/festivals", "List every festival with its code, status and quests"),
         ("/editfestival <code>", "Change a festival's name, wish phrase, start or end"),
         ("/delfestival <code>", "Delete a festival and its quests (earned cards and banners are kept)"),
-        ("/addtempchar", "Create a TEMPORARY event character (hidden from every list; only quests give it out)"),
+        ("/addtempchar", "Create a SPECIAL-tier event character (hidden from the normal lists; only quests give it out)"),
+        ("/specialtier", "Set or change the symbol of the Special tier (asked once, the first time)"),
         ("/addquest <code>", "Add a quest (guided, PM only): type, target, rewards (Berrys, Stones, event card, event banner)"),
         ("/editquest <id>", "Change a quest's target or rewards"),
         ("/delquest <id>", "Delete a quest"),
-        ("/quests", "Players: festival quests and progress (public)"),
+        ("/quests", "Players: festival rewards and progress (public)"),
+        ("/special", "Everyone: catalog of all special characters and banners (public)"),
     ]
     lines = ["🪔 Festival Quests (Owner)", "", "👉 Easiest: /help -> Owner Commands -> 🪔 Festival (or /festival) opens the "
              "Festival Manager with buttons for everything below.", "", "📌 Overview",
              "A festival is a timed event. Quests only count while it is live; what people earn stays forever. "
              "Event cards are hidden from every character list, the shop and spawns and only show in the collection of "
-             "the people who earned them. Event banners are hidden from the banner list and only show to the people "
-             "who earned them.",
+             "the people who earned them. Event banners (2-digit codes 01, 02, ...) are hidden from the normal banner list "
+             "and only show in /banner for the people who earned them. Everyone can browse them in /special.",
              "", "🎯 Quest types: " + ", ".join(f"{e} {l}" for e, l in QUEST_TYPES.values()),
              "", "⌨️ Commands & usage"]
     for n, (syntax, desc) in enumerate(entries, 1):
@@ -2092,6 +2474,10 @@ def register(app):
         ensure_indexes()
     except Exception as e:          # never block the bot from starting; indexes are retried on first use
         logger.warning("festival: index creation deferred (%s)", e)
+    try:
+        apply_symbol()              # puts the saved Special tier symbol into bot.SYMBOL
+    except Exception as e:
+        logger.warning("festival: special symbol not loaded (%s)", e)
     text = filters.TEXT & ~filters.COMMAND
     timeout = _deps.get("conv_timeout")
     fallbacks = [CommandHandler("cancel", _cancel_flow)]
@@ -2119,13 +2505,18 @@ def register(app):
         entry_points=[CommandHandler("addtempchar", addtempchar_start),
                       CallbackQueryHandler(_go_handler("addtempchar"), pattern=_go_pattern("addtempchar"))],
         states={
+            TC_SYMBOL: [MessageHandler(text, addtempchar_symbol)],
             TC_NAME: [MessageHandler(text, addtempchar_name)],
             TC_ANIME: [MessageHandler(text, addtempchar_anime)],
-            TC_RARITY: [MessageHandler(text, addtempchar_rarity)],
             TC_WORTH: [MessageHandler(text, addtempchar_worth)],
             TC_CODE: [MessageHandler(text, addtempchar_code)],
             TC_PHOTO: [MessageHandler(filters.PHOTO, addtempchar_photo), MessageHandler(text, addtempchar_photo)],
         },
+        fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("specialtier", specialtier_start),
+                      CallbackQueryHandler(_go_handler("specialtier"), pattern=_go_pattern("specialtier"))],
+        states={ST_INPUT: [MessageHandler(text, specialtier_input)]},
         fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addquest", addquest_start),
@@ -2147,7 +2538,8 @@ def register(app):
             EQ_INPUT: [MessageHandler(filters.PHOTO, editquest_input), MessageHandler(text, editquest_input)],
         },
         fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))
-    for name, callback in (("quests", quests_command), ("festival", festival_command), ("festivals", festivals_command),
+    for name, callback in (("quests", quests_command), ("special", special_command), ("festival", festival_command),
+                           ("festivals", festivals_command),
                            ("delfestival", delfestival_command), ("delquest", delquest_command)):
         app.add_handler(CommandHandler(name, callback))
     app.add_handler(CallbackQueryHandler(fs_callback, pattern=r"^fs:"))
