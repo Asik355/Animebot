@@ -570,7 +570,11 @@ def festival_reward_lines(qs):
 def progress_line(uid, f, q):
     """'🪔 Diwali Quest: 2/20' (capped at the target)."""
     target = int(q["target"])
-    return f"{QUEST_TYPES.get(q['qtype'], ('🎁',))[0]} {_esc(str(f['name']))} Quest: {min(quest_count(uid, f, q), target)}/{target}"
+    n = min(quest_count(uid, f, q), target)
+    label = {"wish_send": "🪔 Sent", "wish_receive": "💌 Received", "wish_pay": "💰 Paid wishes"}.get(q["qtype"])
+    if label:
+        return f"{label} {n}/{target}"
+    return f"{QUEST_TYPES.get(q['qtype'], ('🎁',))[0]} {_esc(str(f['name']))} Quest: {n}/{target}"
 
 
 def progress_lines(uid, hits, skip_ids=()):
@@ -836,9 +840,12 @@ def _mention(uid, name):
     return f'<a href="tg://user?id={int(uid)}">{_esc(str(name or "Player"))}</a>'
 
 
-async def _send(bot, chat_id, text, thread=None):
+async def _send(bot, chat_id, text, thread=None, reply_to=None):
     try:
-        await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", message_thread_id=thread)
+        if reply_to is not None:
+            await reply_to.reply_text(text[:4000], parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id=chat_id, text=text[:4000], parse_mode="HTML", message_thread_id=thread)
         return True
     except Exception as e:
         logger.info("festival message failed (%s): %s", chat_id, e)
@@ -856,21 +863,22 @@ async def _announce(bot, uid, chat_id, name, done, thread=None):
             await _send(bot, uid, text)          # last resort: DM
 
 
-async def _announce_wish(bot, chat_id, sender, receiver, s_pay, r_pay, s_prog, r_prog, thread=None):
-    """ONE message per wish: who wished whom, what was paid, and the progress line of each quest that moved."""
+async def _announce_wish(bot, chat_id, sender, receiver, s_pay, r_pay, s_prog, r_prog, thread=None, reply_to=None):
+    """ONE reply per wish: payouts (only if something was paid), then 'Sent n/t' and the receiver's 'Received n/t'."""
     sname = sender.full_name if hasattr(sender, "full_name") else sender.first_name
     rname = receiver.full_name if hasattr(receiver, "full_name") else receiver.first_name
     if not (s_pay or r_pay or s_prog or r_prog):
         return
-    head = f"🪔 {_mention(sender.id, sname)} wished {_mention(receiver.id, rname)}!"
-    if s_pay:
-        head += "  🎁 " + ", ".join(s_pay)
-    lines = [head]
+    lines = []
+    if s_pay or r_pay:
+        lines.append(f"🪔 {_mention(sender.id, sname)} wished {_mention(receiver.id, rname)}!" + ("  🎁 " + ", ".join(s_pay) if s_pay else ""))
     if r_pay:
         lines.append(f"🎁 {_mention(receiver.id, rname)} received " + ", ".join(r_pay))
     lines += s_prog
-    lines += [f"{_mention(receiver.id, rname)}: {x}" for x in r_prog]
-    await _send(bot, chat_id, "\n".join(lines), thread)
+    for x in r_prog:
+        emoji, _sp, rest = x.partition(" ")
+        lines.append(f"{emoji} {_mention(receiver.id, rname)}: {rest}")
+    await _send(bot, chat_id, "\n".join(lines), thread, reply_to)
 
 
 # ==========================================================================
@@ -940,7 +948,7 @@ async def wish_handler(update, context):
         got = await asyncio.to_thread(evaluate, target.id, {"wish_receive"})
         s_prog = await asyncio.to_thread(progress_lines, sender.id, s_hits, {q["_id"] for _f, q, _l in sent})
         r_prog = await asyncio.to_thread(progress_lines, target.id, r_hits, {q["_id"] for _f, q, _l in got})
-        await _announce_wish(context.bot, msg.chat_id, sender, target, s_pay, r_pay, s_prog, r_prog, thread=thread)
+        await _announce_wish(context.bot, msg.chat_id, sender, target, s_pay, r_pay, s_prog, r_prog, thread=thread, reply_to=msg)
         sname = sender.full_name if hasattr(sender, "full_name") else sender.first_name
         tname = target.full_name if hasattr(target, "full_name") else target.first_name
         if sent:
