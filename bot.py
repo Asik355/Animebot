@@ -4549,9 +4549,12 @@ async def mystats(update, context):
         f"📊 Remaining: {guess_remaining} ⦵"
     )
 
-SHOP_RARITIES = ("Common", "Rare", "Legendary", "Mythical")
+SHOP_RARITIES = ("Common", "Rare", "Epic", "Legendary", "Mythical")      # one shop page per rarity, in this order
 SHOP_REFRESH_COST = 100
 SHOP_PRICE_MULTIPLIER = 5
+SHOP_CHEAP_RARITIES = ("Common", "Rare", "Epic")        # these cost worth x3, every other rarity worth x5
+def shop_price(worth, rarity):
+    return int(worth) * (3 if rarity in SHOP_CHEAP_RARITIES else SHOP_PRICE_MULTIPLIER)
 # Buying one of these rarities from the shop earns 1 FREE refresh (0 ⦵). Credits stack and never expire.
 SHOP_FREE_REFRESH_RARITIES = ("Legendary", "Mythical")
 
@@ -4619,7 +4622,7 @@ def ensure_shop_rotation(user_id, force=False):
     docs = list(_mc("shop_v3").find({"user_id": user_id}, {"shop_day": 1}))
     count = len(docs)
     current_day = max((d.get("shop_day") for d in docs if d.get("shop_day")), default=None)
-    if not force and count == 4 and current_day == key:
+    if not force and count == len(SHOP_RARITIES) and current_day == key:
         return True
     return replace_user_shop_rotation(user_id, exclude_codes=[])
 
@@ -4633,7 +4636,7 @@ def get_shop_rows(user_id):
             rows.append((d["slot"], ch[0], ch[1], ch[2], ch[3], ch[4], ch[5], d.get("rotation_key")))
     return rows
 
-def shop_keyboard(user_id, page, price, bought=False, total=4, free_credits=0):
+def shop_keyboard(user_id, page, price, bought=False, total=len(SHOP_RARITIES), free_credits=0):
     prev_page = (page - 1) % total
     next_page = (page + 1) % total
     buy_label = "✅ BOUGHT" if bought else f"🛒 BUY FOR {price} ⦵"
@@ -4649,9 +4652,9 @@ def shop_keyboard(user_id, page, price, bought=False, total=4, free_credits=0):
         [InlineKeyboardButton(buy_label, callback_data=f"shop:{buy_action}:{user_id}:{page}")],
     ])
 
-def build_shop_caption(row, page, total=4, free_credits=0):
+def build_shop_caption(row, page, total=len(SHOP_RARITIES), free_credits=0):
     _, code, name, anime, rarity, worth, photo, _rotation_key = row
-    price = int(worth) * SHOP_PRICE_MULTIPLIER
+    price = shop_price(worth, rarity)
     return (
         "🛒 CHARACTER SHOP\n\n"
         f"🎭 {name}\n"
@@ -4670,10 +4673,10 @@ async def render_shop(target, context, user_id, page=0, edit=False):
         if not (await asyncio.to_thread(ensure_shop_rotation, user_id)):
             raise RuntimeError("shop rotation could not be created")
         rows = (await asyncio.to_thread(get_shop_rows, user_id))
-        if len(rows) != 4:
+        if len(rows) != len(SHOP_RARITIES):
             (await asyncio.to_thread(ensure_shop_rotation, user_id, force=True))
             rows = (await asyncio.to_thread(get_shop_rows, user_id))
-        if len(rows) != 4:
+        if len(rows) != len(SHOP_RARITIES):
             text = "❌ Shop is temporarily unavailable. Please try again later."
             if edit:
                 try:
@@ -4684,11 +4687,11 @@ async def render_shop(target, context, user_id, page=0, edit=False):
                 await safe_reply_text(target.message, text)
             return
 
-        page = int(page) % 4
+        page = int(page) % len(SHOP_RARITIES)
         row = rows[page]
         free_credits = (await asyncio.to_thread(get_free_refresh_credits, user_id))
-        caption = add_display_name_header(target.message, build_shop_caption(row, page, 4, free_credits))
-        price = int(row[5]) * SHOP_PRICE_MULTIPLIER
+        caption = add_display_name_header(target.message, build_shop_caption(row, page, len(SHOP_RARITIES), free_credits))
+        price = shop_price(row[5], row[4])
         bought = (await asyncio.to_thread(_mc("shop_purchases_v2").find_one, {"user_id": int(user_id), "rotation_key": row[7], "slot": row[0]})) is not None
         keyboard = shop_keyboard(user_id, page, price, bought=bought, free_credits=free_credits)
         photo = row[6]
@@ -4799,7 +4802,7 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_rows = (await asyncio.to_thread(choose_shop_characters, exclude_codes=current_codes | other_user_codes))
             if not new_rows or len(new_rows) != len(SHOP_RARITIES):
                 await query.answer(
-                    "❌ I couldn't find 4 unused characters for your new shop. Nothing was deducted.",
+                    "❌ I couldn't find enough unused characters for your new shop. Nothing was deducted.",
                     show_alert=True,
                 )
                 return
@@ -4846,12 +4849,12 @@ async def shop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "buy":
         rows = (await asyncio.to_thread(get_shop_rows, owner_id))
-        if len(rows) != 4 or page < 0 or page >= len(rows):
+        if len(rows) != len(SHOP_RARITIES) or page < 0 or page >= len(rows):
             await query.answer("❌ Shop is unavailable. Try again.", show_alert=True)
             return
         row = rows[page]
         _, code, name, anime, rarity, worth, photo, rotation_key = row
-        price = int(worth) * SHOP_PRICE_MULTIPLIER
+        price = shop_price(worth, rarity)
         try:
             balance = (await asyncio.to_thread(mongo_db.get_coins, owner_id)) or 0
             if balance < price:

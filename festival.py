@@ -963,7 +963,7 @@ async def wish_handler(update, context):
 # /quests (everyone)
 # ==========================================================================
 def _quests_text(uid):
-    """Players see each festival's REWARDS (no quest descriptions) with their progress next to every reward."""
+    """Each quest in words (what to do), then its reward and the player's progress."""
     now = _stamp()
     blocks = []
     for f in all_festivals():
@@ -981,14 +981,13 @@ def _quests_text(uid):
         lines.append("")
         for q in qs:
             target = int(q["target"])
-            emoji = QUEST_TYPES.get(q["qtype"], ("🎁",))[0]
             if q["qtype"] != "wish_pay" and is_claimed(uid, q["_id"]):
                 prog = "Done ✅"
             elif st == "live":
                 prog = f"{min(quest_count(uid, f, q), target)}/{target}" + (" paid" if q["qtype"] == "wish_pay" else "")
             else:
                 prog = f"0/{target}"
-            lines.append(f"{emoji} {quest_rewards_short(q)}  ·  {prog}")
+            lines.append(f"{quest_label(f, q)}\n↳ {quest_rewards_short(q)}  ·  {prog}")
         blocks.append("\n".join(lines))
     if not blocks:
         return "🪔 No festival quests are running right now.\n\nSee past and upcoming special rewards with /special."
