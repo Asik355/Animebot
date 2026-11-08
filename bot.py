@@ -2343,11 +2343,62 @@ def event_rewards(ev):
     k = {"coins": "berrys", "stones": "stones", "character": "card"}.get(ev.get("reward_type"))
     return {k: ev["reward_value"]} if k else {}
 
+MAX_REWARD_CHARACTERS = 20
+
+def _reward_cards(v):
+    """Character reward as a list of codes (old events/codes stored a single code)."""
+    if v is None or v == "":
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
 def format_event_rewards(rw):
-    parts = [format_reward("character", rw["card"]) if rw.get("card") else None,
-             format_reward("coins", rw["berrys"]) if rw.get("berrys") else None,
-             format_reward("stones", rw["stones"]) if rw.get("stones") else None]
-    return " + ".join(x for x in parts if x)
+    parts = [format_reward("character", c) for c in _reward_cards(rw.get("card"))]
+    if rw.get("berrys"):
+        parts.append(format_reward("coins", rw["berrys"]))
+    if rw.get("stones"):
+        parts.append(format_reward("stones", rw["stones"]))
+    return " + ".join(parts)
+
+def redeem_rewards_of(doc):
+    """{'coins': n, 'stones': n, 'character': [codes]} of a redeem code; old single-reward codes are converted."""
+    doc = doc or {}
+    if doc.get("rewards"):
+        return doc["rewards"]
+    t, v = doc.get("reward_type"), doc.get("reward_value")
+    if t == "character":
+        return {"character": [v]}
+    if t in ("coins", "stones"):
+        return {t: v}
+    return {}
+
+def format_redeem_rewards(rw):
+    parts = [format_reward("character", c) for c in _reward_cards(rw.get("character"))]
+    if rw.get("coins"):
+        parts.append(format_reward("coins", rw["coins"]))
+    if rw.get("stones"):
+        parts.append(format_reward("stones", rw["stones"]))
+    return " + ".join(parts) or "—"
+
+def parse_character_list(text, limit=MAX_REWARD_CHARACTERS):
+    """One or more characters (code or name) separated by commas / new lines -> (codes, error)."""
+    parts = [p.strip() for p in re.split(r"[,;\n]+", text or "") if p.strip()]
+    if not parts:
+        return None, "❌ Send at least one character."
+    codes, bad = [], []
+    for p in parts:
+        ch = get_character(p)
+        if not ch:
+            bad.append(p)
+            continue
+        c = int(ch[0])
+        if c not in codes:
+            codes.append(c)
+    if bad:
+        return None, ("❌ Character not found: " + ", ".join(bad) +
+                      ". Use a 4-digit code, first name, last name, or full name. Send the whole list again.")
+    if len(codes) > limit:
+        return None, f"❌ Maximum {limit} characters. Send a shorter list."
+    return codes, None
 
 def get_spawn_lock(app):
     lock = app.bot_data.get("spawn_lock")
@@ -9970,7 +10021,7 @@ async def notification_history_command(update, context):
         lines.append("────────────────")
     await safe_reply_text(update.effective_message, "\n".join(lines))
 
-async def notify_admins(context, text, photo_file_id=None, reply_to=None):
+async def notify_admins(context, text, photo_file_id=None, reply_to=None, include_scouts=True):
     owner_id = ADMIN_IDS[0] if ADMIN_IDS else None
 
     executive_ids = set()
@@ -9988,6 +10039,8 @@ async def notify_admins(context, text, photo_file_id=None, reply_to=None):
 
     executive_ids.update(int(uid) for uid in EXECUTIVE_IDS)
     scout_ids = {uid for uid in scout_ids if uid not in executive_ids and uid != owner_id}
+    if not include_scouts:
+        scout_ids = set()
 
     recipients = []
     if owner_id is not None:
@@ -10492,7 +10545,7 @@ async def add_event_stones(update, context):
     if amount is None:
         await safe_reply_text(update.message, "❌ Send a positive number, or 0 to skip."); return EVENT_STONES
     context.user_data["event_stones"] = amount
-    await safe_reply_text(update.message, "5️⃣ Character code or name (send none to skip):")
+    await safe_reply_text(update.message, "5️⃣ Characters: send one or more (code or name), separated by commas. Send none to skip:")
     return EVENT_CHAR
 
 async def add_event_char(update, context):
@@ -10500,11 +10553,11 @@ async def add_event_char(update, context):
     d = context.user_data
     d["event_card"] = None
     if text.lower() not in ("none", "skip", "0"):
-        character = (await asyncio.to_thread(get_character, text))
-        if not character:
-            await safe_reply_text(update.message, "❌ Character not found. Use a 4-digit code, first name, last name, or full name (or none to skip).")
+        codes, err = (await asyncio.to_thread(parse_character_list, text))
+        if err:
+            await safe_reply_text(update.message, err + "\nOr send none to skip.")
             return EVENT_CHAR
-        d["event_card"] = int(character[0])
+        d["event_card"] = codes
     if not (d.get("event_berrys") or d.get("event_stones") or d.get("event_card")):
         await safe_reply_text(update.message, "❌ Give at least one reward. Send the Berrys amount again (0 to skip):")
         return EVENT_BERRYS
@@ -10585,7 +10638,7 @@ async def add_event_end_minute(update, context):
         _mc("events_v2").update_many({"active": 1}, {"$set": {"active": 0}}, session=session)
         mongo_db.insert_with_id("events_v2", {
             "name": d["event_name"], "event_code": d["event_code"], "description": "",
-            "reward_type": {"berrys":"coins","stones":"stones","card":"character"}[k0], "reward_value": rw[k0],
+            "reward_type": {"berrys":"coins","stones":"stones","card":"character"}[k0], "reward_value": (rw[k0][0] if isinstance(rw[k0], list) else rw[k0]),
             "rewards": rw, "max_per_user": d["event_limit"],
             "end_at": end_at, "active": 1, "created_at": timestamp(), "trigger_text": d["event_trigger"],
         }, session=session)
@@ -10643,10 +10696,10 @@ async def event_trigger_message(update, context):
             if not (await asyncio.to_thread(mongo_db.add_special_stones, uid, amt)):
                 raise RuntimeError("event reward user missing")
             undo.append(lambda amt=amt: mongo_db.add_special_stones(uid, -amt))
-        if rw.get("card"):
-            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(rw["card"]))):
+        for _c in _reward_cards(rw.get("card")):
+            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(_c))):
                 raise RuntimeError("event reward character missing")
-            gid = (await asyncio.to_thread(mongo_db.add_collection, uid, rw["card"], timestamp()))
+            gid = (await asyncio.to_thread(mongo_db.add_collection, uid, _c, timestamp()))
             undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
     except Exception as e:
         for fn in reversed(undo):
@@ -10709,6 +10762,7 @@ async def event_claim_callback(update, context):
         pass
 
 REDEEM_TYPE, REDEEM_REWARD, REDEEM_COUNT, REDEEM_EXPIRY, REDEEM_CODE = range(500,505)
+REDEEM_MORE = 505
 
 CODE_MAX_LENGTH = 1000      # safety ceiling only (a code is one Telegram command argument); there is no practical limit
 
@@ -10743,51 +10797,76 @@ async def add_redeem_start(update, context):
     context.user_data.pop("redeem_reward", None)
     context.user_data.pop("redeem_count", None)
     context.user_data.pop("redeem_expiry", None)
-    await safe_reply_text(update.message, "1️⃣ Reward type: Character, Berrys or Stone")
+    context.user_data["redeem_rewards"] = {}
+    await safe_reply_text(update.message, "1️⃣ Reward type: Character, Berrys or Stone\n(you can add several rewards to one code)")
     return REDEEM_TYPE
 
-async def add_redeem_type(update, context):
-    text = update.message.text.strip().lower()
+async def _redeem_pick_type(update, context, text):
+    """Shared by the first reward and 'add another reward'. Returns the next state, or None if the text was not a valid type."""
+    text = text.strip().lower()
     if text not in ("character", "berrys", "stone", "stones", "special stone", "special stones"):
         await safe_reply_text(update.message, "❌ Send Character, Berrys or Stone.")
-        return REDEEM_TYPE
-
-    context.user_data["redeem_type"] = ("coins" if text == "berrys" else "character" if text == "character" else "stones")
+        return None
+    typ = "coins" if text == "berrys" else "character" if text == "character" else "stones"
+    if typ in ("coins", "stones") and typ in context.user_data.get("redeem_rewards", {}):
+        await safe_reply_text(update.message, "❌ That reward is already added. Send a different type (Character, Berrys or Stone), or done.")
+        return None
+    context.user_data["redeem_type"] = typ
     await safe_reply_text(update.message,
-        {"character": "2️⃣ Existing character code or name:", "coins": "2️⃣ Berrys amount:",
-         "stones": "2️⃣ Special Stones amount:"}[context.user_data["redeem_type"]]
+        {"character": "2️⃣ Characters: send one or more (code or name), separated by commas:",
+         "coins": "2️⃣ Berrys amount:",
+         "stones": "2️⃣ Special Stones amount:"}[typ]
     )
     return REDEEM_REWARD
+
+async def add_redeem_type(update, context):
+    return (await _redeem_pick_type(update, context, update.message.text)) or REDEEM_TYPE
 
 async def add_redeem_reward(update, context):
     text = update.message.text.strip()
     typ = context.user_data["redeem_type"]
+    rewards = context.user_data.setdefault("redeem_rewards", {})
 
     if typ == "character":
-        char = (await asyncio.to_thread(get_character, text))
-        if not char:
-            await safe_reply_text(update.message, "❌ Character not found. Use a 4-digit code, first name, last name, or full name.")
+        codes, err = (await asyncio.to_thread(parse_character_list, text))
+        if err:
+            await safe_reply_text(update.message, err)
             return REDEEM_REWARD
-        value = char[0]
+        merged = list(_reward_cards(rewards.get("character")))
+        for c in codes:
+            if c not in merged:
+                merged.append(c)
+        if len(merged) > MAX_REWARD_CHARACTERS:
+            await safe_reply_text(update.message, f"❌ A code can hold at most {MAX_REWARD_CHARACTERS} characters.")
+            return REDEEM_REWARD
+        rewards["character"] = merged
     else:
         amount = _positive_amount(text)
         if amount is None:
             await safe_reply_text(update.message, "❌ " + ("Special Stones" if typ == "stones" else "Berrys") +
                                   " amount must be a positive whole number.")
             return REDEEM_REWARD
-        value = str(amount)
+        rewards[typ] = amount
 
-    context.user_data["redeem_reward"] = value
-    await safe_reply_text(update.message, "3️⃣ How many users can redeem this code? Send a positive number:")
-    return REDEEM_COUNT
+    await safe_reply_text(update.message,
+        f"✅ Added. Rewards so far:\n🎁 {(await asyncio.to_thread(format_redeem_rewards, rewards))}\n\n"
+        "➕ Add another reward? Send Character, Berrys or Stone — or send done to continue.")
+    return REDEEM_MORE
 
-async def add_redeem_count(update, context):
+async def add_redeem_more(update, context):
+    text = update.message.text.strip().lower()
+    if text in ("done", "no", "n", "finish", "next", "skip"):
+        await safe_reply_text(update.message, "3️⃣ How many users can redeem this code? Send a positive number, or 0 for unlimited users (each user can still redeem it only once):")
+        return REDEEM_COUNT
+    return (await _redeem_pick_type(update, context, text)) or REDEEM_MORE
+
+
     text = update.message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await safe_reply_text(update.message, "❌ Redeem count must be a positive number.")
+    if not (text.isascii() and text.isdigit()):
+        await safe_reply_text(update.message, "❌ Send a positive number, or 0 for unlimited users.")
         return REDEEM_COUNT
 
-    context.user_data["redeem_count"] = int(text)
+    context.user_data["redeem_count"] = int(text) or None      # 0 = unlimited
     await safe_reply_text(update.message,
         "4️⃣ Expiry duration:\n"
         "Examples: 24h, 7d, 2d 12h\n"
@@ -10843,9 +10922,21 @@ async def add_redeem_code(update, context):
         return REDEEM_CODE
 
     d = dict(context.user_data)
+    _rw = d.get("redeem_rewards") or {}
+    if not _rw:
+        await safe_reply_text(update.message, "❌ No reward added. Start again with /addredeem.")
+        context.user_data.clear()
+        return ConversationHandler.END
+    # first reward is also kept in the old single-reward fields
+    if _rw.get("character"):
+        _legacy_type, _legacy_value = "character", str(_reward_cards(_rw["character"])[0])
+    elif _rw.get("coins"):
+        _legacy_type, _legacy_value = "coins", str(_rw["coins"])
+    else:
+        _legacy_type, _legacy_value = "stones", str(_rw["stones"])
     try:
         (await asyncio.to_thread(_mc("redeem_codes_v2").insert_one, {
-            "_id": code, "code": shown, "reward_type": d["redeem_type"], "reward_value": d["redeem_reward"],
+            "_id": code, "code": shown, "reward_type": _legacy_type, "reward_value": _legacy_value, "rewards": d["redeem_rewards"],
             "created_at": timestamp(), "active": 1, "max_claims": d["redeem_count"],
             "expires_at": d["redeem_expiry"],
         }))
@@ -10857,8 +10948,7 @@ async def add_redeem_code(update, context):
         await safe_reply_text(update.message, "❌ Could not create redeem code. Please try again.")
         return REDEEM_CODE
 
-    reward_type = d["redeem_type"]
-    reward_value = d["redeem_reward"]
+    rw = _rw
     max_claims = d["redeem_count"]
     expiry = d["redeem_expiry"]
 
@@ -10871,8 +10961,8 @@ async def add_redeem_code(update, context):
     await safe_reply_text(update.message,
         f"✅ Redeem created!\n"
         f"🎟️ {shown}\n"
-        f"🎁 {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
-        f"👥 Limit: {max_claims} users\n"
+        f"🎁 {(await asyncio.to_thread(format_redeem_rewards, rw))}\n"
+        f"👥 Limit: {(str(max_claims) + ' users') if max_claims is not None else 'Unlimited (1 per user)'}\n"
         f"⏳ Expiry: {expiry_text}"
     )
     await release_conv_log(context, update.effective_user.id, "addredeem")
@@ -10892,10 +10982,21 @@ async def redeem(update, context):
     user_id = update.effective_user.id
     codes = _mc("redeem_codes_v2")
     claims = _mc("redeem_claims_v2")
-    granted_id = None
-    coins_given = False
-    stones_given = False
+    undo = []
     claim_id = None
+
+    async def _rollback():
+        """Take back everything already granted and release the claim, so a failure never leaves a half-redeemed code."""
+        for fn in reversed(undo):
+            try:
+                (await asyncio.to_thread(fn))
+            except Exception as undo_err:
+                print("Redeem undo error:", undo_err)
+        if claim_id is not None:
+            try:
+                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
+            except Exception as undo_err:
+                print("Redeem undo error:", undo_err)
 
     try:
         row = (await asyncio.to_thread(codes.find_one, {"_id": code}))
@@ -10903,8 +11004,7 @@ async def redeem(update, context):
             await safe_reply_text(update.message, "❌ Invalid or inactive redeem code.")
             return
 
-        reward_type = row.get("reward_type")
-        reward_value = row.get("reward_value")
+        rw = redeem_rewards_of(row)
         max_claims = row.get("max_claims")
         expires_at = row.get("expires_at")
         shown = row.get("code") or code             # the code as the Owner typed it (for messages)
@@ -10939,71 +11039,53 @@ async def redeem(update, context):
             await safe_reply_text(update.message, "⚠️ You have already redeemed this code.")
             return
 
-        if reward_type == "coins":
-            if not (await asyncio.to_thread(mongo_db.add_coins, user_id, int(reward_value))):
-                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
-                await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
-                return
-            coins_given = True
-        elif reward_type == "stones":
-            if not (await asyncio.to_thread(mongo_db.add_special_stones, user_id, int(reward_value))):
-                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
-                await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
-                return
-            stones_given = True
-        else:
-            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(reward_value))):
-                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
+        cards = _reward_cards(rw.get("character"))
+        for _c in cards:      # check every character exists before giving anything
+            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(_c))):
+                await _rollback()
                 await safe_reply_text(update.message, "❌ This redeem reward is no longer available.")
                 return
-            granted_id = (await asyncio.to_thread(mongo_db.add_collection, user_id, reward_value, timestamp()))
+
+        if rw.get("coins"):
+            amt = int(rw["coins"])
+            if not (await asyncio.to_thread(mongo_db.add_coins, user_id, amt)):
+                await _rollback()
+                await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
+                return
+            undo.append(lambda amt=amt: mongo_db.add_coins(user_id, -amt))
+        if rw.get("stones"):
+            amt = int(rw["stones"])
+            if not (await asyncio.to_thread(mongo_db.add_special_stones, user_id, amt)):
+                await _rollback()
+                await safe_reply_text(update.message, "❌ User account could not be updated. Try /start first.")
+                return
+            undo.append(lambda amt=amt: mongo_db.add_special_stones(user_id, -amt))
+        for _c in cards:
+            gid = (await asyncio.to_thread(mongo_db.add_collection, user_id, _c, timestamp()))
+            undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
 
         if max_claims is not None and claim_count + 1 >= int(max_claims):
             (await asyncio.to_thread(codes.update_one, {"_id": code}, {"$set": {"active": 0}}))
     except Exception as e:
-        # take back anything already granted so a failure never leaves a half-redeemed code
-        if claim_id is not None:
-            try:
-                (await asyncio.to_thread(claims.delete_one, {"_id": claim_id}))
-            except Exception as undo_err:
-                print("Redeem undo error:", undo_err)
-        if coins_given:
-            try:
-                (await asyncio.to_thread(mongo_db.add_coins, user_id, -int(reward_value)))
-            except Exception as undo_err:
-                print("Redeem undo error:", undo_err)
-        if stones_given:
-            try:
-                (await asyncio.to_thread(mongo_db.add_special_stones, user_id, -int(reward_value)))
-            except Exception as undo_err:
-                print("Redeem undo error:", undo_err)
-        if granted_id is not None:
-            try:
-                (await asyncio.to_thread(mongo_db.delete_collection_by_id, granted_id))
-            except Exception as undo_err:
-                print("Redeem undo error:", undo_err)
+        await _rollback()
         print("Redeem error:", e)
         await safe_reply_text(update.message, "❌ Redeem failed. Please try again.")
         return
 
     await safe_reply_text(update.message,
-        f"🎉 Redeemed successfully!\n🎁 {(await asyncio.to_thread(format_reward, reward_type, reward_value))}"
+        f"🎉 Redeemed successfully!\n🎁 {(await asyncio.to_thread(format_redeem_rewards, rw))}"
     )
     redeem_notification = (
         f"🎟️ REDEEM CODE USED\n"
         f"🎟️ Code: {shown}\n"
-        f"🎁 Reward: {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
+        f"🎁 Reward: {(await asyncio.to_thread(format_redeem_rewards, rw))}\n"
         f"👤 Redeemed by: {display_user(update.effective_user)}"
     )
     if max_claims is not None and claim_count + 1 >= int(max_claims):
         redeem_notification += f"\n👥 Final usage: {claim_count + 1}/{max_claims}"
         redeem_notification = "🔴 REDEEM CODE LIMIT REACHED\n" + redeem_notification
-    await notify_staff_action(
-        context,
-        redeem_notification,
-        actor_id=user_id,
-        owner_choice=True,
-    )
+    if not is_owner(user_id):
+        await notify_admins(context, f"🔔 BOT NOTIFICATION\n\n{redeem_notification}", include_scouts=False)
 
 async def delete_redeem(update, context):
     if not is_owner(update.effective_user.id):
@@ -11027,7 +11109,7 @@ async def list_redeems(update, context):
     codes = _mc("redeem_codes_v2")
     claims = _mc("redeem_claims_v2")
     _code_docs = await asyncio.to_thread(lambda: list(codes.find({"active": 1}).sort("created_at", -1)))
-    rows = [(d.get("code") or d["_id"], d.get("reward_type"), d.get("reward_value"), d.get("max_claims"), d.get("expires_at"))
+    rows = [(d.get("code") or d["_id"], redeem_rewards_of(d), d.get("max_claims"), d.get("expires_at"))
             for d in _code_docs]
 
     if not rows:
@@ -11038,7 +11120,7 @@ async def list_redeems(update, context):
     lines = ["🎟️ Active Redeem Codes:"]
     now = datetime.now()
 
-    for code, reward_type, reward_value, max_claims, expires_at in rows:
+    for code, rw, max_claims, expires_at in rows:
         if expires_at:
             try:
                 if now >= datetime.fromisoformat(expires_at):
@@ -11053,7 +11135,7 @@ async def list_redeems(update, context):
         expiry_text = expires_at.replace("T", " ") if expires_at else "Never"
 
         lines.append(
-            f"• {code} → {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
+            f"• {code} → {(await asyncio.to_thread(format_redeem_rewards, rw))}\n"
             f"  👥 Redeemed: {limit_text} | ⏳ Expiry: {expiry_text}"
         )
 
@@ -11443,14 +11525,14 @@ async def event_redeem_expiry_loop(app):
             for rc in await asyncio.to_thread(lambda: list(rc_col.find({"active": 1, "expires_at": {"$nin": [None, ""]}}))):
                 try:
                     if datetime.fromisoformat(rc["expires_at"]) <= now:
-                        expired_redeems.append((rc["_id"], rc.get("reward_type"), rc.get("reward_value"), rc["expires_at"]))
+                        expired_redeems.append((rc["_id"], redeem_rewards_of(rc), rc["expires_at"]))
                 except (TypeError, ValueError):
                     continue
-            for code, reward_type, reward_value, expires_at in expired_redeems:
+            for code, rw, expires_at in expired_redeems:
                 if (await asyncio.to_thread(rc_col.update_one, {"_id": code, "active": 1}, {"$set": {"active": 0}})).modified_count:
                     notifications.append(
                         f"⏰ REDEEM CODE EXPIRED AUTOMATICALLY\n🎟️ Code: {code}\n"
-                        f"🎁 Reward: {(await asyncio.to_thread(format_reward, reward_type, reward_value))}\n"
+                        f"🎁 Reward: {(await asyncio.to_thread(format_redeem_rewards, rw))}\n"
                         f"⏰ Expired: {expires_at.replace('T', ' ')}"
                     )
             for message in notifications:
@@ -14014,6 +14096,7 @@ def register_owner_commands(app):
         states={
             REDEEM_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_type)],
             REDEEM_REWARD: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_reward)],
+            REDEEM_MORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_more)],
             REDEEM_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_count)],
             REDEEM_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_expiry)],
             REDEEM_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_redeem_code)],
