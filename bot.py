@@ -1211,6 +1211,80 @@ async def _get_toggle_target_chat(update, context, command_name):
         return None
     return int(context.args[0])
 
+# ---- per-group switches: manual /spawn and automatic spawning (separate from /boton /botoff) ----
+GROUP_SPAWN_FLAGS = "group_spawn_flags_v1"            # {_id: chat_id, spawn_off: bool, auto_off: bool}
+_GROUP_FLAGS = {"ts": 0.0, "val": {}}
+_GROUP_FLAGS_TTL = 15.0
+
+def group_spawn_flag(chat_id, key):
+    """True when `key` ('spawn_off' / 'auto_off') is set for this group. Cached for a few seconds."""
+    c = _GROUP_FLAGS
+    if time.monotonic() - c["ts"] > _GROUP_FLAGS_TTL:
+        try:
+            c["val"] = {int(d["_id"]): d for d in _mc(GROUP_SPAWN_FLAGS).find({})}
+        except Exception as e:
+            print("Group spawn flags load error:", e)
+        c["ts"] = time.monotonic()
+    return bool((c["val"].get(int(chat_id)) or {}).get(key))
+
+def set_group_spawn_flag(chat_id, key, value):
+    _mc(GROUP_SPAWN_FLAGS).update_one({"_id": int(chat_id)}, {"$set": {key: bool(value)}}, upsert=True)
+    _GROUP_FLAGS["ts"] = 0.0                           # reload on the next check
+
+_SPAWN_SWITCH_TEXT = {
+    # command: (flag, turn_off, what, other)
+    "spawnoff": ("spawn_off", True, "The /spawn command", "Automatic spawning and the rest of the bot keep working."),
+    "spawnon": ("spawn_off", False, "The /spawn command", "Automatic spawning and the rest of the bot keep working."),
+    "autooff": ("auto_off", True, "Automatic spawning", "The /spawn command and the rest of the bot keep working."),
+    "autoon": ("auto_off", False, "Automatic spawning", "The /spawn command and the rest of the bot keep working."),
+}
+
+async def _group_spawn_switch(update, context, command_name):
+    uid = update.effective_user.id
+    if not (is_owner(uid) or is_executive(uid)):
+        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
+        return
+    chat_id = await _get_toggle_target_chat(update, context, command_name)
+    if chat_id is None:
+        return
+    if not await is_group_approved(chat_id):
+        await safe_reply_text(update.effective_message, "⚠️ This group is not approved. Use /approve first.")
+        return
+    flag, turn_off, what, other = _SPAWN_SWITCH_TEXT[command_name]
+    try:
+        await asyncio.to_thread(set_group_spawn_flag, chat_id, flag, turn_off)
+    except Exception as e:
+        print("Group spawn switch error:", e)
+        await safe_reply_text(update.effective_message, "❌ Could not save the setting. Please try again.")
+        return
+    if flag == "auto_off":
+        context.application.bot_data.setdefault("next_auto_spawn_at", {}).pop(chat_id, None)   # fresh timer when turned back on
+    back = command_name.replace("off", "on") if turn_off else command_name.replace("on", "off")
+    state = "OFF" if turn_off else "ON"
+    await safe_reply_text(
+        update.effective_message,
+        f"{'🔴' if turn_off else '🟢'} {what} is now {state} in this group.\n🆔 Group ID: {chat_id}\n\n"
+        f"Other groups are not affected.\n{other}\n"
+        f"👑 Owner/Executive can turn it {'ON' if turn_off else 'OFF'} with /{back}.",
+    )
+    await notify_staff_action(
+        context,
+        f"{'🔴' if turn_off else '🟢'} {what.upper()} TURNED {state}\n🆔 Group ID: {chat_id}\n👤 By: {display_user(update.effective_user)}",
+        actor_id=uid,
+    )
+
+async def spawn_off_command(update, context):
+    await _group_spawn_switch(update, context, "spawnoff")
+
+async def spawn_on_command(update, context):
+    await _group_spawn_switch(update, context, "spawnon")
+
+async def auto_off_command(update, context):
+    await _group_spawn_switch(update, context, "autooff")
+
+async def auto_on_command(update, context):
+    await _group_spawn_switch(update, context, "autoon")
+
 async def bot_off(update, context):
     if not (is_owner(update.effective_user.id) or is_executive(update.effective_user.id)):
         await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
@@ -2080,9 +2154,13 @@ HELP_MODULES = {
              ("/unbtransfer <user_id_1> <user_id_2>", "Remove the transfer block")])),
         ("groupctl", "🤖 Group Control", _help_page(
             "🤖 Group Control (Owner & Executive)",
-            "Switch the bot on or off per group and fix spawns that got stuck.",
+            "Switch the bot, the /spawn command or automatic spawning on or off per group, and fix spawns that got stuck.",
             [("/boton [group_chat_id]", "Turn the bot ON in a group (PM supported)"),
              ("/botoff [group_chat_id]", "Turn the bot OFF in a group (PM supported)"),
+             ("/spawnon [group_chat_id]", "Turn the /spawn command ON in a group (PM supported)"),
+             ("/spawnoff [group_chat_id]", "Turn the /spawn command OFF in a group; automatic spawning keeps running (PM supported)"),
+             ("/autoon [group_chat_id]", "Turn automatic spawning ON in a group (PM supported)"),
+             ("/autooff [group_chat_id]", "Turn automatic spawning OFF in a group; /spawn keeps working (PM supported)"),
              ("/clearspawn", "Clear a stuck active spawn (group only)")])),
         ("broadcast", "📣 Broadcast", "📣 Broadcast"),                       # opens the Broadcast / DM menu (bc:h)
         ("scouts", "🔭 Scout Mgmt", _help_page(
@@ -3453,6 +3531,9 @@ async def spawn(update, context):
         return
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
+    if await asyncio.to_thread(group_spawn_flag, chat_id, "spawn_off"):
+        await safe_reply_text(update.message, "🚫 The /spawn command is turned off in this group.")
+        return
     active = context.application.bot_data.setdefault("active_spawns", {})
 
     if chat_id in active:
@@ -11482,6 +11563,10 @@ async def _auto_spawn_one_chat(app, chat_id):
             return
         return
 
+    if await asyncio.to_thread(group_spawn_flag, chat_id, "auto_off"):
+        next_auto.pop(chat_id, None)          # automatic spawning is switched off here (/autooff)
+        return
+
     if chat_id not in next_auto:
         next_auto[chat_id] = now_dt + timedelta(seconds=AUTO_SPAWN_INTERVAL)
         return
@@ -11680,7 +11765,7 @@ LOG_CATEGORIES = {
               {"addexec", "removeexec", "executives", "addscout", "removescout", "scout",
                "addgroupapprove", "removegroupapprove"}),
     "system": ("System logs", "Group approval, bot ON/OFF, leaving groups, status, history and broadcasts",
-               {"approve", "removeapprove", "leavegroup", "autoapprove", "boton", "botoff", "status",
+               {"approve", "removeapprove", "leavegroup", "autoapprove", "boton", "botoff", "spawnon", "spawnoff", "autoon", "autooff", "status",
                 "history", "gstats", "setrules", "resetrules"}),
     "general": ("General", "Every other command (collection, stats, characters, view, check ...)", set()),
 }
@@ -13126,6 +13211,10 @@ COMMANDS = {
     "dmall": "Owner: send one message to every member's PM (PM only; or reply to a message with /dmall)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
+    "spawnoff": "Owner/Executive: turn /spawn OFF in a group (PM: /spawnoff <group_chat_id>)",
+    "spawnon": "Owner/Executive: turn /spawn ON in a group (PM: /spawnon <group_chat_id>)",
+    "autooff": "Owner/Executive: turn automatic spawning OFF in a group (PM: /autooff <group_chat_id>)",
+    "autoon": "Owner/Executive: turn automatic spawning ON in a group (PM: /autoon <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
     "gstats": "Owner: list groups where bot is added",
     "restrict": "Owner/Executive: restrict by reply or user ID + duration + optional reason",
@@ -13169,8 +13258,10 @@ PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | festival.PUBLIC_COMMANDS | {
 
 PRIVATE_ONLY_COMMANDS = {"reply"}      # shown in the command menu of private chats only, never in groups
 
+MENU_HIDDEN_COMMANDS = {"spawnon", "spawnoff", "autoon", "autooff"}    # work and are logged, but are not listed in Telegram's "/" menu
+
 def make_bot_commands(names):
-    return badge_banner.fit_command_menu([BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS])   # Telegram: max 100
+    return badge_banner.fit_command_menu([BotCommand(name, COMMANDS[name]) for name in names if name in COMMANDS and name not in MENU_HIDDEN_COMMANDS])   # Telegram: max 100
 
 async def refresh_group_command_menu(bot, chat_id, user_id):
     from telegram import BotCommandScopeChatMember
@@ -13967,7 +14058,7 @@ async def scout_list_command(update, context):
 
 EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict",
-    "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
+    "clearspawn", "boton", "botoff", "spawnon", "spawnoff", "autoon", "autooff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
     "btransfer", "unbtransfer", "setrules", "resetrules", "dm", "dmhistory",
 } | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
@@ -13980,6 +14071,10 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("unrestrict", unrestrict))
     app.add_handler(CommandHandler("restrictions", restrictions_list))
     app.add_handler(CommandHandler("botoff", bot_off))
+    app.add_handler(CommandHandler("spawnoff", spawn_off_command))
+    app.add_handler(CommandHandler("spawnon", spawn_on_command))
+    app.add_handler(CommandHandler("autooff", auto_off_command))
+    app.add_handler(CommandHandler("autoon", auto_on_command))
     app.add_handler(CommandHandler("notifications", notifications_command))
     app.add_handler(CommandHandler("notificationoff", notificationoff_command))
     app.add_handler(CommandHandler("notificationon", notificationon_command))
