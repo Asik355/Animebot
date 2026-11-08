@@ -5091,7 +5091,7 @@ def _bc_panel(uid):
 
 def _bc_hub(uid):
     role = "owner" if is_owner(uid) else "executive"
-    rows = [[_bc_btn("📣 Broadcast", "bc:m")]] + ([[_bc_btn("💬 DM", "dm:m")]] if is_owner(uid) else [])
+    rows = [[_bc_btn("📣 Broadcast", "bc:m")], [_bc_btn("💬 DM", "dm:m")]]      # same buttons for the owner and executives
     return "<b>📣 Broadcast & DM</b>\n\nChoose what you want to do.", _bc_kb(*rows, [_bc_btn("🔙 Back", f"help:{uid}:{role}")])
 
 def _bc_screen(st):
@@ -5384,8 +5384,9 @@ async def bc_message(update, context):
 
 
 # ---------------------------------------------------------------------------
-# DM (/help -> 📣 Broadcast -> 💬 DM, Owner only): message one user through the bot and read the whole chat.
-# Executives can only use the ✍️ Reply button under Idea / Issue / Appeal notifications and under answers to their own replies.
+# DM (/help -> 📣 Broadcast -> 💬 DM, Owner and Executives): message one user through the bot and read the chat.
+# An executive's DM is copied automatically to the owner and the other executives. The owner's DM is copied to the executives
+# only if the owner presses 📤 Send. Executives see in History only what is shared with them (rows with "vis"), and cannot 🗑 Remove chats.
 # A user's message reaches the owner ONLY when they swipe-reply to one of the owner's DMs or use /reply. Everything is saved in dm_log.
 # A user can only be messaged after they pressed Start in the bot (Telegram rule).
 # ---------------------------------------------------------------------------
@@ -5457,7 +5458,7 @@ async def _dm_next_n(uid):
         return None
 
 async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev="", n=None, mid2=None, about=False,
-                  by=None, byn="", ctx=None):
+                  by=None, byn="", ctx=None, vis=False):
     if n is None:
         n = await _dm_next_n(uid)
     row = {"uid": uid, "out": out, "kind": kind, "text": text[:500], "t": int(time.time())}
@@ -5479,6 +5480,8 @@ async def _dm_log(uid, out, kind, text, mid=None, reply_n=None, reply_prev="", n
             row["byn"] = byn                  # executive's display name
     if ctx:
         row["ctx"] = ctx                      # what it answered, e.g. "Idea #3"
+    if vis:
+        row["vis"] = True                     # executives may see this message in History
     try:
         await asyncio.to_thread(_mc(DM_COLL).insert_one, row)
     except Exception as e:
@@ -5645,7 +5648,7 @@ async def _dm_send(context, uid, src=None, text=None, sender=None, ctx=None, ref
     is_exec = sender.get("role") == "executive"
     await _dm_log(uid, True, kind, body, mid=mid, n=n, mid2=mid2, by=sender.get("id"),
                   byn=(sender.get("name") or "Executive") if is_exec else "",
-                  ctx=(ctx or {}).get("label"), reply_n=(ref or {}).get("n"))
+                  ctx=(ctx or {}).get("label"), reply_n=(ref or {}).get("n"), vis=is_exec)
     return {"mid": mid, "mid2": mid2, "n": n}
 
 def _dm_staff_kb(rid, uid):
@@ -5655,9 +5658,26 @@ def _dm_staff_kb(rid, uid):
                       [_bc_btn("🗑 Remove", f"dm:d:{uid}")])
     return _bc_kb([_bc_btn("✍️ Reply", f"dm:rm:{uid}:0")])
 
+# What an executive may see in History: executives' own messages, owner DMs the owner shared (📤 Send), and members' messages
+# that do not answer a hidden owner DM.
+_DM_EXEC_VIS = {"$or": [{"vis": True}, {"byn": {"$exists": True}}]}
+
+async def _dm_mark_visible(uid, row):
+    """The owner pressed 📤 Send: executives may now see this DM and the member's replies to it in History."""
+    try:
+        await asyncio.to_thread(_mc(DM_COLL).update_one, {"_id": row["_id"]}, {"$set": {"vis": True}})
+        if row.get("n") is not None:
+            await asyncio.to_thread(_mc(DM_COLL).update_many, {"uid": uid, "out": False, "rto": row["n"]}, {"$set": {"vis": True}})
+    except Exception as e:
+        print("DM visibility error:", e)
+
+async def _dm_staff_ok(uid):
+    return is_owner(uid) or await _is_exec(uid)
+
 async def _dm_share(context, uid, res, recipients):
     """Copy exactly what the member received to these staff ids, with a '📤 Sent to ...' line first."""
     name = await _dm_name(uid)
+    failed = []
     for rid in recipients:
         try:
             await context.bot.send_message(rid, f"📤 Sent to {name} (ID {uid})")
@@ -5667,7 +5687,30 @@ async def _dm_share(context, uid, res, recipients):
                 ids.append((await context.bot.copy_message(rid, uid, res["mid2"])).message_id)
             await _dm_note(rid, ids, uid)
         except TelegramError as e:
+            failed.append(rid)
             print(f"DM share error ({rid}):", e)
+    return failed
+
+async def _dm_share_alert(context, sender, uid, preview, failed):
+    """An executive's DM could not be copied to everyone: tell the owner, with the message text, so nothing goes unseen."""
+    if not ADMIN_IDS:
+        return
+    owner_id = int(ADMIN_IDS[0])
+    name = html_escape(await _dm_name(uid))
+    who = html_escape((sender.full_name or "").strip() or str(sender.id))
+    lines = ["⚠️ <b>Copy failed</b>",
+             f"Executive <b>{who}</b> (<code>{sender.id}</code>) sent a DM to <b>{name}</b> (<code>{uid}</code>)."]
+    if owner_id in failed:
+        lines.append("The copy to you did not arrive.")
+    others = [i for i in failed if i != owner_id]
+    if others:
+        lines.append("Copy failed for: " + ", ".join(f"<code>{i}</code>" for i in others))
+    if preview:
+        lines.append("\nMessage:\n" + html_escape(preview[:600]))
+    try:
+        await context.bot.send_message(owner_id, "\n".join(lines), parse_mode="HTML")
+    except TelegramError as e:
+        print("DM share alert error:", e)
 
 async def _dm_staff_send(msg, context, user, uid, src=None, text=None, ctx=None, ref=None):
     """The owner or an executive writes to member `uid`. Owner: then 📤 Send / 🚫 Don't send (copy to executives).
@@ -5690,12 +5733,17 @@ async def _dm_staff_send(msg, context, user, uid, src=None, text=None, ctx=None,
         return
     await safe_reply_text(msg, f"✅ Sent to <b>{name}</b>.", parse_mode="HTML")
     others = ([int(ADMIN_IDS[0])] if ADMIN_IDS else []) + sorted(execs - {user.id})
-    await _dm_share(context, uid, res, others)
+    failed = await _dm_share(context, uid, res, others)
+    if failed:      # a copy did not arrive: alert the owner (with the message text) so an executive's DM never goes unseen
+        await _dm_share_alert(context, user, uid, _dm_preview(src) if src is not None else (text or ""), failed)
 
-async def _dm_history(uid, page):
-    """(text, keyboard) with the chat, newest page first (10 messages per page, oldest at the top of each page)."""
+async def _dm_history(uid, page, viewer=None):
+    """(text, keyboard) with the chat, newest page first (10 messages per page, oldest at the top of each page).
+    viewer = the staff member looking at it; an executive only sees what is shared with executives."""
+    exec_view = viewer is not None and not is_owner(viewer)
+    flt = {"uid": uid, "t": {"$gte": _dm_cutoff()}, **(_DM_EXEC_VIS if exec_view else {})}
     rows = await asyncio.to_thread(lambda: list(
-        _mc(DM_COLL).find({"uid": uid, "t": {"$gte": _dm_cutoff()}}).sort("t", -1).skip(page * DM_PAGE).limit(DM_PAGE + 1)))
+        _mc(DM_COLL).find(flt).sort("t", -1).skip(page * DM_PAGE).limit(DM_PAGE + 1)))
     more, rows = len(rows) > DM_PAGE, rows[:DM_PAGE][::-1]
     name = html_escape(await _dm_name(uid))
     if rows:
@@ -5714,7 +5762,12 @@ async def _dm_history(uid, page):
                 ref = " (↩️ bot msg)"
             elif not r["out"] and r.get("rprev"):
                 ref = " (↩️ reply)"
-            who = (name if not r["out"] else (f"Exec {html_escape(r['byn'])}" if r.get("byn") else "You"))
+            if not r["out"]:
+                who = name
+            elif r.get("byn"):
+                who = "You" if exec_view and r.get("by") == viewer else f"Exec {html_escape(r['byn'])}"
+            else:
+                who = "Owner" if exec_view else "You"
             lines.append(f"🕒 {datetime.fromtimestamp(r['t'], IST).strftime('%d %b, %I:%M %p')}\n"
                          f"<b>{num}{who}</b>{ref}: {body}")
         text = f"<b>📜 Chat with {name}</b> (<code>{uid}</code>)\n\n" + "\n\n".join(lines)
@@ -5722,7 +5775,7 @@ async def _dm_history(uid, page):
         text = f"📜 No messages with <b>{name}</b> in the last 5 days."
     nav = ([_bc_btn("◀ Older", f"dm:h:{uid}:{page + 1}")] if more else []) + \
           ([_bc_btn("Newer ▶", f"dm:h:{uid}:{page - 1}")] if page else [])
-    actions = [_bc_btn("✍️ Reply", f"dm:r:{uid}")] + ([_bc_btn("🗑 Remove", f"dm:dh:{uid}")] if rows else [])
+    actions = [_bc_btn("✍️ Reply", f"dm:r:{uid}")] + ([_bc_btn("🗑 Remove", f"dm:dh:{uid}")] if rows and not exec_view else [])
     return text, _bc_kb(*([nav] if nav else []), actions, [_bc_btn("🔙 Back", "dm:l:0")])
 
 def _dm_ago(t):
@@ -5735,11 +5788,13 @@ def _dm_ago(t):
         return f"{d // 3600} h ago"
     return f"{d // 86400} d ago"
 
-async def _dm_list(page):
-    """(text, keyboard): everyone you messaged or who messaged you in the last 5 days, newest first."""
+async def _dm_list(page, viewer=None):
+    """(text, keyboard): everyone you messaged or who messaged you in the last 5 days, newest first.
+    An executive only sees chats that have something shared with executives."""
     cutoff = _dm_cutoff()
+    match = {"t": {"$gte": cutoff}, **(_DM_EXEC_VIS if viewer is not None and not is_owner(viewer) else {})}
     rows = await asyncio.to_thread(lambda: list(_mc(DM_COLL).aggregate([
-        {"$match": {"t": {"$gte": cutoff}}},
+        {"$match": match},
         {"$sort": {"t": -1}},
         {"$group": {"_id": "$uid", "t": {"$first": "$t"}, "out": {"$first": "$out"}}},
         {"$sort": {"t": -1}},
@@ -5771,7 +5826,7 @@ def _dm_panel():
 async def dm_command(update, context):
     """/dm opens the DM menu.  /dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
     msg = update.effective_message
-    if not is_owner(update.effective_user.id):
+    if not await _dm_staff_ok(update.effective_user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
         return
     if update.effective_chat.type != "private":
@@ -5794,7 +5849,7 @@ async def dm_command(update, context):
 
 async def dmhistory_command(update, context):
     msg = update.effective_message
-    if not is_owner(update.effective_user.id):
+    if not await _dm_staff_ok(update.effective_user.id):
         await safe_reply_text(msg, UNAUTHORIZED_TEXT)
         return
     if update.effective_chat.type != "private" or not context.args:
@@ -5804,15 +5859,15 @@ async def dmhistory_command(update, context):
     if uid is None:
         await safe_reply_text(msg, DM_UNKNOWN_TEXT)
         return
-    text, markup = await _dm_history(uid, 0)
+    text, markup = await _dm_history(uid, 0, update.effective_user.id)
     await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
 
 async def dm_callback(update, context):
     q, uid = update.callback_query, update.callback_query.from_user.id
     parts = (q.data or "").split(":")
     act, a, b = parts[1] if len(parts) > 1 else "m", parts[2] if len(parts) > 2 else "", parts[3] if len(parts) > 3 else "0"
-    # Owner: everything. Executives: only ✍️ Reply under Idea/Issue/Appeal and under answers to their replies.
-    if not is_owner(uid) and not (act in ("rm", "ri", "cx") and await _is_exec(uid)):
+    # Owner: everything. Executives: the DM menu, History and replies; not 📤 Send / 🚫 Don't send (owner's choice) and not 🗑 Remove.
+    if not is_owner(uid) and not (act in ("m", "x", "new", "hist", "r", "cx", "rm", "ri", "l", "h") and await _is_exec(uid)):
         await q.answer(UNAUTHORIZED_TEXT, show_alert=True)
         return
     if q.message is None or q.message.chat.type != "private":
@@ -5881,11 +5936,12 @@ async def dm_callback(update, context):
                 return
             _dm_shared.add((target, mid))
             await _dm_share(context, target, {"mid": row.get("mid"), "mid2": row.get("mid2")}, sorted(await _exec_ids()))
+            await _dm_mark_visible(target, row)
             await show(f"✅ Sent to <b>{name}</b>.\n📤 Shown to executives.", None)
     elif act == "l":
-        await show(*await _dm_list(int(a) if a.isdigit() else 0))
+        await show(*await _dm_list(int(a) if a.isdigit() else 0, uid))
     elif act == "h" and a.lstrip("-").isdigit() and b.isdigit():
-        await show(*await _dm_history(int(a), int(b)))
+        await show(*await _dm_history(int(a), int(b), uid))
     elif act == "d" and a.lstrip("-").isdigit():        # 🗑 Remove on a "Reply from" message: step 1, ask first
         await context.bot.send_message(
             q.message.chat.id, f"🗑 Remove chat with <b>{html_escape(await _dm_name(int(a)))}</b>?\n"
@@ -5936,12 +5992,12 @@ async def dm_message(update, context):
             _dm_state.pop(user.id, None)
             await _dm_staff_send(msg, context, user, st["to"], src=msg, ctx=st.get("ctx"), ref=st.get("ref"))
             return
-        if owner and st is not None:
+        if st is not None:
             if (target := await _dm_target(msg.text)) is None:
                 await safe_reply_text(msg, DM_UNKNOWN_TEXT)
             elif st["step"] == "hist":
                 _dm_state.pop(user.id, None)
-                out, markup = await _dm_history(target, 0)
+                out, markup = await _dm_history(target, 0, user.id)
                 await msg.reply_text(out, parse_mode="HTML", reply_markup=markup)
             else:
                 st.update(step="msg", to=target)
@@ -5979,8 +6035,9 @@ async def _dm_forward(context, msg, user, title, text=None, ref=None, about=None
         reply_prev = (ref.get("text") or "").strip() or _DM_LABELS.get(ref.get("kind"), "")
     elif about is not None:
         reply_prev, is_about = about, True
+    vis = ref is None or bool(ref.get("vis")) or bool(ref.get("byn"))      # an answer to a hidden owner DM stays hidden from executives
     n = await _dm_log(user.id, False, kind, text, mid=getattr(msg, "message_id", None), reply_n=reply_n,
-                      reply_prev=reply_prev, about=is_about)
+                      reply_prev=reply_prev, about=is_about, vis=vis)
     who = html_escape(await _dm_name(user.id))
     head = (f"{title} <b>{who}</b>\n🆔 <code>{user.id}</code> | "
             f"{'@' + html_escape(user.username) if user.username else 'no username'}"
@@ -12760,8 +12817,8 @@ COMMANDS = {
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
     "leavegroup": "Owner: remove a group and make the bot leave it (PM: /leavegroup <group_chat_id>)",
     "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
-    "dm": "Owner: open the DM menu, or /dm <user_id or @username> <message> (PM only)",
-    "dmhistory": "Owner: read your chat with a user (/dmhistory <user_id or @username>, PM only)",
+    "dm": "Owner/Executive: open the DM menu, or /dm <user_id or @username> <message> (PM only)",
+    "dmhistory": "Owner/Executive: read your chat with a user (/dmhistory <user_id or @username>, PM only)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -13606,7 +13663,7 @@ async def scout_list_command(update, context):
 EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
-    "btransfer", "unbtransfer", "setrules",
+    "btransfer", "unbtransfer", "setrules", "dm", "dmhistory",
 } | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
