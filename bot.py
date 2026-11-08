@@ -10868,9 +10868,13 @@ async def add_redeem_count(update, context):
 
     context.user_data["redeem_count"] = int(text) or None      # 0 = unlimited
     await safe_reply_text(update.message,
-        "4️⃣ Expiry duration:\n"
-        "Examples: 24h, 7d, 2d 12h\n"
-        "Send 0 for no expiry."
+        "4️⃣ When should this code expire? (India time)\n\n"
+        "📅 Exact date and time: DD-MM-YY h:mm am/pm\n"
+        "Example: 10-11-26 4:30am (10 Nov 2026, 4:30 AM)\n"
+        "Example: 25-12-26 11:00pm\n\n"
+        "⏱ Or a duration from now\n"
+        "Examples: 24h, 7d, 2d 12h\n\n"
+        "♾ Send 0 for no expiry."
     )
     return REDEEM_EXPIRY
 
@@ -10879,13 +10883,32 @@ def parse_redeem_expiry(value):
     if raw in ("0", "never", "none", "no"):
         return None, None
 
+    # Exact date and time (India time): DD-MM-YY h:mm am/pm  (also DD/MM/YYYY, 24-hour 16:30, "4:30 pm")
+    m = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4}|\d{2})[\s,]+(\d{1,2}):(\d{2})\s*([ap]\.?m\.?)?", raw)
+    if m:
+        day, month, year, hour, minute = (int(m.group(i)) for i in range(1, 6))
+        ampm = (m.group(6) or "").replace(".", "")
+        if year < 100:
+            year += 2000
+        if ampm:
+            if not 1 <= hour <= 12:
+                return None, "❌ Invalid time. With am/pm the hour must be 1-12, for example 10-11-26 4:30am"
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        try:
+            when = datetime(year, month, day, hour, minute)
+        except ValueError:
+            return None, "❌ Invalid date or time. Use DD-MM-YY h:mm am/pm, for example 10-11-26 4:30am"
+        if when <= datetime.now() + timedelta(seconds=60):
+            return None, "❌ That time has already passed (or is under 1 minute away). Send a future date and time."
+        return when.isoformat(timespec="seconds"), None
+
     matches = re.findall(r"(\d+)\s*(d|h|m)", raw)
     if not matches:
-        return None, "❌ Invalid expiry. Use examples like `24h`, `7d`, or `2d 12h`, or send `0` for no expiry."
+        return None, "❌ Invalid expiry. Send a date and time like 10-11-26 4:30am, a duration like 24h, 7d or 2d 12h, or 0 for no expiry."
 
     normalized = re.sub(r"(\d+)\s*(d|h|m)", "", raw)
     if normalized.strip():
-        return None, "❌ Invalid expiry. Use examples like `24h`, `7d`, or `2d 12h`, or send `0` for no expiry."
+        return None, "❌ Invalid expiry. Send a date and time like 10-11-26 4:30am, a duration like 24h, 7d or 2d 12h, or 0 for no expiry."
 
     total_seconds = 0
     seen = set()
