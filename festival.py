@@ -210,20 +210,25 @@ def _grant_stamp():
     return _stamp()
 
 
-_DATE_RE = re.compile(r"^\s*(\d{1,2})\D+(\d{1,2})\D+(\d{4}|\d{2})\D+(\d{1,2})\D+(\d{2})\s*$")
+_DATE_RE = re.compile(r"^\s*(\d{1,2})\D+(\d{1,2})\D+(\d{4}|\d{2})\D+(\d{1,2})\D+(\d{2})\s*(?:([ap])\.?\s*m\.?)?\s*$", re.I)
 
 
 def parse_when(text, allow_now=False):
-    """'DD-MM-YYYY HH:MM' (24h, IST; any separators, 2-digit year ok) -> ISO string, or None. 'now' only if allowed."""
+    """'DD-MM-YY h:mm am/pm' (e.g. 10-11-26 4:30am) or 24-hour 'DD-MM-YYYY HH:MM' (IST; any separators, 2- or 4-digit year) -> ISO string, or None. 'now' only if allowed."""
     t = str(text or "").strip()
     if allow_now and t.casefold() == "now":
         return _stamp()
     m = _DATE_RE.match(t)
     if not m:
         return None
-    d, mo, y, h, mi = (int(x) for x in m.groups())
+    d, mo, y, h, mi = (int(x) for x in m.groups()[:5])
+    ampm = (m.group(6) or "").lower()
     if y < 100:
         y += 2000
+    if ampm:
+        if not 1 <= h <= 12:
+            return None
+        h = h % 12 + (12 if ampm == "p" else 0)
     try:
         return _iso(datetime(y, mo, d, h, mi))
     except ValueError:
@@ -1215,7 +1220,10 @@ async def fs_callback(update, context):
 # ==========================================================================
 AF_NAME, AF_PHRASE, AF_START, AF_END, AF_CONFIRM = range(20, 25)
 _NEW = "fs_new"
-_WHEN_HELP = "Format: DD-MM-YYYY HH:MM (24-hour, India time). Example: 20-10-2026 18:00"
+_WHEN_HELP = ("Format: DD-MM-YY h:mm am/pm (India time).\n"
+              "Example: 10-11-26 4:30am  (10 Nov 2026, 4:30 AM)\n"
+              "Example: 25-12-26 11:00pm\n"
+              "24-hour also works: 20-10-2026 18:00")
 
 
 async def addfestival_start(update, context):
