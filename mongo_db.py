@@ -393,6 +393,8 @@ def _user_defaults():
     return {
         "coins": 0, "last_daily": None, "guess_attempts": 0,
         "guess_secret": None, "guess_active": 0, "guess_reward_total": 0,
+        # join stamp: only members created after the "View Rules" update have it (old members never get the rules button)
+        "joined": datetime.now(timezone(timedelta(hours=5, minutes=30))).replace(tzinfo=None).isoformat(timespec="seconds"),
     }
 
 
@@ -473,6 +475,42 @@ def get_user_names(user_id):
 @retry_read
 def count_users():
     return col(USERS).count_documents({})
+
+
+@retry_read
+def get_all_user_ids():
+    """Every saved user id (used by the owner's DM All)."""
+    return [d["_id"] for d in col(USERS).find({}, {"_id": 1})]
+
+
+@retry_read
+def needs_rules_prompt(user_id):
+    """True for a NEW member (created after the rules-button update) who has not opened the rules yet, while rules are set."""
+    doc = col(USERS).find_one({"_id": int(user_id)}, {"joined": 1, "rules_seen": 1})
+    if not doc or not doc.get("joined") or doc.get("rules_seen"):
+        return False
+    return get_rules() is not None
+
+
+@retry_read
+def has_started(user_id):
+    """May this user use the bot in groups? False only for NEW members (never seen, or created after the start-first update)
+    who have not opened the bot's PM yet. Members created before the update have no 'joined' stamp and are always allowed."""
+    doc = col(USERS).find_one({"_id": int(user_id)}, {"joined": 1, "started": 1})
+    if doc is None:
+        return False
+    return bool(doc.get("started")) or not doc.get("joined")
+
+
+@retry_write
+def mark_started(user_id):
+    """The user opened the bot's PM (the only way the bot can message them)."""
+    col(USERS).update_one({"_id": int(user_id)}, {"$set": {"started": True}, "$setOnInsert": _user_defaults()}, upsert=True)
+
+
+@retry_write
+def mark_rules_seen(user_id):
+    col(USERS).update_one({"_id": int(user_id)}, {"$set": {"rules_seen": True}})
 
 
 @retry_read

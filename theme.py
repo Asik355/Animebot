@@ -530,7 +530,7 @@ def _slot_links(links_value, slot):
     return out
 
 
-def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=False, bot_username=None):
+def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=False, bot_username=None, extra_rows=None):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     preset = _preset(theme_value, "start")
     items = _button_items(buttons_value)
@@ -556,7 +556,10 @@ def start_keyboard_for(uid, buttons_value, links_value, theme_value, preview=Fal
                 _themed_label(LINK_LABELS[slot], LINK_LABELS[slot], LINK_WORDS[slot].split("/")[0], preset), callback_data=data)
     rows = _resolve_layout(items, links_value, (buttons_value or {}).get("layout"))
     keyboard = [[elements[e] for e in row if e in elements] for row in rows]
-    return InlineKeyboardMarkup([r for r in keyboard if r])
+    out = [r for r in keyboard if r]
+    if extra_rows:                      # e.g. the "📜 View Rules" row bot.py adds for new members in groups
+        out += [list(r) for r in extra_rows]
+    return InlineKeyboardMarkup(out)
 
 
 def decorate_help_text(text):
@@ -567,7 +570,7 @@ def decorate_help_text(text):
         return text
 
 
-async def send_start(update, context):
+async def send_start(update, context, extra_rows=None):
     """
     Called by /start. Returns False when nothing is customized (the original code then runs unchanged) or when the
     customized message could not be sent at all; True once the customized /start has been delivered.
@@ -584,7 +587,7 @@ async def send_start(update, context):
         if header and not custom:       # a custom welcome already greets the user by name: no second "👤 Name" line
             text = header(msg, text)
         keyboard = start_keyboard_for(user.id, _saved.get("buttons"), _links_saved(), _saved.get("theme"),
-                                      bot_username=getattr(msg.get_bot(), "username", None))
+                                      bot_username=getattr(msg.get_bot(), "username", None), extra_rows=extra_rows)
         parse = "HTML" if custom else None
         bot, chat_id = msg.get_bot(), msg.chat_id
         banner = _saved.get("banner")

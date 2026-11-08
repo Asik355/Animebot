@@ -2014,13 +2014,6 @@ HELP_MODULES = {
                                                "Overwrites an old mapping and tells you; warns if the command is not registered"),
              ("/unlogmap <command>", "Remove a mapping; the command goes back to its default category"),
              ("/logmappings", "List all mapped commands and their categories")])),
-        ("rules", "📜 Bot Rules", _help_page(
-            "📜 Bot Rules",
-            "The usage rules everyone can read. Only staff can change them.",
-            [("/rules", "Show the rules (everyone, groups and PM)"),
-             ("/rules noformat", "Raw markdown text for easy copying"),
-             ("/setrules <text>", "Set the rules (Owner/Executive, private chat only; Markdown supported)"),
-             ("/resetrules", "Clear all rules (Owner only, private chat only)")])),
         ("staff", "👔 Staff Roles", _help_page(
             "👔 Staff Roles (Owner only)",
             "Manage Executives, Scouts and who may approve groups.",
@@ -2098,14 +2091,14 @@ HELP_MODULES = {
             [("/addscout <user_id>", "Add a Scout"),
              ("/removescout <user_id>", "Remove a Scout"),
              ("/scouts", "View the Scout list (public: every user can run it)")])),
-        ("execrules", "📜 Exec Rules", _help_page(
-            "📜 Exec Rules (Owner & Executive)",
-            "Executives can set the bot rules; everyone can read them.",
+        ("botrules", "📜 Bot Rules", _help_page(
+            "📜 Bot Rules (Owner & Executive)",
+            "Only the Owner and Executives manage the bot rules; everyone can read them.",
             [("/setrules <text>", "Set the rules (private chat only; Markdown supported). "
                                   "Tip: reply to a message in PM with /setrules to use that message"),
-             ("/rules", "View the rules"),
-             ("/rules noformat", "Raw markdown text for copying")],
-            "Clearing the rules is reserved for the Owner.")),
+             ("/resetrules", "Clear all rules (private chat only)"),
+             ("/rules", "View the rules (everyone, groups and PM)"),
+             ("/rules noformat", "Raw markdown text for copying")])),
     ],
     "scout": [
         ("addedit", "🎴 Add & Edit", _addedit_page("scout")),
@@ -3167,24 +3160,135 @@ START_TEXT = (
 )
 
 
+# ---- START FIRST: a NEW member must open the bot's PM before the bot reacts to them in groups ----------------------------
+# Blocked: commands (one short notice, at most once a minute per person), button taps (pop-up). Everything else (normal
+# messages, catching by typing a name) is ignored silently, like Bot OFF. /start and staff are never blocked.
+_START_OK = set()                 # users known to be allowed (cached for the life of the process)
+_START_BLOCKED = {}               # user id -> monotonic time of the last DB check that said "blocked"
+_START_NOTICE_LAST = {}           # user id -> monotonic time of the last "start the bot first" notice
+START_RECHECK, START_NOTICE_GAP = 60, 60
+
+async def _start_blocked(user_id):
+    """True when this user has to open the bot's PM first. A database problem never blocks anybody."""
+    if user_id in _START_OK:
+        return False
+    now = time.monotonic()
+    last = _START_BLOCKED.get(user_id)
+    if last is not None and now - last < START_RECHECK:
+        return True
+    try:
+        if is_owner(user_id) or is_executive(user_id) or await asyncio.to_thread(is_scout, user_id) \
+                or await asyncio.to_thread(mongo_db.has_started, user_id):
+            _START_OK.add(user_id)
+            _START_BLOCKED.pop(user_id, None)
+            return False
+    except Exception as e:
+        print("Start-first check error:", e)
+        return False
+    if len(_START_BLOCKED) > 5000:
+        _START_BLOCKED.clear()
+    _START_BLOCKED[user_id] = now
+    return True
+
+async def start_first_gate(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if msg is None or user is None or user.is_bot or not await _start_blocked(user.id):
+        return
+    command_name, _args = _parse_command(msg.text or "", getattr(context.bot, "username", None))
+    if command_name == "start":
+        return                                                      # /start always works
+    if command_name and command_name in _known_command_names(context.application):
+        now = time.monotonic()
+        if now - _START_NOTICE_LAST.get(user.id, -1e9) >= START_NOTICE_GAP and getattr(context.bot, "username", None):
+            if len(_START_NOTICE_LAST) > 5000:
+                _START_NOTICE_LAST.clear()
+            _START_NOTICE_LAST[user.id] = now
+            try:
+                await safe_reply_text(
+                    msg, "⚠️ Please start the bot first.\n\nTap the button below, then press Start in the private chat.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                        "▶️ Start Bot", url=f"https://t.me/{context.bot.username}?start=go")]]))
+            except Exception as e:
+                print("Start-first notice error:", e)
+    elif command_name is None and (msg.text or "").startswith("/"):
+        return                                                      # a command for another bot: not ours, never blocked
+    elif command_name:
+        return                                                      # not one of our commands: nothing to block
+    raise ApplicationHandlerStop                                    # normal messages and blocked commands: nothing runs
+
+async def start_first_callback_gate(update, context):
+    q = update.callback_query
+    if q is None or q.message is None or q.message.chat.type not in ("group", "supergroup"):
+        return
+    user = q.from_user
+    if user is None or user.is_bot or not await _start_blocked(user.id):
+        return
+    try:
+        await q.answer("⚠️ Please start the bot first: open my private chat and press Start.", show_alert=True)
+    except Exception:
+        pass
+    raise ApplicationHandlerStop
+
+async def mark_started_private(update, context):
+    """Any message in the bot's PM = the user opened the chat, so the bot may react to them in groups (and DM them)."""
+    user = update.effective_user
+    if user is None or user.is_bot or user.id in _START_OK:
+        return
+    try:
+        await asyncio.to_thread(mongo_db.mark_started, user.id)
+    except Exception as e:
+        print("Mark started error:", e)
+        return
+    _START_OK.add(user.id)
+    _START_BLOCKED.pop(user.id, None)
+
+
+async def _rules_button_rows(context, chat, user_id):
+    """[[📜 View Rules]] for a NEW member (created after the update, rules not opened yet) who presses /start in a group.
+    The button opens the bot's PM with /start rules (which also starts the bot). A new member who has not started the bot and
+    has no rules to read gets ▶️ Start Bot instead. None for everyone else (old members, PM)."""
+    if chat is None or chat.type not in ("group", "supergroup") or not getattr(context.bot, "username", None):
+        return None
+    try:
+        if await asyncio.to_thread(mongo_db.needs_rules_prompt, user_id):
+            return [[InlineKeyboardButton("📜 View Rules", url=f"https://t.me/{context.bot.username}?start=rules")]]
+        if await _start_blocked(user_id):
+            return [[InlineKeyboardButton("▶️ Start Bot", url=f"https://t.me/{context.bot.username}?start=go")]]
+    except Exception as e:
+        print("Rules button check error:", e)
+    return None
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     (await save_user_async(update.effective_user))
     if update.effective_chat and update.effective_chat.type in ("group", "supergroup"):
         (await asyncio.to_thread(register_bot_group, update.effective_chat))
     user_id = update.effective_user.id
 
-    if update.effective_chat.type == "private":
+    private = update.effective_chat.type == "private"
+    if private:
         await refresh_command_menu(context.bot, user_id)
     else:
         await refresh_group_command_menu(context.bot, update.effective_chat.id, user_id)
 
-    if await theme.send_start(update, context):     # only acts when the Owner saved a customization; otherwise False
-        return
+    rules_rows = await _rules_button_rows(context, update.effective_chat, user_id)
+    if not await theme.send_start(update, context, extra_rows=rules_rows):     # only acts when the Owner saved a customization
+        keyboard = start_help_keyboard(update.effective_user.id)
+        if rules_rows:
+            keyboard = InlineKeyboardMarkup(list(keyboard.inline_keyboard) + rules_rows)
+        await safe_reply_text(update.message,
+            START_TEXT,
+            reply_markup=keyboard,
+        )
 
-    await safe_reply_text(update.message,
-        START_TEXT,
-        reply_markup=start_help_keyboard(update.effective_user.id),
-    )
+    if private:       # the rules follow the welcome message: for a new member's first /start, or when they tapped 📜 View Rules
+        try:
+            explicit = bool(context.args) and context.args[0].lower() == "rules"
+            if explicit or await asyncio.to_thread(mongo_db.needs_rules_prompt, user_id):
+                if await _send_rules(update.message):
+                    await asyncio.to_thread(mongo_db.mark_rules_seen, user_id)
+        except Exception as e:
+            print("Start rules error:", e)
 
 async def help_command(update, context):
     (await save_user_async(update.effective_user))
@@ -5392,7 +5496,7 @@ async def bc_message(update, context):
 # ---------------------------------------------------------------------------
 DM_COLL, DM_PAGE = "dm_log", 10
 DM_KEEP, DM_COUNTER, DM_LIST_PAGE = 5 * 24 * 3600, "dm_counter", 10   # DM messages are kept for 5 days only
-_dm_state = {}   # staff id -> {"step": "id" | "hist" | "msg", "to": user id, "ctx": Idea/Issue/Appeal, "ref": member message, "t": when}
+_dm_state = {}   # staff id -> {"step": "id" | "hist" | "msg" | "all" | "allc" (DM All), "to": user id, "ctx": Idea/Issue/Appeal, "ref": member message, "t": when}
 DM_NOTIF, DM_STATE_TTL = "dm_notif", 600   # notification message -> what it belongs to (for swipe-reply); a pending "send your reply" expires after 10 min
 _dm_shared = set()                          # (user id, message id) already copied to the executives
 _DM_LABELS = {"photo": "📷 photo", "video": "🎬 video", "animation": "🎞 gif", "document": "📄 file", "audio": "🎵 audio",
@@ -5819,9 +5923,79 @@ async def _dm_list(page, viewer=None):
             "📤 your message was the latest · 📥 their message was the latest")
     return text, _bc_kb(*buttons, *([nav] if nav else []), find_row, back_row)
 
-def _dm_panel():
-    return ("<b>💬 DM</b>\n\nMessage one person through the bot and see everyone you have chatted with (last 5 days).",
-            _bc_kb([_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:l:0")], [_bc_btn("🔙 Back", "bc:h")]))
+def _dm_panel(owner=False):
+    rows = [[_bc_btn("✉️ New DM", "dm:new")], [_bc_btn("📜 History", "dm:l:0")]]
+    if owner:
+        rows.append([_bc_btn("📢 DM All", "dm:all")])              # Owner only: one message to every member's PM
+    rows.append([_bc_btn("🔙 Back", "bc:h")])
+    return ("<b>💬 DM</b>\n\nMessage one person through the bot and see everyone you have chatted with (last 5 days)."
+            + ("\n📢 DM All sends one message to every member." if owner else ""),
+            _bc_kb(*rows))
+
+
+# ---- 📢 DM All (Owner only): one message to every member's PM -------------------
+DM_ALL_PROMPT = ("📢 <b>DM All</b>\n\nSend the one message that every member will get in their PM. "
+                 "Text, photo, video or a file all work.")
+DM_ALL_PAUSE = 0.05            # seconds between members (about 20 a second, under Telegram's limit)
+_dm_all_running = False
+_dm_all_tasks = set()
+
+async def _dm_all_confirm(target, uid):
+    """The owner sent the message: show how many members it will reach and ask for confirmation."""
+    total = await asyncio.to_thread(mongo_db.count_users)
+    _dm_state[uid] = {"step": "allc", "chat": target.chat_id, "mid": target.message_id, "t": time.monotonic()}
+    await target.reply_text(
+        f"📢 Send this message to <b>{total}</b> members?\n"
+        "Members who blocked the bot or never started it are skipped.",
+        parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("✅ Send to all", "dm:ay"), _bc_btn("❌ Cancel", "dm:cx")]))
+
+async def _dm_all_run(bot, report_chat, src_chat, src_mid, owner_id):
+    global _dm_all_running
+    _dm_all_running = True
+    sent = failed = total = 0
+    try:
+        ids = [i for i in await asyncio.to_thread(mongo_db.get_all_user_ids) if i != owner_id]
+        total = len(ids)
+        for rid in ids:
+            for attempt in (1, 2):
+                try:
+                    await bot.copy_message(chat_id=rid, from_chat_id=src_chat, message_id=src_mid)
+                    sent += 1
+                    break
+                except RetryAfter as e:                                 # Telegram asks us to slow down: wait, try once more
+                    wait = getattr(e, "retry_after", 1)
+                    await asyncio.sleep((wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)) + 1)
+                    if attempt == 2:
+                        failed += 1
+                except TelegramError:                                    # blocked the bot / never started it / deleted account
+                    failed += 1
+                    break
+            await asyncio.sleep(DM_ALL_PAUSE)
+    except Exception as e:
+        print("DM All error:", e)
+    finally:
+        _dm_all_running = False
+    try:
+        await bot.send_message(report_chat, f"✅ <b>DM All finished</b>\n\nSent: <b>{sent}</b>\n"
+                               f"Failed: <b>{failed}</b> (blocked the bot or never opened a chat with it)\nTotal: {total}",
+                               parse_mode="HTML")
+    except TelegramError as e:
+        print("DM All report error:", e)
+
+async def dmall_command(update, context):
+    """/dmall (Owner, PM): then send the one message.  Or reply to a message with /dmall to use that message."""
+    msg, user = update.effective_message, update.effective_user
+    if user is None or not is_owner(user.id):
+        await safe_reply_text(msg, UNAUTHORIZED_TEXT)
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /dmall can only be used in the bot's PM.")
+        return
+    if msg.reply_to_message is not None:
+        await _dm_all_confirm(msg.reply_to_message, user.id)
+        return
+    _dm_state[user.id] = {"step": "all", "t": time.monotonic()}
+    await msg.reply_text(DM_ALL_PROMPT, parse_mode="HTML", reply_markup=_bc_kb([_bc_btn("❌ Cancel", "dm:cx")]))
 
 async def dm_command(update, context):
     """/dm opens the DM menu.  /dm <user_id or @username> <message>   or reply to a message with /dm <user_id or @username>"""
@@ -5835,7 +6009,7 @@ async def dm_command(update, context):
     text = " ".join(context.args[1:]).strip()
     src = msg.reply_to_message
     if not context.args and not src:                 # plain /dm: shortcut to the 💬 DM menu
-        text, markup = _dm_panel()
+        text, markup = _dm_panel(is_owner(update.effective_user.id))
         await msg.reply_text(text, parse_mode="HTML", reply_markup=markup)
         return
     if not context.args or not (src or text):
@@ -5884,11 +6058,26 @@ async def dm_callback(update, context):
     await q.answer()
     if act in ("m", "x"):
         _dm_state.pop(uid, None)
-        await show(*_dm_panel())
+        await show(*_dm_panel(is_owner(uid)))
     elif act in ("new", "hist"):
         _dm_state[uid] = {"step": "id" if act == "new" else "hist"}
         await show("<b>💬 DM</b>\n\nSend the user ID or @username of the person" + (" you want to message." if act == "new" else
                    " whose chat you want to see."), cancel)
+    elif act == "all" and is_owner(uid):                # 📢 DM All, step 1: ask for the one message
+        _dm_state[uid] = {"step": "all", "t": time.monotonic()}
+        await show(DM_ALL_PROMPT, cancel)
+    elif act == "ay" and is_owner(uid):                 # 📢 DM All, step 2: confirmed, send in the background
+        st = _dm_state.get(uid)
+        if not st or st.get("step") != "allc":
+            await show("⌛ This DM All has expired. Open it again from 💬 DM.", _bc_kb([_bc_btn("🔙 Back", "dm:m")]))
+        elif _dm_all_running:
+            await show("⏳ A DM All is already being sent. Please wait for its report.", None)
+        else:
+            _dm_state.pop(uid, None)
+            await show("⏳ Sending to all members... You will get a report here when it is done.", None)
+            task = asyncio.create_task(_dm_all_run(context.bot, q.message.chat.id, st["chat"], st["mid"], uid))
+            _dm_all_tasks.add(task)
+            task.add_done_callback(_dm_all_tasks.discard)
     elif act == "r" and a.lstrip("-").isdigit():
         _dm_state[uid] = {"step": "msg", "to": int(a)}
         await context.bot.send_message(q.message.chat.id, f"✍️ Send your message for <b>{html_escape(await _dm_name(int(a)))}</b>. "
@@ -5991,6 +6180,12 @@ async def dm_message(update, context):
         if st is not None and st["step"] == "msg":          # the reply they were asked to type
             _dm_state.pop(user.id, None)
             await _dm_staff_send(msg, context, user, st["to"], src=msg, ctx=st.get("ctx"), ref=st.get("ref"))
+            return
+        if owner and st is not None and st["step"] == "all":       # 📢 DM All: the message to send to everyone
+            await _dm_all_confirm(msg, user.id)
+            return
+        if owner and st is not None and st["step"] == "allc":
+            await safe_reply_text(msg, "⏳ Press ✅ Send to all or ❌ Cancel on the question above first.")
             return
         if st is not None:
             if (target := await _dm_target(msg.text)) is None:
@@ -12611,24 +12806,28 @@ def _split_chunks(text, limit=3900):
     return chunks
 
 
-async def rules_command(update, context):
-    msg = update.effective_message
+async def _send_rules(msg, raw=False):
+    """Send the bot rules to `msg`'s chat. False when no rules are set."""
     doc = await asyncio.to_thread(mongo_db.get_rules)
     if not doc:
         await safe_reply_text(msg, "📜 No bot rules have been set yet.")
-        return
+        return False
     text = doc["text"]
-    raw = bool(context.args) and context.args[0].lower() == "noformat"
     if raw:
         for chunk in _split_chunks(text):
             await safe_reply_text(msg, chunk)               # plain text: markdown stays visible and copyable
-        return
+        return True
     chunks = _split_chunks("📜 Bot Rules\n\n" + text)
     for chunk in chunks:
         try:
             await safe_reply_text(msg, chunk, parse_mode="Markdown")
         except Exception:                                   # unbalanced markdown: fall back to plain text
             await safe_reply_text(msg, chunk)
+    return True
+
+
+async def rules_command(update, context):
+    await _send_rules(update.effective_message, bool(context.args) and context.args[0].lower() == "noformat")
 
 
 async def setrules_command(update, context):
@@ -12656,7 +12855,7 @@ async def setrules_command(update, context):
 
 async def resetrules_command(update, context):
     msg, user = update.effective_message, update.effective_user
-    if user is None or not is_owner(user.id):
+    if user is None or not (is_owner(user.id) or is_executive(user.id)):
         await safe_reply_text(msg, RULES_RESET_DENIED)
         return
     if update.effective_chat.type != "private":
@@ -12819,6 +13018,7 @@ COMMANDS = {
     "autoapprove": "Owner: auto-approve new groups (/autoapprove on|off|min <number>, alone = status)",
     "dm": "Owner/Executive: open the DM menu, or /dm <user_id or @username> <message> (PM only)",
     "dmhistory": "Owner/Executive: read your chat with a user (/dmhistory <user_id or @username>, PM only)",
+    "dmall": "Owner: send one message to every member's PM (PM only; or reply to a message with /dmall)",
     "boton": "Owner/Executive: turn bot ON (PM: /boton <group_chat_id>)",
     "botoff": "Owner/Executive: turn bot OFF (PM: /botoff <group_chat_id>)",
     "status": "Owner: bot status and active spawns",
@@ -12833,7 +13033,7 @@ COMMANDS = {
     "btransfer": "Owner/Executive: block transfer between two user IDs",
     "unbtransfer": "Owner/Executive: remove transfer block between two user IDs",
     "setrules": "Owner/Executive: set the bot usage rules (PM only)",
-    "resetrules": "Owner: clear all bot usage rules (PM only)",
+    "resetrules": "Owner/Executive: clear all bot usage rules (PM only)",
     "setlog": "Owner: link a log channel - repeat to add more (send in the channel, then forward it here)",
     "unsetlog": "Owner: unlink a log channel (/unsetlog <chat_id> or all)",
     "logchannel": "Owner: show all linked log channels",
@@ -13663,7 +13863,7 @@ async def scout_list_command(update, context):
 EXECUTIVE_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "addevo", "editevo", "restrict", "unrestrict",
     "clearspawn", "boton", "botoff", "addscout", "removescout", "notifications", "notificationoff", "notificationon", "notificationhistory",
-    "btransfer", "unbtransfer", "setrules", "dm", "dmhistory",
+    "btransfer", "unbtransfer", "setrules", "resetrules", "dm", "dmhistory",
 } | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
@@ -13684,6 +13884,7 @@ def register_executive_commands(app):
     app.add_handler(CallbackQueryHandler(reply_cancel_callback, pattern=r"^um:x$"))
     app.add_handler(CommandHandler("dm", dm_command))
     app.add_handler(CommandHandler("dmhistory", dmhistory_command))
+    app.add_handler(CommandHandler("dmall", dmall_command))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, dm_message), group=103)
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND & ~filters.StatusUpdate.ALL, bc_message), group=102)
     app.add_handler(CommandHandler("btransfer", block_transfer_pair))
@@ -13730,7 +13931,7 @@ OWNER_COMMANDS = {
     "delevo", "callcharacter", "clearspawn", "gift", "delete", "discontinue", "continue",
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
-    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton", "dm", "dmhistory",
+    "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton", "dm", "dmhistory", "dmall",
     "status", "gstats", "cooldown", "cd", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
@@ -13962,6 +14163,10 @@ def main():
 
     app.add_handler(MessageHandler(filters.ALL, block_unapproved_group), group=-100)
     app.add_handler(CallbackQueryHandler(block_unapproved_callback), group=-100)
+    # Start first: new members must open the bot's PM before the bot reacts to them in groups (after the approved-group check).
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL, start_first_gate), group=-96)
+    app.add_handler(CallbackQueryHandler(start_first_callback_gate), group=-96)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, mark_started_private, block=False), group=-95)
     # Strict role check for restricted commands: after the approved-group check, before every real handler.
     app.add_handler(MessageHandler(filters.COMMAND & filters.UpdateType.MESSAGE, role_gate), group=-90)
     app.add_handler(CallbackQueryHandler(exchange_callback, pattern=r"^ex_(accept|decline):"))
