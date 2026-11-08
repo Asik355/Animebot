@@ -10860,7 +10860,7 @@ async def add_redeem_more(update, context):
         return REDEEM_COUNT
     return (await _redeem_pick_type(update, context, text)) or REDEEM_MORE
 
-
+async def add_redeem_count(update, context):
     text = update.message.text.strip()
     if not (text.isascii() and text.isdigit()):
         await safe_reply_text(update.message, "❌ Send a positive number, or 0 for unlimited users.")
