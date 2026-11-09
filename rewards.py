@@ -51,7 +51,7 @@ from html import escape as _esc, unescape as _unesc
 from urllib.parse import quote as _urlquote
 
 import mongo_db
-from pymongo import ASCENDING
+from pymongo import ASCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
@@ -81,6 +81,8 @@ REFERRALS = "referrals_v1"              # {_id: invitee user id, inviter, token,
 REF_LINKS = "referral_links_v1"         # {_id: link token, user_id, ts}  a member can generate new links; old ones keep working
 REF_CLAIMS = "referral_claims_v1"       # {_id: "<user id>:<tier>", user_id, tier, boxes, ...}  unique id = one claim per tier
 REF_OPENS = "referral_opens_v1"         # {user_id, tier, text, ts}  history of opened boxes
+REF_BOXES = "referral_boxes_v1"         # {_id: "<user id>:<box id>", user_id, mid, invites, rarity, chars, b_min.., opened}  claimed Mystery Boxes, opened with /openbox
+REF_TASKS = "referral_tasks_v1"         # {_id: invited friend, inviter, t: {spawn, catch, sell}, settled, paid_f, paid_i}  friend task bonus
 
 NAME_MAX = 40
 PHRASE_MIN, PHRASE_MAX = 2, 40
@@ -104,7 +106,10 @@ DEFAULT_RARITIES = ("Common", "Rare", "Epic", "Legendary", "Mythical", "Celestia
 COMMAND_DESCRIPTIONS = {
     "quests": "View festival quests and your progress",
     "invite": "Your invite link, progress and Mystery Boxes",
-    "boxes": "Owner: invite system and Mystery Box settings (buttons)",
+    "openbox": "Open a Mystery Box you earned",
+    "myinvites": "See your invites and friends",
+    "topinvites": "See who invited the most",
+    "boxes": "Owner: Mystery Boxes and friend tasks (buttons)",
     "special": "See every special festival character and banner",
     "specialtier": "Owner: set the symbol of the Special tier",
     "festival": "Owner: open the Festival Manager (buttons)",
@@ -117,12 +122,13 @@ COMMAND_DESCRIPTIONS = {
     "editquest": "Owner: edit a quest (/editquest <quest id>)",
     "delquest": "Owner: delete a quest (/delquest <quest id>)",
 }
-PUBLIC_COMMANDS = {"quests", "special", "festivals", "invite"}
+PUBLIC_COMMANDS = {"quests", "special", "festivals", "invite", "openbox", "myinvites", "topinvites"}
 OWNER_COMMANDS = {"boxes", "festival", "specialtier", "addfestival", "editfestival", "delfestival", "addtempchar", "addquest", "editquest", "delquest"}
 
 # User-owned collections: (collection, field holding the user id). Used by /deleteuser, /restoreuser, /moveuser.
 USER_DATA_SPEC = ((PROGRESS, "user_id"), (CLAIMS, "user_id"), (GRANTS, "user_id"), (PAID, "user_id"),
-                  (REFERRALS, "inviter"), (REF_LINKS, "user_id"), (REF_CLAIMS, "user_id"), (REF_OPENS, "user_id"))
+                  (REFERRALS, "inviter"), (REF_LINKS, "user_id"), (REF_CLAIMS, "user_id"), (REF_OPENS, "user_id"),
+                  (REF_BOXES, "user_id"))
 
 DENIED_TEXT = "⚠️ Access Denied: You do not have permission to perform this action."
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Run the command yourself to get your own buttons."
@@ -190,6 +196,8 @@ def ensure_indexes():
         mongo_db.col(REF_LINKS).create_index([("user_id", ASCENDING)], name="user_id")
         mongo_db.col(REF_CLAIMS).create_index([("user_id", ASCENDING)], name="user_id")
         mongo_db.col(REF_OPENS).create_index([("user_id", ASCENDING), ("ts", ASCENDING)], name="user_ts")
+        mongo_db.col(REF_TASKS).create_index([("inviter", ASCENDING)], name="inviter")
+        mongo_db.col(REF_BOXES).create_index([("user_id", ASCENDING)], name="user_id")
         _idx_done = True
 
 
@@ -907,6 +915,8 @@ async def _announce_wish(bot, chat_id, sender, receiver, s_pay, r_pay, s_prog, r
 async def record(bot, uid, kind, rarity=None, chat_id=None, name=None):
     """Called by bot.py after a REAL action ('catch' with its rarity, or 'daily'). Never raises."""
     try:
+        if kind == "catch":
+            await task_hook(bot, uid, "catch", name=name)        # invite friend task (never raises)
         if kind not in COUNTED_TYPES:
             return
         live = await asyncio.to_thread(live_festivals)
@@ -2456,7 +2466,10 @@ PUBLIC_HELP_SECTION = (
     "/festivals — See running and upcoming festivals\n"
     "/special — See special festival characters and banners\n\n"
     "🎁 Invite & Mystery Boxes\n"
-    "/invite — Get your invite link and earn Mystery Boxes\n\n"
+    "/invite — Get your invite link and earn Mystery Boxes\n"
+    "/openbox — Open a Mystery Box you earned\n"
+    "/myinvites — See your invites and friends\n"
+    "/topinvites — See who invited the most\n\n"
 )
 
 
@@ -2474,8 +2487,11 @@ def help_page_text():
         ("/delquest <id>", "Delete a quest"),
         ("/quests", "Players: festival rewards and progress (public)"),
         ("/special", "Everyone: catalog of all special characters and banners (public)"),
-        ("/boxes", "Invite system and Mystery Box settings (buttons): invite rewards, invites needed, what each box gives, on/off"),
-        ("/invite", "Everyone: invite link, progress, claim and open Mystery Boxes (public)"),
+        ("/boxes", "Invite Manager (buttons, also 🎁 Invites in Owner Commands): add, edit, remove or reset Mystery Boxes (invites needed 3-100, rarity, 1-3 characters, Berrys range in steps of 100, Stones range) and set the Friend Tasks bonus for the friend and the inviter"),
+        ("/invite", "Everyone: invite link, progress, claiming Mystery Boxes and friend tasks (public)"),
+        ("/openbox", "Everyone: open the Mystery Boxes you claimed (public)"),
+        ("/myinvites", "Everyone: your invite count, boxes and your friends' task progress (public)"),
+        ("/topinvites", "Everyone: the top 10 inviters (public)"),
     ]
     lines = ["🪔 Festival Quests (Owner)", "", "👉 Easiest: /help -> Owner Commands -> 🪔 Festival (or /festival) opens the "
              "Festival Manager with buttons for everything below.", "", "📌 Overview",
@@ -2623,8 +2639,14 @@ def _dotted_int(doc, path):
 
 
 def item_lines(user_doc):
-    """Lines for /item (fusion.py): one per Mystery Box type the user owns. Boxes are only listed, never opened there."""
-    lines = []
+    """Lines for /item (fusion.py): unopened Mystery Boxes (opened with /openbox), then any old-tier boxes the user still owns."""
+    n, uid = 0, (user_doc or {}).get("_id")
+    if uid is not None:
+        try:
+            n = _col(REF_BOXES).count_documents({"user_id": int(uid), "opened": {"$ne": True}})
+        except Exception as e:
+            logger.warning("item_lines: could not count Mystery Boxes: %s", e)
+    lines = [f"🎁 Mystery Box: {n}"]
     for tier in TIER_ORDER:
         n = _dotted_int(user_doc or {}, _box_field(tier))
         if n > 0:
@@ -2633,23 +2655,56 @@ def item_lines(user_doc):
 
 
 # ---------------- settings ----------------
+BERRY_STEP = 100                    # Berrys in an invite reward are always a multiple of this (100, 200, 300 ...)
+MS_BERRYS_MAX = 5000                # highest Berrys an invite reward can give
+MS_INV_MIN, MS_INV_MAX = 3, 100     # invites one Mystery Box can need
+MS_CHARS_MAX = 3                    # characters in one Mystery Box (the Owner picks 1 to 3, fixed)
+MS_STONES_MAX = 25                  # highest Stones an invite reward (Mystery Box or friend task bonus) can give
+# Starting Mystery Boxes (Owner: /boxes or 🎁 Invites). ♻️ Reset brings these back.
+DEFAULT_MILESTONES = [
+    {"id": "box5",  "enabled": True, "invites": 5,  "rarity": "Epic",      "chars": 1, "b_min": 100,  "b_max": 500,  "s_min": 0, "s_max": 0},
+    {"id": "box10", "enabled": True, "invites": 10, "rarity": "Legendary", "chars": 1, "b_min": 500,  "b_max": 2000, "s_min": 0, "s_max": 0},
+    {"id": "box25", "enabled": True, "invites": 25, "rarity": "Mythical",  "chars": 1, "b_min": 1000, "b_max": 5000, "s_min": 0, "s_max": 0},
+]
+TASK_KINDS = ("spawn", "catch", "sell")
+TASK_NAMES = {"spawn": "Use /spawn", "catch": "Catch a character with /add", "sell": "Sell a character with /sell"}
+NO_REWARD = {"b_min": 0, "b_max": 0, "s_min": 0, "s_max": 0}
+
+
 def get_config():
     doc = _col(REF_SETTINGS).find_one({"_id": "config"}) or {}
     saved = doc.get("tiers") or {}
     tiers = {}
-    for tier in TIER_ORDER:
+    for tier in TIER_ORDER:         # old Mystery Box settings: only used to open boxes members already own
         merged = dict(DEFAULT_TIERS[tier])
         merged.update(saved.get(tier) or {})
         tiers[tier] = merged
-    return {"enabled": bool(doc.get("enabled", True)), "tiers": tiers}
+    ms = doc.get("milestones")
+    if not isinstance(ms, list) or any("rarity" not in m for m in ms):     # nothing saved yet, or saved by an older version
+        ms = DEFAULT_MILESTONES
+    tasks = {}
+    for side in ("friend", "inviter"):
+        t = dict(NO_REWARD)
+        t.update((doc.get("tasks") or {}).get(side) or {})
+        tasks[side] = t
+    return {"enabled": bool(doc.get("enabled", True)), "tiers": tiers, "tasks": tasks,
+            "milestones": sorted((dict(m) for m in ms), key=lambda m: m["invites"])}
 
 
 def set_system_enabled(value):
     _col(REF_SETTINGS).update_one({"_id": "config"}, {"$set": {"enabled": bool(value)}}, upsert=True)
 
 
-def set_tier_fields(tier, fields):
-    _col(REF_SETTINGS).update_one({"_id": "config"}, {"$set": {f"tiers.{tier}.{k}": v for k, v in fields.items()}}, upsert=True)
+def save_milestones(ms):
+    _col(REF_SETTINGS).update_one({"_id": "config"}, {"$set": {"milestones": ms}}, upsert=True)
+
+
+def save_tasks(tasks):
+    _col(REF_SETTINGS).update_one({"_id": "config"}, {"$set": {"tasks": tasks}}, upsert=True)
+
+
+def reset_milestones():
+    _col(REF_SETTINGS).update_one({"_id": "config"}, {"$unset": {"milestones": ""}}, upsert=True)
 
 
 def _fmt_range(lo, hi):
@@ -2658,7 +2713,8 @@ def _fmt_range(lo, hi):
     return str(hi) if lo == hi else f"{lo}-{hi}"
 
 
-def _parse_range(text, cap):
+def _parse_range(text, cap, step=1):
+    """'100-1000' / '300' / '0' -> (lo, hi). With a step above 1 both ends must be multiples of it (and at least one step)."""
     s = (text or "").strip().lower()
     if s in ("0", "off", "none", "no"):
         return 0, 0
@@ -2671,36 +2727,61 @@ def _parse_range(text, cap):
         return None
     if lo > hi or hi < 1 or hi > cap:
         return None
+    if step > 1 and (lo < step or lo % step or hi % step):
+        return None
     return lo, hi
 
 
-def apply_edit_sync(tier, field, text):
-    """Validate and save one Owner edit. Returns (ok, message)."""
+def _ms_label(m):
+    return f"🎁 Mystery Box · {m['invites']} invites"
+
+
+def _task_text(r):
+    parts = []
+    if r["b_max"] > 0:
+        parts.append(f"🪙 {_fmt_range(r['b_min'], r['b_max'])} Berrys")
+    if r["s_max"] > 0:
+        parts.append(f"💎 {_fmt_range(r['s_min'], r['s_max'])} Stones")
+    return " · ".join(parts) or "nothing"
+
+
+def _ms_reward_text(m):
+    parts = [f"🎭 {m['chars']} {m['rarity']}"]
+    if m["b_max"] > 0:
+        parts.append(f"🪙 {_fmt_range(m['b_min'], m['b_max'])}")
+    if m["s_max"] > 0:
+        parts.append(f"💎 {_fmt_range(m['s_min'], m['s_max'])}")
+    return " · ".join(parts)
+
+
+def _ms_parse(field, text, ms, mid):
+    """Validate one Owner input. Returns (fields to set, None) or (None, error message)."""
     s = (text or "").strip()
-    label = _tier_label(tier)
-    if field in ("invites", "boxes", "chars"):
-        low = 0 if field == "chars" else 1
-        high = {"invites": INVITES_MAX, "boxes": BOXES_MAX, "chars": CHARS_MAX}[field]
-        if not (s.isascii() and s.isdigit()) or not low <= int(s) <= high:
-            return False, f"❌ Send a whole number from {low} to {high}."
-        set_tier_fields(tier, {field: int(s)})
-        word = {"invites": "Invites needed", "boxes": "Boxes per claim", "chars": "Characters per box"}[field]
-        return True, f"{label}: {word} is now {int(s)}."
+    if field == "invites":
+        if not (s.isascii() and s.isdigit()) or not MS_INV_MIN <= int(s) <= MS_INV_MAX:
+            return None, f"❌ Send a whole number from {MS_INV_MIN} to {MS_INV_MAX}."
+        if any(m["invites"] == int(s) and m["id"] != mid for m in ms):
+            return None, "❌ Another Mystery Box already needs that many invites."
+        return {"invites": int(s)}, None
+    if field == "chars":
+        if not (s.isascii() and s.isdigit()) or not 1 <= int(s) <= MS_CHARS_MAX:
+            return None, f"❌ Send 1, 2 or 3 (how many characters one box gives)."
+        return {"chars": int(s)}, None
     if field == "rarity":
-        match = next((r for r in _rarities() if r.lower() == s.lower()), None)
-        if not match:
-            return False, "❌ Unknown rarity. Choose one of: " + ", ".join(_rarities())
-        set_tier_fields(tier, {"rarity": match})
-        return True, f"{label}: characters now come from {match}."
+        names = _rarities()
+        hit = next((r for r in names if r.lower() == s.lower()), None)
+        if hit is None:
+            return None, "❌ Unknown rarity. Send one of: " + ", ".join(names)
+        return {"rarity": hit}, None
     if field in ("berrys", "stones"):
-        cap = BERRYS_MAX if field == "berrys" else STONES_MAX
-        rng = _parse_range(s, cap)
+        berrys = field == "berrys"
+        rng = _parse_range(s, MS_BERRYS_MAX if berrys else MS_STONES_MAX, BERRY_STEP if berrys else 1)
         if rng is None:
-            return False, f"❌ Send a range like 50-500 (minimum can't be above maximum, top is {cap}), one number, or 0 to turn it off."
-        key = "b" if field == "berrys" else "s"
-        set_tier_fields(tier, {f"{key}_min": rng[0], f"{key}_max": rng[1]})
-        return True, f"{label}: {field.capitalize()} is now {_fmt_range(*rng)}."
-    return False, "❌ Unknown setting."
+            return None, (f"❌ Berrys go in steps of 100, from 100 to {MS_BERRYS_MAX}. Send a range like 100-1000, one number like 300, or 0 for none."
+                          if berrys else f"❌ Stones go from 0 to {MS_STONES_MAX}. Send a range like 1-10, one number, or 0 for none.")
+        k = "b" if berrys else "s"
+        return {f"{k}_min": rng[0], f"{k}_max": rng[1]}, None
+    return None, "❌ Unknown setting."
 
 
 # ---------------- invite links and referrals ----------------
@@ -2765,39 +2846,150 @@ async def ref_start_handler(update, context):
         if not total:
             return
         lines = [f"🎉 <b>{_esc(user.first_name or 'A new member')}</b> joined using your invite link!", f"👥 Total invites: <b>{total}</b>"]
-        for tier in TIER_ORDER:
-            c = cfg["tiers"][tier]
-            if c["enabled"] and c["invites"] == total:
-                lines.append(f"🎁 You unlocked the {_tier_label(tier)} Mystery Box! Open /invite to claim it.")
+        for m in cfg["milestones"]:
+            if m["enabled"] and m["invites"] == total:
+                lines.append(f"🎁 You unlocked a Mystery Box ({m['invites']} invites)! Open /invite to claim it.")
         await context.bot.send_message(chat_id=inviter, text="\n".join(lines), parse_mode="HTML")
     except Exception as e:
         logger.warning("referral: could not process %r: %s", token, e)
 
 
-# ---------------- claiming and opening boxes ----------------
-def claim_sync(uid, tier):
-    """('ok', boxes) | ('low', invites_missing) | ('dup', None) | ('off', None). A tier can be claimed once per user (unique id)."""
+# ---------------- claiming boxes, opening boxes ----------------
+def _grant(uid, berrys=0, stones=0, rows=()):
+    """All-or-nothing payout to one member. If any part fails, what was already given is taken back and the error is raised."""
+    uid = int(uid)
+    undo, lines = [], []
+    try:
+        if berrys:
+            if not mongo_db.add_coins(uid, berrys):
+                raise RuntimeError("add_coins failed")
+            undo.append(lambda n=berrys: mongo_db.add_coins(uid, -n))
+            lines.append(f"🪙 +{berrys} Berrys")
+        if stones:
+            if not mongo_db.add_special_stones(uid, stones):
+                raise RuntimeError("add_special_stones failed")
+            undo.append(lambda n=stones: mongo_db.add_special_stones(uid, -n))
+            lines.append(f"💎 +{stones} Special Stones")
+        for row in rows:
+            cid = mongo_db.add_collection(uid, row[0], _grant_stamp())
+            if not cid:
+                raise RuntimeError("add_collection failed")
+            undo.append(lambda c=cid: mongo_db.delete_collection_by_id(c))
+            sym = (_deps.get("symbols") or {}).get(str(row[3]), "🎭")
+            lines.append(f"{sym} {_esc(str(row[1]))} [{row[0]}] ({_esc(str(row[3]))})")
+    except Exception:
+        for fn in reversed(undo):
+            try:
+                fn()
+            except Exception as e:
+                logger.error("invite reward rollback failed for %s: %s", uid, e)
+        raise
+    return lines
+
+
+def _roll(r):
+    """A reward range -> (berrys, stones). Berrys are always a multiple of 100 inside the range."""
+    b = random.randrange(r["b_min"], r["b_max"] + 1, BERRY_STEP) if r["b_max"] > 0 else 0
+    st = random.randint(r["s_min"], r["s_max"]) if r["s_max"] > 0 else 0
+    return b, st
+
+
+def claim_ms_sync(uid, mid):
+    """Claiming ADDS the box to the member's items (it is opened later with /openbox).
+    ('ok', None) | ('low', invites_missing) | ('dup', None) | ('off', None) | ('failed', None). One claim per user per box."""
     uid = int(uid)
     cfg = get_config()
-    c = cfg["tiers"].get(tier)
-    if not cfg["enabled"] or not c or not c["enabled"]:
+    m = next((x for x in cfg["milestones"] if x["id"] == mid), None)
+    if not cfg["enabled"] or not m or not m["enabled"]:
         return "off", None
     total = _col(REFERRALS).count_documents({"inviter": uid})
-    if total < c["invites"]:
-        return "low", c["invites"] - total
-    claim_id = f"{uid}:{tier}"
+    if total < m["invites"]:
+        return "low", m["invites"] - total
+    claim_id = f"{uid}:{mid}"
     try:
-        _col(REF_CLAIMS).insert_one({"_id": claim_id, "user_id": uid, "tier": tier, "boxes": c["boxes"], "invites": total, "ts": time.time()})
+        _col(REF_CLAIMS).insert_one({"_id": claim_id, "user_id": uid, "tier": mid, "invites": total, "ts": time.time()})
     except DuplicateKeyError:
         return "dup", None
+    try:                    # what is inside is fixed now: later edits in the Invite Manager do not change a box already claimed
+        _col(REF_BOXES).insert_one({"_id": claim_id, "user_id": uid, "mid": mid, "invites": m["invites"], "rarity": m["rarity"],
+                                    "chars": int(m["chars"]), "b_min": m["b_min"], "b_max": m["b_max"], "s_min": m["s_min"],
+                                    "s_max": m["s_max"], "opened": False, "ts": time.time()})
+    except Exception as e:
+        logger.warning("mystery box could not be added for %s: %s", uid, e)
+        _col(REF_CLAIMS).delete_one({"_id": claim_id})
+        return "failed", None
+    return "ok", None
+
+
+def boxes_sync(uid):
+    return list(_col(REF_BOXES).find({"user_id": int(uid), "opened": {"$ne": True}}).sort("ts", 1))
+
+
+def open_box_new_sync(uid, mid):
+    """('ok', reward lines) | ('none', None) | ('failed', None). A box opens once; if the payout fails, nothing is given and it stays unopened."""
+    uid = int(uid)
+    box_id = f"{uid}:{mid}"
+    box = _col(REF_BOXES).find_one_and_update({"_id": box_id, "user_id": uid, "opened": {"$ne": True}},
+                                              {"$set": {"opened": True, "opened_ts": time.time()}})
+    if not box:
+        return "none", None
     try:
-        res = mongo_db.col(mongo_db.USERS).update_one({"_id": uid}, {"$inc": {_box_field(tier): int(c["boxes"])}})
-        if res.matched_count == 0:
-            raise RuntimeError("user row missing")
-    except Exception:
-        _col(REF_CLAIMS).delete_one({"_id": claim_id})      # nothing was given, so the claim must stay available
-        raise
-    return "ok", int(c["boxes"])
+        pool = filter_hidden(mongo_db.get_characters_by_rarity(box["rarity"]) or [])
+        picks = random.sample(pool, min(int(box["chars"]), len(pool))) if pool else []
+        berrys, stones = _roll(box)
+        if not (picks or berrys or stones):
+            raise RuntimeError("the box is empty")
+        return "ok", _grant(uid, berrys, stones, picks)
+    except Exception as e:
+        logger.warning("mystery box open failed for %s: %s", uid, e)
+        _col(REF_BOXES).update_one({"_id": box_id}, {"$set": {"opened": False}})
+        return "failed", None
+
+
+def record_task_sync(uid, kind):
+    """Marks one task done for an invited friend. When the third one is done, pays the friend and the inviter what the Owner set
+    (once; an empty side gets nothing). Returns {'inviter_id', 'friend', 'inviter'} (reward lines) if something was paid, else None."""
+    uid = int(uid)
+    if kind not in TASK_KINDS:
+        return None
+    ref = _col(REFERRALS).find_one({"_id": uid})
+    if not ref:
+        return None
+    inviter = int(ref["inviter"])
+    doc = _col(REF_TASKS).find_one_and_update({"_id": uid}, {"$set": {f"t.{kind}": True, "inviter": inviter}},
+                                              upsert=True, return_document=ReturnDocument.AFTER)
+    if not all((doc.get("t") or {}).get(k) for k in TASK_KINDS):
+        return None
+    if _col(REF_TASKS).update_one({"_id": uid, "settled": {"$ne": True}}, {"$set": {"settled": True}}).modified_count != 1:
+        return None
+    cfg, out, failed = get_config()["tasks"], {"inviter_id": inviter, "friend": None, "inviter": None}, False
+    for side, flag, to in (("friend", "paid_f", uid), ("inviter", "paid_i", inviter)):
+        r = cfg[side]
+        if doc.get(flag) or (r["b_max"] <= 0 and r["s_max"] <= 0):
+            continue
+        try:
+            out[side] = _grant(to, *_roll(r))
+            _col(REF_TASKS).update_one({"_id": uid}, {"$set": {flag: True}})
+        except Exception as e:
+            logger.warning("friend task payout failed (%s): %s", side, e)
+            failed = True
+    if failed:
+        _col(REF_TASKS).update_one({"_id": uid}, {"$unset": {"settled": ""}})      # the next /spawn, /add or /sell tries the unpaid side again
+    return out if (out["friend"] or out["inviter"]) else None
+
+
+async def task_hook(bot, uid, kind, name=None):
+    """Called by bot.py after a real /spawn, a caught /add character, or a /sell. Never raises."""
+    try:
+        res = await asyncio.to_thread(record_task_sync, uid, kind)
+        if not res:
+            return
+        if res["friend"]:
+            await _send(bot, uid, "🎉 <b>You finished all your invite tasks!</b>\n\n" + "\n".join(res["friend"]))
+        if res["inviter"]:
+            await _send(bot, res["inviter_id"], f"🤝 {_mention(uid, name or 'Your friend')} finished all the invite tasks!\n\n" + "\n".join(res["inviter"]))
+    except Exception as e:
+        logger.warning("friend task hook failed: %s", e)
 
 
 def open_box_sync(uid, tier):
@@ -2861,51 +3053,64 @@ def _invite_state_sync(uid):
     udoc = mongo_db.get_user(uid) or {}
     boxes = {t: _dotted_int(udoc, _box_field(t)) for t in TIER_ORDER}
     recent = list(_col(REF_OPENS).find({"user_id": uid}).sort("ts", -1).limit(3))
-    return cfg, total, claims, boxes, current_token(uid), recent
+    finished = _col(REF_TASKS).count_documents({"inviter": uid, "t.spawn": True, "t.catch": True, "t.sell": True})
+    mine = ((_col(REF_TASKS).find_one({"_id": uid}) or {}).get("t") or {}) if _col(REFERRALS).find_one({"_id": uid}) else None
+    unopened = _col(REF_BOXES).count_documents({"user_id": uid, "opened": {"$ne": True}})
+    return cfg, total, claims, boxes, current_token(uid), recent, {"finished": finished, "mine": mine, "unopened": unopened}
 
 
 def _invite_page(uid, bot_username, state):
-    cfg, total, claims, boxes, token, recent = state
+    cfg, total, claims, boxes, token, recent, extra = state
     link = f"https://t.me/{bot_username}?start=ref_{token}"
     lines = ["🎁 <b>INVITE &amp; EARN</b>", ""]
     if not cfg["enabled"]:
         lines += ["⚠️ The invite system is turned off right now.", ""]
     lines += ["🔗 Your invite link (tap it to copy):", f"<code>{_esc(link)}</code>", "", f"👥 Total invites: <b>{total}</b>"]
-    live = sorted(((t, cfg["tiers"][t]) for t in TIER_ORDER if cfg["tiers"][t]["enabled"]), key=lambda x: x[1]["invites"])
-    nxt = next(((t, c) for t, c in live if c["invites"] > total), None)
+    live = [m for m in cfg["milestones"] if m["enabled"]]          # already sorted by invites
+    nxt = next((m for m in live if m["invites"] > total), None)
     if nxt:
-        need = nxt[1]["invites"]
+        need = nxt["invites"]
         filled = min(10, total * 10 // need)
         lines += [f"📈 Progress: {total}/{need}  " + "▰" * filled + "▱" * (10 - filled),
-                  f"🎯 Next invite reward: {_tier_label(nxt[0])} Mystery Box at {need} invites"]
+                  f"🎯 Next invite reward: {_ms_label(nxt)} · {_ms_reward_text(nxt)}"]
     elif live:
         lines.append("🏁 You have reached every invite reward!")
     claimable = []
     if live:
-        lines += ["", "🏆 <b>Invite Rewards</b>"]
-    for tier, c in live:
-        if tier in claims:
+        lines += ["", "🎁 <b>Mystery Boxes</b>"]
+    for m in live:
+        if m["id"] in claims:
             mark, note = "✅", "claimed"
-        elif total >= c["invites"]:
-            mark, note = "🎁", "ready to claim!"
-            claimable.append((tier, c["boxes"]))
+        elif total >= m["invites"]:
+            mark, note = "🟢", "ready to claim!"
+            claimable.append(m)
         else:
-            mark, note = "🔒", f"{c['invites'] - total} more to go"
-        times = f" ×{c['boxes']}" if c["boxes"] > 1 else ""
-        lines.append(f"{mark} {_tier_label(tier)} Box{times} - {c['invites']} invites · {note}")
+            mark, note = "🔒", f"{m['invites'] - total} more to go"
+        lines.append(f"{mark} {_ms_label(m)} · {_ms_reward_text(m)} · {note}")
+    if extra["unopened"]:
+        lines += ["", f"📦 Unopened Mystery Boxes: <b>{extra['unopened']}</b> · open them with /openbox"]
+    tcfg = cfg["tasks"]
+    f_set, i_set = tcfg["friend"]["b_max"] > 0 or tcfg["friend"]["s_max"] > 0, tcfg["inviter"]["b_max"] > 0 or tcfg["inviter"]["s_max"] > 0
+    if extra["mine"] is not None and (f_set or i_set):          # this member joined with an invite link
+        lines += ["", "🤝 <b>Your invite tasks</b>"] + [f"{'✅' if extra['mine'].get(k) else '⬜'} {TASK_NAMES[k]}" for k in TASK_KINDS]
+        if f_set:
+            lines.append(f"Finish all three to get {_task_text(tcfg['friend'])}.")
+    if i_set:
+        lines += ["", f"🤝 Friends who finished their tasks: <b>{extra['finished']}</b> of {total}",
+                  f"You get {_task_text(tcfg['inviter'])} for each friend who finishes all three: use /spawn, catch with /add, sell with /sell."]
     owned = [(t, n) for t, n in boxes.items() if n > 0]
     if owned:
-        lines += ["", "📦 <b>Your Mystery Boxes</b>", "  ".join(f"{_tier_label(t)} ×{n}" for t, n in owned), "They also show in /item."]
+        lines += ["", "📦 <b>Old Mystery Boxes</b>", "  ".join(f"{_tier_label(t)} ×{n}" for t, n in owned), "They also show in /item."]
     if recent:
         lines += ["", "🎲 <b>Recent openings</b>"] + [f"{TIER_META.get(d['tier'], ('📦',))[0]} {_esc(d.get('text', ''))}" for d in recent]
     lines += ["", "💡 Share your link. When someone new starts the bot with it, it counts as an invite."]
     share = ("https://t.me/share/url?url=" + _urlquote(link, safe="") + "&text="
              + _urlquote("Join me on this anime bot - catch rare characters and build your collection! 🎌", safe=""))
     rows = [[InlineKeyboardButton("📤 Share Link", url=share), InlineKeyboardButton("🔄 New Link", callback_data=f"rf:u:{uid}:gen")]]
-    for tier, n in claimable:
-        rows.append([InlineKeyboardButton(f"🎁 Claim {_tier_label(tier)} Box" + (f" ×{n}" if n > 1 else ""), callback_data=f"rf:u:{uid}:claim:{tier}")])
+    for m in claimable:
+        rows.append([InlineKeyboardButton(f"🎁 Claim {_ms_label(m)}", callback_data=f"rf:u:{uid}:claim:{m['id']}")])
     if owned:
-        rows.append([InlineKeyboardButton("📦 Open a Mystery Box", callback_data=f"rf:u:{uid}:open")])
+        rows.append([InlineKeyboardButton("📦 Open an old Mystery Box", callback_data=f"rf:u:{uid}:open")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
@@ -2920,13 +3125,13 @@ async def invite_command(update, context):
         except Exception as e:
             logger.warning("referral: save_user failed: %s", e)
     state = await asyncio.to_thread(_invite_state_sync, user.id)
-    text, kb = _invite_page(user.id, context.bot.username, state)
+    text, kb = await asyncio.to_thread(_invite_page, user.id, context.bot.username, state)
     await _reply(msg, text, parse_mode="HTML", reply_markup=kb)
 
 
 async def _show_invite(q, context, uid):
     state = await asyncio.to_thread(_invite_state_sync, uid)
-    text, kb = _invite_page(uid, context.bot.username, state)
+    text, kb = await asyncio.to_thread(_invite_page, uid, context.bot.username, state)
     await _edit(q, text, kb)
 
 
@@ -2942,7 +3147,7 @@ async def rf_user_callback(update, context):
         await q.answer(NOT_YOURS_TEXT, show_alert=True)
         return
     tier = parts[4] if len(parts) > 4 else None
-    if tier is not None and tier not in TIER_ORDER:
+    if tier is not None and (not re.fullmatch(r"[a-z0-9]{1,16}", tier) or (action != "claim" and tier not in TIER_ORDER)):
         await q.answer()
         return
     note = None
@@ -2951,11 +3156,16 @@ async def rf_user_callback(update, context):
             await asyncio.to_thread(new_token, uid)
             note = "🔄 New invite link created. Your old links still work."
         elif action == "claim" and tier:
-            status, val = await asyncio.to_thread(claim_sync, uid, tier)
-            note = {"ok": f"🎁 Claimed! {val} × {_tier_label(tier)} Mystery Box added. See /item.",
-                    "low": f"🔒 You need {val} more invite(s) for this box.",
-                    "dup": "✅ You already claimed this box.",
-                    "off": "⚠️ This reward is not available right now."}[status]
+            status, val = await asyncio.to_thread(claim_ms_sync, uid, tier)
+            if status == "ok":
+                await q.answer("🎁 Box added!")
+                await _edit(q, "🎁 <b>Mystery Box claimed!</b>\n\nIt is in your items. Send /openbox to open it.",
+                            InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"rf:u:{uid}:home")]]))
+                return
+            note = {"low": f"🔒 You need {val} more invite(s) for this reward.",
+                    "dup": "✅ You already claimed this reward.",
+                    "off": "⚠️ This reward is not available right now.",
+                    "failed": "❌ The reward could not be paid. Please try again."}[status]
         elif action == "open":
             state = await asyncio.to_thread(_invite_state_sync, uid)
             owned = [(t, n) for t, n in state[3].items() if n > 0]
@@ -2995,47 +3205,200 @@ async def rf_user_callback(update, context):
     await _show_invite(q, context, uid)
 
 
-# ---------------- /boxes (Owner) ----------------
-def _hub_page(cfg):
-    lines = ["🎁 <b>INVITE &amp; BOX SETTINGS</b>", "",
-             f"Invite system: {'ON ✅' if cfg['enabled'] else 'OFF 🔴'}", "",
-             "Tap a box to change what it gives and how many invites it needs.", ""]
-    rows = [[InlineKeyboardButton("🔴 Turn invite system OFF" if cfg["enabled"] else "🟢 Turn invite system ON", callback_data="rf:o:sys")]]
-    for tier in TIER_ORDER:
-        c = cfg["tiers"][tier]
-        lines.append(f"{_tier_label(tier)} - {c['invites']} invites · {c['boxes']} box · {'ON' if c['enabled'] else 'OFF'}")
-        rows.append([InlineKeyboardButton(f"{_tier_label(tier)} · {c['invites']} invites", callback_data=f"rf:o:t:{tier}")])
+# ---------------- /openbox, /myinvites, /topinvites (everyone) ----------------
+def _openbox_page(uid, boxes):
+    if not boxes:
+        return "🎁 <b>MYSTERY BOXES</b>\n\nYou have no Mystery Box to open.\nInvite friends and claim one in /invite.", None
+    rows = [[InlineKeyboardButton(f"🎁 Mystery Box · {b['invites']} invites", callback_data=f"rf:b:{uid}:{b['mid']}")] for b in boxes]
+    return (f"🎁 <b>OPEN A MYSTERY BOX</b>\n\nYou have <b>{len(boxes)}</b> unopened. Tap one to open it.\n"
+            "The rewards go straight to your account."), InlineKeyboardMarkup(rows)
+
+
+async def openbox_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    boxes = await asyncio.to_thread(boxes_sync, user.id)
+    text, kb = _openbox_page(user.id, boxes)
+    await _reply(msg, text, parse_mode="HTML", reply_markup=kb)
+
+
+async def rf_box_callback(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")           # rf:b:<user id>:<box id | home>
+    uid, mid = int(parts[2]), parts[3]
+    if q.from_user.id != uid:
+        await q.answer("❌ This is not your box.", show_alert=True)
+        return
+    try:
+        if mid != "home":
+            status, lines = await asyncio.to_thread(open_box_new_sync, uid, mid)
+            if status == "failed":
+                await q.answer("❌ The box could not be opened. Nothing was taken. Please try again.", show_alert=True)
+                return
+            if status == "ok":
+                left = await asyncio.to_thread(boxes_sync, uid)
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🎁 Open another box", callback_data=f"rf:b:{uid}:home")]]) if left else None
+                await q.answer("🎁 Opened!")
+                await _edit(q, "🎉 <b>Mystery Box opened!</b>\n\n" + "\n".join(lines), kb)
+                return
+        text, kb = _openbox_page(uid, await asyncio.to_thread(boxes_sync, uid))
+    except Exception as e:
+        logger.warning("openbox failed: %s", e)
+        await q.answer("❌ Something went wrong. Please try again.", show_alert=True)
+        return
+    await q.answer()
+    await _edit(q, text, kb)
+
+
+def _person(names, uid):
+    t = names.get(uid) or names.get(int(uid))
+    if t:
+        full = " ".join(x for x in (t[0], t[1]) if x).strip()
+        if full:
+            return _esc(full)
+        if t[2]:
+            return "@" + _esc(t[2])
+    return f"User {uid}"
+
+
+def my_invites_sync(uid):
+    uid = int(uid)
+    cfg = get_config()
+    total = _col(REFERRALS).count_documents({"inviter": uid})
+    finished = _col(REF_TASKS).count_documents({"inviter": uid, "t.spawn": True, "t.catch": True, "t.sell": True})
+    claimed = _col(REF_BOXES).count_documents({"user_id": uid})
+    unopened = _col(REF_BOXES).count_documents({"user_id": uid, "opened": {"$ne": True}})
+    friends = list(_col(REFERRALS).find({"inviter": uid}).sort("ts", -1).limit(10))
+    ids = [int(f["_id"]) for f in friends]
+    tasks = {int(d["_id"]): d.get("t") or {} for d in _col(REF_TASKS).find({"_id": {"$in": ids}})} if ids else {}
+    names = mongo_db.get_users_by_ids(ids) if ids else {}
+    return cfg, total, finished, claimed, unopened, friends, tasks, names
+
+
+def _my_invites_text(data):
+    cfg, total, finished, claimed, unopened, friends, tasks, names = data
+    lines = ["🤝 <b>YOUR INVITES</b>", "", f"👥 Total invites: <b>{total}</b>",
+             f"✅ Friends who finished all tasks: <b>{finished}</b> of {total}",
+             f"🎁 Mystery Boxes claimed: <b>{claimed}</b> · unopened: <b>{unopened}</b>" + (" (/openbox)" if unopened else "")]
+    nxt = next((m for m in cfg["milestones"] if m["enabled"] and m["invites"] > total), None)
+    if nxt:
+        lines.append(f"🎯 Next box: {_ms_label(nxt)} ({nxt['invites'] - total} more)")
+    if friends:
+        lines += ["", "👥 <b>Your latest friends</b>"]
+        for f in friends:
+            t = tasks.get(int(f["_id"]), {})
+            lines.append(f"• {_person(names, int(f['_id']))} · " + "".join("✅" if t.get(k) else "⬜" for k in TASK_KINDS))
+        lines.append("Tasks: /spawn · catch with /add · /sell")
+    lines += ["", "Share your link from /invite to get more."]
+    return "\n".join(lines)
+
+
+async def myinvites_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    data = await asyncio.to_thread(my_invites_sync, user.id)
+    await _reply(msg, _my_invites_text(data), parse_mode="HTML")
+
+
+def top_invites_sync(uid):
+    group = {"$group": {"_id": "$inviter", "n": {"$sum": 1}}}
+    rows = list(_col(REFERRALS).aggregate([group, {"$sort": {"n": -1, "_id": 1}}, {"$limit": 10}]))
+    names = mongo_db.get_users_by_ids([int(r_["_id"]) for r_ in rows]) if rows else {}
+    mine = _col(REFERRALS).count_documents({"inviter": int(uid)})
+    rank = None
+    if mine:
+        above = list(_col(REFERRALS).aggregate([group, {"$match": {"n": {"$gt": mine}}}, {"$count": "c"}]))
+        rank = 1 + (above[0]["c"] if above else 0)
+    return rows, names, mine, rank
+
+
+def _top_invites_text(rows, names, mine, rank):
+    if not rows:
+        return "🏆 <b>TOP INVITERS</b>\n\nNo invites yet. Be the first! Get your link with /invite."
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = ["🏆 <b>TOP INVITERS</b>", ""]
+    for i, r_ in enumerate(rows, 1):
+        lines.append(f"{medals.get(i, f'{i}.')} {_person(names, int(r_['_id']))} — <b>{r_['n']}</b> invite{'' if r_['n'] == 1 else 's'}")
+    if mine:
+        lines += ["", f"👤 You: <b>{mine}</b> invite{'' if mine == 1 else 's'} (rank #{rank})"]
+    return "\n".join(lines)
+
+
+async def topinvites_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    rows, names, mine, rank = await asyncio.to_thread(top_invites_sync, user.id)
+    await _reply(msg, _top_invites_text(rows, names, mine, rank), parse_mode="HTML")
+
+
+# ---------------- /boxes (Owner): Mystery Boxes and friend tasks ----------------
+def _ms_text(m):
+    lines = [f"🎁 <b>MYSTERY BOX</b> · {m['invites']} invites", "",
+             f"Status: {'ON ✅' if m.get('enabled', True) else 'OFF 🔴'}",
+             f"📨 Invites needed: <b>{m['invites']}</b>",
+             f"🎭 Characters: <b>{m['chars']} × {m['rarity']}</b> (random of that rarity)",
+             f"🪙 Berrys: <b>{_fmt_range(m['b_min'], m['b_max'])}</b> (random, steps of {BERRY_STEP})",
+             f"💎 Stones: <b>{_fmt_range(m['s_min'], m['s_max'])}</b>" + (" (random)" if m['s_max'] > 0 else "")]
+    return "\n".join(lines)
+
+
+def _hub_page(cfg, uid):
+    lines = ["🎁 <b>INVITE MANAGER</b>", "", f"Invite system: {'ON ✅' if cfg['enabled'] else 'OFF 🔴'}", ""]
+    rows = [[_btn("🔴 Turn invite system OFF" if cfg["enabled"] else "🟢 Turn invite system ON", "rf:o:sys")]]
+    if not cfg["milestones"]:
+        lines.append("No Mystery Boxes yet. Tap ➕ New Box.")
+    for m in cfg["milestones"]:
+        lines.append(f"{_ms_label(m)} · {_ms_reward_text(m)} · {'ON' if m['enabled'] else 'OFF'}")
+        rows.append([_btn(f"✏️ {_ms_label(m)}", f"rf:o:m:{m['id']}")])
+    rows.append([_btn("➕ New Box", "rf:o:new"), _btn("♻️ Reset", "rf:o:rs")])
+    rows.append([_btn("🤝 Friend Tasks", "rf:o:tk")])
+    rows.append([_btn("« Owner Commands", f"help:{uid}:owner")])
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 
-def _tier_page(cfg, tier):
-    c = cfg["tiers"][tier]
-    chars = f"{c['chars']} × {c['rarity']} (random)" if c["chars"] > 0 else "none"
-    lines = [f"{_tier_label(tier)} <b>MYSTERY BOX</b>", "",
-             f"Status: {'ON ✅' if c['enabled'] else 'OFF 🔴'}",
-             f"📨 Invites needed: <b>{c['invites']}</b>",
-             f"🎁 Boxes given per claim: <b>{c['boxes']}</b>",
-             f"🎭 Characters per box: <b>{chars}</b>",
-             f"🪙 Berrys: <b>{_fmt_range(c['b_min'], c['b_max'])}</b> (random amount in the range)",
-             f"💎 Stones: <b>{_fmt_range(c['s_min'], c['s_max'])}</b> (random amount in the range)",
-             "", "Set Characters to 0, or a range to 0, to leave that part out of the box."]
-    e = f"rf:o:e:{tier}:"
-    rows = [[InlineKeyboardButton("🔴 Turn OFF" if c["enabled"] else "🟢 Turn ON", callback_data=f"rf:o:tg:{tier}")],
-            [InlineKeyboardButton("✏️ Invites", callback_data=e + "invites"), InlineKeyboardButton("✏️ Boxes", callback_data=e + "boxes")],
-            [InlineKeyboardButton("✏️ Characters", callback_data=e + "chars"), InlineKeyboardButton("✏️ Rarity", callback_data=e + "rarity")],
-            [InlineKeyboardButton("✏️ Berrys", callback_data=e + "berrys"), InlineKeyboardButton("✏️ Stones", callback_data=e + "stones")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="rf:o:hub")]]
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+def _ms_page(cfg, mid):
+    m = next((x for x in cfg["milestones"] if x["id"] == mid), None)
+    if m is None:
+        return None
+    e = f"rf:o:e:{mid}:"
+    rows = [[_btn("🔴 Turn OFF" if m["enabled"] else "🟢 Turn ON", f"rf:o:tg:{mid}")],
+            [_btn("✏️ Invites", e + "invites"), _btn("✏️ Rarity", e + "rarity")],
+            [_btn("✏️ Characters", e + "chars"), _btn("✏️ Berrys", e + "berrys")],
+            [_btn("✏️ Stones", e + "stones")],
+            [_btn("🗑 Remove", f"rf:o:dl:{mid}"), _btn("⬅️ Back", "rf:o:hub")]]
+    return _ms_text(m), InlineKeyboardMarkup(rows)
+
+
+def _task_page(cfg):
+    t = cfg["tasks"]
+    text = ("🤝 <b>FRIEND TASKS</b>\n\n"
+            "A friend counts as 1 invite as soon as they join. When that friend has also used /spawn, caught a character with /add "
+            "and sold a character with /sell, each side below gets its reward once. A side you leave empty gets nothing.\n\n"
+            f"👤 Friend gets: <b>{_task_text(t['friend'])}</b>\n"
+            f"🧑 Inviter gets: <b>{_task_text(t['inviter'])}</b>")
+    rows = [[_btn("✏️ Friend Berrys", "rf:o:e:tkf:berrys"), _btn("✏️ Friend Stones", "rf:o:e:tkf:stones")],
+            [_btn("✏️ Inviter Berrys", "rf:o:e:tki:berrys"), _btn("✏️ Inviter Stones", "rf:o:e:tki:stones")],
+            [_btn("⬅️ Back", "rf:o:hub")]]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def _owner_page(uid, mid=None):
+    """(text, keyboard) of a box page, or of the main manager page. Reads the database: call through asyncio.to_thread."""
+    cfg = get_config()
+    return (mid and _ms_page(cfg, mid)) or _hub_page(cfg, uid)
 
 
 RF_PROMPTS = {
-    "invites": "✏️ How many invites are needed for the {tier} box? Send a whole number, for example 10.",
-    "boxes": "✏️ How many {tier} boxes does one claim give? Send a whole number, for example 1.",
-    "chars": "✏️ How many characters inside one {tier} box? Send a number (0 = no character), for example 1.",
-    "rarity": "✏️ Which rarity are the characters in the {tier} box? Send one of: {rarities}",
-    "berrys": "✏️ Berrys inside the {tier} box. Send a range like 50-500 (random amount), one fixed number, or 0 to turn Berrys off.",
-    "stones": "✏️ Stones inside the {tier} box. Send a range like 1-10 (random amount), one fixed number, or 0 to turn Stones off.",
+    "invites": f"✏️ How many invites does this Mystery Box need? Send a whole number from {MS_INV_MIN} to {MS_INV_MAX}, for example 10.",
+    "rarity": "🎭 Which rarity are the characters in this box? Send one of: {rarities}",
+    "chars": f"🎭 How many characters does one box give? Send 1, 2 or 3. If you send 1, the member gets exactly one character.",
+    "berrys": f"🪙 Berrys in this box. Send a range in steps of 100 from 100 to {MS_BERRYS_MAX}, like 100-1000 (the member gets a random amount such as 100, 200, 300 … never below or above it), one number like 300, or 0 for none.",
+    "stones": f"💎 Stones in this box. Send a range from 0 to {MS_STONES_MAX}, like 1-10 (random amount), one number, or 0 for none.",
 }
+NEW_STEPS = ("invites", "rarity", "chars", "berrys", "stones")
 
 
 async def boxes_command(update, context):
@@ -3045,29 +3408,59 @@ async def boxes_command(update, context):
     if not _is_owner(update.effective_user.id):
         await _reply(msg, DENIED_TEXT)
         return
-    text, kb = _hub_page(await asyncio.to_thread(get_config))
+    text, kb = await asyncio.to_thread(_owner_page, update.effective_user.id)
     await _reply(msg, text, parse_mode="HTML", reply_markup=kb)
 
 
 async def rf_owner_callback(update, context):
     q = update.callback_query
-    if not _is_owner(q.from_user.id):
+    uid = q.from_user.id
+    if not _is_owner(uid):
         await q.answer(DENIED_TEXT, show_alert=True)
         return
-    parts = (q.data or "").split(":")           # rf:o:<hub|sys|t|tg>[:<tier>]
+    parts = (q.data or "").split(":")           # rf:o:<action>[:<box id>]
     action = parts[2] if len(parts) > 2 else ""
-    tier = parts[3] if len(parts) > 3 else None
-    if tier is not None and tier not in TIER_ORDER:
-        await q.answer()
-        return
+    mid = parts[3] if len(parts) > 3 else None
     try:
         cfg = await asyncio.to_thread(get_config)
+        ms = cfg["milestones"]
+        found = next((m for m in ms if m["id"] == mid), None)
+        text = kb = None
         if action == "sys":
             await asyncio.to_thread(set_system_enabled, not cfg["enabled"])
-        elif action == "tg" and tier:
-            await asyncio.to_thread(set_tier_fields, tier, {"enabled": not cfg["tiers"][tier]["enabled"]})
-        cfg = await asyncio.to_thread(get_config)
-        text, kb = _tier_page(cfg, tier) if action in ("t", "tg") and tier else _hub_page(cfg)
+        elif action == "tk":
+            text, kb = _task_page(cfg)
+        elif action == "tg" and found:
+            found["enabled"] = not found["enabled"]
+            await asyncio.to_thread(save_milestones, ms)
+        elif action == "dl" and found:
+            text = f"⚠️ Remove the {_ms_label(found)}?\nMembers who already claimed it keep what they got."
+            kb = InlineKeyboardMarkup([[_btn("🗑 Remove", f"rf:o:dy:{mid}"), _btn("↩️ Cancel", f"rf:o:m:{mid}")]])
+        elif action == "dy":
+            await asyncio.to_thread(save_milestones, [m for m in ms if m["id"] != mid])
+            mid = None
+        elif action == "rs":
+            text = "⚠️ Reset the Mystery Boxes to the starting ones? Your own boxes and changes will be lost. Members who already claimed keep what they got."
+            kb = InlineKeyboardMarkup([[_btn("♻️ Reset", "rf:o:ry"), _btn("↩️ Cancel", "rf:o:hub")]])
+        elif action == "ry":
+            await asyncio.to_thread(reset_milestones)
+            mid = None
+        elif action == "cx":
+            context.user_data.pop("rf_draft", None)
+            mid = None
+        elif action == "sv":
+            draft = context.user_data.get("rf_draft")
+            if not draft:
+                await q.answer("This preview has expired.", show_alert=True)
+                return
+            if any(m["invites"] == draft["invites"] for m in ms):
+                await q.answer("Another Mystery Box already needs that many invites.", show_alert=True)
+                return
+            context.user_data.pop("rf_draft", None)
+            await asyncio.to_thread(save_milestones, ms + [draft])
+            mid = None
+        if text is None:
+            text, kb = await asyncio.to_thread(_owner_page, uid, mid)
     except Exception as e:
         logger.warning("referral settings failed: %s", e)
         await q.answer("❌ Could not load the settings. Try again.", show_alert=True)
@@ -3076,15 +3469,26 @@ async def rf_owner_callback(update, context):
     await _edit(q, text, kb)
 
 
+def _rf_prompt(field):
+    return RF_PROMPTS[field].replace("{rarities}", ", ".join(_rarities()))
+
+
 async def rf_edit_entry(update, context):
     q = update.callback_query
     if not _is_owner(q.from_user.id):
         await q.answer(DENIED_TEXT, show_alert=True)
         return -1
-    _r, _o, _e, tier, field = (q.data or "").split(":")
-    context.user_data["rf_edit"] = {"tier": tier, "field": field}
+    parts = (q.data or "").split(":")           # rf:o:new   or   rf:o:e:<box id | tkf | tki>:<field>
+    if parts[2] == "new":
+        st = {"mid": None, "field": NEW_STEPS[0], "draft": {"id": "m" + secrets.token_hex(3), "enabled": True, "invites": 0, "rarity": "",
+              "chars": 1, "b_min": 0, "b_max": 0, "s_min": 0, "s_max": 0}}
+        intro = f"➕ New Mystery Box · step 1 of {len(NEW_STEPS)}\n"
+    else:
+        st = {"mid": parts[3], "field": parts[4], "draft": None}
+        intro = ""
+    context.user_data["rf_edit"] = st
     await q.answer()
-    await _reply(q.message, RF_PROMPTS[field].format(tier=_tier_label(tier), rarities=", ".join(_rarities())) + "\nSend /cancel to stop.")
+    await _reply(q.message, intro + _rf_prompt(st["field"]) + "\nSend /cancel to stop.")
     return RF_INPUT
 
 
@@ -3093,18 +3497,43 @@ async def rf_edit_input(update, context):
     st = context.user_data.get("rf_edit")
     if msg is None or not st or not _is_owner(update.effective_user.id):
         return -1
-    ok, note = await asyncio.to_thread(apply_edit_sync, st["tier"], st["field"], msg.text or "")
-    if not ok:
-        await _reply(msg, note + "\nTry again, or send /cancel.")
+    cfg = await asyncio.to_thread(get_config)
+    ms, draft = cfg["milestones"], st["draft"]
+    fields, err = await asyncio.to_thread(_ms_parse, st["field"], msg.text or "", ms, draft["id"] if draft else st["mid"])
+    if err:
+        await _reply(msg, err + "\nTry again, or send /cancel.")
         return RF_INPUT
-    context.user_data.pop("rf_edit", None)
-    text, kb = _tier_page(await asyncio.to_thread(get_config), st["tier"])
-    await _reply(msg, f"✅ {_esc(note)}\n\n{text}", parse_mode="HTML", reply_markup=kb)
+    if draft is not None:                                   # ➕ New Box: ask each value, then preview
+        draft.update(fields)
+        i = NEW_STEPS.index(st["field"]) + 1
+        if i < len(NEW_STEPS):
+            st["field"] = NEW_STEPS[i]
+            await _reply(msg, f"Step {i + 1} of {len(NEW_STEPS)}\n" + _rf_prompt(st["field"]) + "\nSend /cancel to stop.")
+            return RF_INPUT
+        context.user_data.pop("rf_edit", None)
+        context.user_data["rf_draft"] = draft
+        await _reply(msg, "🔎 <b>Preview</b>\n\n" + _ms_text(draft), parse_mode="HTML", reply_markup=InlineKeyboardMarkup(
+            [[_btn("✅ Save", "rf:o:sv"), _btn("❌ Cancel", "rf:o:cx")]]))
+        return -1
+    if st["mid"] in ("tkf", "tki"):                         # friend task reward (Berrys / Stones for the friend or the inviter)
+        cfg["tasks"]["friend" if st["mid"] == "tkf" else "inviter"].update(fields)
+        await asyncio.to_thread(save_tasks, cfg["tasks"])
+        context.user_data.pop("rf_edit", None)
+        text, kb = _task_page(cfg)
+    else:                                                   # editing one value of a box: saved at once
+        for m in ms:
+            if m["id"] == st["mid"]:
+                m.update(fields)
+        await asyncio.to_thread(save_milestones, ms)
+        context.user_data.pop("rf_edit", None)
+        text, kb = await asyncio.to_thread(_owner_page, update.effective_user.id, st["mid"])
+    await _reply(msg, "✅ Saved.\n\n" + text, parse_mode="HTML", reply_markup=kb)
     return -1
 
 
 async def _rf_cancel(update, context):
     context.user_data.pop("rf_edit", None)
+    context.user_data.pop("rf_draft", None)
     return await _cancel_flow(update, context)
 
 
@@ -3114,10 +3543,14 @@ def register_referrals(app):
     # Counts a referral BEFORE the main /start saves the new member's profile; it never replaces or delays the normal /start.
     app.add_handler(CommandHandler("start", ref_start_handler, filters=filters.ChatType.PRIVATE), group=-97)
     app.add_handler(ConversationHandler(
-        entry_points=[CallbackQueryHandler(rf_edit_entry, pattern=r"^rf:o:e:(bronze|gold|platinum|diamond):(invites|boxes|chars|rarity|berrys|stones)$")],
+        entry_points=[CallbackQueryHandler(rf_edit_entry, pattern=r"^rf:o:(new|e:[a-z0-9]+:(invites|rarity|chars|berrys|stones))$")],
         states={RF_INPUT: [MessageHandler(text, rf_edit_input)]},
         fallbacks=[CommandHandler("cancel", _rf_cancel)], allow_reentry=True, conversation_timeout=_deps.get("conv_timeout")))
-    app.add_handler(CallbackQueryHandler(rf_owner_callback, pattern=r"^rf:o:(hub|sys|t:[a-z]+|tg:[a-z]+)$"))
+    app.add_handler(CallbackQueryHandler(rf_owner_callback, pattern=r"^rf:o:(hub|sys|rs|ry|sv|cx|tk|(m|tg|dl|dy):[a-z0-9]+)$"))
     app.add_handler(CallbackQueryHandler(rf_user_callback, pattern=r"^rf:u:\d+:"))
     app.add_handler(CommandHandler("invite", invite_command))
+    app.add_handler(CommandHandler("openbox", openbox_command))
+    app.add_handler(CommandHandler("myinvites", myinvites_command))
+    app.add_handler(CommandHandler("topinvites", topinvites_command))
+    app.add_handler(CallbackQueryHandler(rf_box_callback, pattern=r"^rf:b:\d+:[a-z0-9]+$"))
     app.add_handler(CommandHandler("boxes", boxes_command))

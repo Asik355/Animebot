@@ -116,7 +116,7 @@ import mongo_db
 import fusion  # Special Stone Daily Task System
 import theme   # Bot Theme Customization (Owner: /help -> Owner Commands -> 🎨 Customize Bot)
 import badge_banner  # Character badges + profile banners (all logic lives in badge_banner.py)
-import festival  # Festivals: timed quests + hidden event card/banner (all logic lives in festival.py)
+import rewards  # Rewards: festivals with timed quests + hidden event card/banner (all logic lives in rewards.py)
 
 
 def _mc(name):
@@ -1832,13 +1832,13 @@ def set_recruit_names(character_code, names):
 
 def find_character_by_recruit_name(value):
     row = mongo_db.find_character_by_recruit_name(value)
-    return None if row and festival.is_hidden(row[0]) else row      # festival event cards never show in searches
+    return None if row and rewards.is_hidden(row[0]) else row      # festival event cards never show in searches
 
 def find_characters_by_recruit_name_partial(value):
     return mongo_db.find_characters_by_recruit_name_partial(value)
 
 def find_characters_by_name_parts(query):
-    return festival.filter_hidden(mongo_db.find_characters_by_name_parts(query))
+    return rewards.filter_hidden(mongo_db.find_characters_by_name_parts(query))
 
 def get_character(value):
     value = str(value).strip()
@@ -1861,10 +1861,10 @@ def get_character_by_code(code):
     return mongo_db.get_character_by_code(code.zfill(4))
 
 def get_all_characters():
-    return festival.filter_hidden(mongo_db.get_all_characters())     # festival event cards stay out of /characters
+    return rewards.filter_hidden(mongo_db.get_all_characters())     # festival event cards stay out of /characters
 
 def get_characters_by_rarity(rarity):
-    return festival.filter_hidden(mongo_db.get_characters_by_rarity(rarity))     # spawns, /daily and shops never pick event cards
+    return rewards.filter_hidden(mongo_db.get_characters_by_rarity(rarity))     # spawns, /daily and shops never pick event cards
 
 def is_character_discontinued(code):
     return mongo_db.is_character_discontinued(code)
@@ -1958,54 +1958,55 @@ def _build_help_text_raw():
         "👤 Profile & Collection\n"
         "/start — Register / start the bot\n"
         "/help — Show this command list\n"
-        "/reply — Send a message to the bot staff (private chat)\n"
+        "/reply — Message the bot staff (private chat only)\n"
         "/mycollection — View your collection\n"
-        "/see <user_id or @username> — View another user's collection (hidden if they turned Privacy ON)\n"
-        "/myfav <code/name> — Set or change favourite character\n"
-        "/mystats — View your stats and collection progress\n"
-        "/characters [tier] — List all characters, or one tier (/characters legendary)\n"
-        "/view <code/name> — View a character's full details and image (anime list: /view (Naruto))\n"
-        "/check <code/name> — Check character details and owners (anime list: /check (Naruto))\n"
-        "/addlist — View character add/edit ranking\n\n"
+        "/see <user_id or @username> — View another user's collection\n"
+        "/myfav <code/name> — Set your favourite character\n"
+        "/mystats — See your stats and progress\n"
+        "/characters [tier] — List all characters, or one tier\n"
+        "/view <code/name> — See a character's details and image\n"
+        "/check <code/name> — See a character's details and owners\n"
+        "/addlist — See who added and edited the most characters\n\n"
         "🎯 Catching & Rewards\n"
         "/spawn — Spawn a character in the group\n"
         "/add — Catch the spawned character\n"
         "/daily — Claim your daily reward\n"
-        "/dailytask — View your daily missions and earn Berrys\n"
-        "/sell <code/name> [quantity] — Sell a character (many at once: /sell naruto 2 / sakura, or the 💰 Sell button in your collection)\n"
-        "/rem [number] — Delete the bot's own messages (reply to one, or /rem 10)\n"
-        "/transfer <code/name> — Transfer a character by replying to a user\n"
-        "/exchange <your_code> <their_code> — Exchange same-tier characters by replying to a user\n\n"
+        "/dailytask — Do daily missions to earn Berrys\n"
+        "/sell <code/name> [quantity] — Sell a character for Berrys\n"
+        "/rem [number] — Delete the bot's messages\n"
+        "/transfer <code/name> — Give a character to a user (reply to them)\n"
+        "/exchange <your_code> <their_code> — Swap same-tier characters (reply to a user)\n\n"
         "🎮 Games\n"
         "/guess_num — Start a Guess the Number game\n"
-        "/nguess <number> — Guess a number from 1–100 (10 attempts, 150 Berrys reward)\n\n"
+        "/nguess <number> — Guess a number from 1 to 100\n\n"
         "🫐 Berrys\n"
-        "/berrytransfer <amount> — Give Berrys by replying to a user\n"
-        "/berry — View your daily Berry transfer status\n\n"
+        "/berrytransfer <amount> — Give Berrys to a user (reply to them)\n"
+        "/berry — See how many Berrys you can still send today\n\n"
         "🎪 Events & Redeem\n"
         "/event — View the active event\n"
         "/redeem <code> — Redeem a code\n\n"
         "🛒 Shop\n"
-        "/shop — Open your personal character shop\n\n"
+        "/shop — Buy characters from your personal shop\n\n"
         "🌟💫 Evolution\n"
-        "/evolution — View all evolution recipes\n"
-        "/evolve [code/name] — Evolve a character (needs base characters, Evolution Stones and Berrys)\n\n"
+        "/evolution — See all evolution recipes\n"
+        "/evolve [code/name] — Evolve a character into a stronger one\n\n"
         "💎 Stones & Items\n"
-        "/stonetask — View your daily stone tasks and claim rewards\n"
-        "/claimstone — Claim the stones of your completed tasks\n"
+        "/stonetask — Do daily tasks to earn stones\n"
+        "/claimstone — Collect stones from finished tasks\n"
         "/stone — Stone leaderboard\n"
-        "/item — View your items (personal inventory)\n\n"
-        + badge_banner.PUBLIC_HELP_SECTION + festival.PUBLIC_HELP_SECTION +
+        "/item — See your items and Mystery Boxes\n\n"
+        + badge_banner.PUBLIC_HELP_SECTION + rewards.PUBLIC_HELP_SECTION +
         "📜 Rules\n"
-        "/rules — View the bot usage rules (/rules noformat for raw text)\n\n"
+        "/rules — Read the bot rules\n\n"
         "👥 Staff\n"
-        "/executives — View the Executive list\n"
-        "/scouts — View the Scout list\n\n"
+        "/executives — See the Executive list\n"
+        "/scouts — See the Scout list\n\n"
         "📝 Support\n"
         "/issue — Report an issue\n"
         "/idea — Send a suggestion\n"
-        "/restrictions — View your restriction details\n"
+        "/restrictions — See why you are restricted\n"
         "/appeal — Appeal a restriction\n"
+        "/about — About this bot\n"
         "/cancel — Cancel the current action\n\n"
     )
 
@@ -2213,7 +2214,7 @@ def _module_button(label, callback_data):
 HELP_MODULES["owner"].append(("addedit", "🎴 Add & Edit", _addedit_page("owner")))
 HELP_MODULES["executive"].append(("addedit", "🎴 Add & Edit", _addedit_page("executive")))
 HELP_MODULES["executive"].append(badge_banner.help_module())      # 🏅 Badges (copied into the Owner menu by the loop below)
-HELP_MODULES["owner"].append(festival.help_module())              # 🪔 Festival (Owner only)
+HELP_MODULES["owner"].append(rewards.help_module())              # 🪔 Festival (Owner only)
 
 NOT_YOURS_TEXT = "⚠️ This isn't yours. Please run /help to open your own menu."
 # Executive and Scout modules stay in their own menus AND are copied (same text) into the Owner menu.
@@ -2225,6 +2226,7 @@ for _role in ("executive", "scout"):
             _owner_keys.add(_module[0])
 HELP_MODULES["owner"].append(("customize", "🎨 Customize Bot", "🎨 Customize Bot"))    # Owner only (opens theme.py's hub)
 HELP_MODULES["owner"].append(("autoapprove", "✅ Auto Approve", "✅ Auto Approve"))     # Owner only (opens the Auto Approve page)
+HELP_MODULES["owner"].append(("invites", "🎁 Invites", "🎁 Invites"))                  # Owner only (opens the Invite & Mystery Box settings, same as /boxes)
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -2243,7 +2245,7 @@ def _help_module_visible(key, user_id):
         return False
     if key == "scouts" and is_owner(uid):
         return False
-    if key in ("customize", "autoapprove", "festival") and not is_owner(uid):
+    if key in ("customize", "autoapprove", "festival", "invites") and not is_owner(uid):
         return False
     return True
 
@@ -2256,7 +2258,9 @@ def help_grid_keyboard(role, owner_id):
         if key == "autoapprove":
             return f"aa:{owner_id}:hub"
         if key == "festival":
-            return f"fs:hub:{owner_id}"          # 🪔 Festival Manager (festival.py)
+            return f"fs:hub:{owner_id}"          # 🪔 Festival Manager (rewards.py)
+        if key == "invites":
+            return "rf:o:hub"                    # 🎁 Invite & Mystery Box settings (rewards.py, Owner check inside)
         if key == "broadcast":
             return "bc:h"
         return f"help:{owner_id}:{role}:{key}"
@@ -3609,6 +3613,7 @@ async def spawn(update, context):
         await safe_reply_text(update.message, "❌ The spawn could not be completed. Please try again.")
         return
     mark_success(update)
+    await rewards.task_hook(context.bot, user_id, "spawn", name=berry_display_name(update.effective_user))     # invite friend task (never raises)
 
     last_calls = context.application.bot_data.setdefault("last_calls", {})
     last_calls[user_id] = datetime.now()
@@ -4293,7 +4298,7 @@ async def add(update, context):
         user_id, caught_rarity, caught_spawn["code"],
         event_id=(f"catch:{caught_spawn['history_id']}" if caught_spawn.get("history_id") else None),
         chat_id=chat_id, name=_who)  # daily mission progress + "mission complete - claim it" message (never raises)
-    await festival.record(context.bot, user_id, "catch", rarity=caught_rarity, chat_id=chat_id, name=_who)   # festival quests (never raises)
+    await rewards.record(context.bot, user_id, "catch", rarity=caught_rarity, chat_id=chat_id, name=_who)   # festival quests (never raises)
 
 async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
     rows = (await asyncio.to_thread(mongo_db.get_collection_summary, user_id))
@@ -4825,7 +4830,7 @@ def choose_shop_characters(exclude_codes=None, cursor=None):
     for rarity in SHOP_RARITIES:
         taken = exclude | {str(row[0]) for row in chosen}
         pool = [
-            r for r in festival.filter_hidden(mongo_db.get_characters_by_rarity(rarity))
+            r for r in rewards.filter_hidden(mongo_db.get_characters_by_rarity(rarity))
             if r[3] != "Celestial" and str(r[0]) not in taken
         ]
         if not pool:
@@ -6833,6 +6838,7 @@ async def sell_confirm_callback(update, context):
 
     for ln in lines:
         await fusion.record_sell(uid, ln["rarity"], ln["qty"])      # stone task progress (never raises)
+    await rewards.task_hook(context.bot, uid, "sell", name=berry_display_name(query.from_user))     # invite friend task (never raises)
     done = "\n".join(f"• {ln['name']} [{ln['code']}] x{ln['qty']} → +{ln['payout']}" for ln in lines)
     await _edit(f"💸 Sold {sum(ln['qty'] for ln in lines)} character copies!\n\n{done}\n\n💰 +{total} Berrys")
     await fusion.stone_remind(uid, chat_id=info["chat_id"], name=berry_display_name(query.from_user))
@@ -7081,6 +7087,7 @@ async def sell(update, context):
         return
 
     await fusion.record_sell(update.effective_user.id, rarity, quantity)  # stone task progress (never raises)
+    await rewards.task_hook(context.bot, update.effective_user.id, "sell", name=berry_display_name(update.effective_user))     # invite friend task (never raises)
 
     try:
         await update.message.delete()
@@ -7649,7 +7656,7 @@ async def daily(update, context):
                 )
             except Exception as e:
                 print("Daily photo error:", e)
-    await festival.record(context.bot, user_id, "daily", chat_id=update.message.chat_id,
+    await rewards.record(context.bot, user_id, "daily", chat_id=update.message.chat_id,
                           name=berry_display_name(update.effective_user))     # festival quests (never raises)
 
 ADD_NAME, ADD_RECRUIT, ADD_ANIME, ADD_RARITY, ADD_WORTH, ADD_CODE, ADD_PHOTO = range(7)
@@ -8204,7 +8211,7 @@ def purge_user_data(user_id):
         _mc("shop_purchases_v2").delete_many({"user_id": uid}, session=session)
         _mc("shop_free_refresh_v1").delete_one({"_id": uid}, session=session)
         badge_banner.purge_user(uid, session)        # badge claims + equipped banner
-        festival.purge_user(uid, session)            # festival progress, claims, event-banner grants, wishes
+        rewards.purge_user(uid, session)            # festival progress, claims, event-banner grants, wishes
         removed = _mc(mongo_db.USERS).delete_one({"_id": uid}, session=session).deleted_count
         return copies, removed
     return mongo_db.run_transaction(_work)
@@ -8399,7 +8406,7 @@ def _archive_user_data(uid):
             ("shop_v3", {"user_id": uid}), ("shop_purchases_v2", {"user_id": uid}),
             ("shop_free_refresh_v1", {"_id": uid})]
     spec += [(name, {key: uid}) for name, key in badge_banner.USER_DATA_SPEC]      # badge claims + equipped banner
-    spec += [(name, {key: uid}) for name, key in festival.USER_DATA_SPEC]          # festival progress, claims, event-banner grants
+    spec += [(name, {key: uid}) for name, key in rewards.USER_DATA_SPEC]          # festival progress, claims, event-banner grants
     data = {name: list(_mc(name).find(flt)) for name, flt in spec}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     doc = {"archived_at": stamp, "user_id": uid,
@@ -8630,7 +8637,7 @@ async def _dacct_answer(q, text=None, alert=False):
 # Same collections (and the same ownership keys) that purge_user_data removes / _archive_user_data saves.
 _RESTORE_SPEC = ((mongo_db.USERS, "_id"), (mongo_db.COLLECTIONS, "user_id"), (mongo_db.FAVORITES, "_id"),
                  (mongo_db.NOTIFICATIONS, "_id"), ("shop_v3", "user_id"), ("shop_purchases_v2", "user_id"),
-                 ("shop_free_refresh_v1", "_id")) + badge_banner.USER_DATA_SPEC + festival.USER_DATA_SPEC
+                 ("shop_free_refresh_v1", "_id")) + badge_banner.USER_DATA_SPEC + rewards.USER_DATA_SPEC
 # Review bookkeeping that must never come back with a restored profile (it would leave the user stuck in "deleting").
 _RESTORE_STRIP_USER_FIELDS = ("deleted_review", "deleted_review_at", "deleted_review_reason",
                               "deleted_review_token", "deleted_review_confirm_at", "missing_strikes")
@@ -8934,7 +8941,7 @@ def _move_user_data(plan, old, new):
                         _mc(name).insert_one(nd, session=session)
                         inserted.append((name, new))
             badge_banner.move_user_data(data, new, session, inserted)      # badge claims + equipped banner (never overwrites)
-            festival.move_user_data(data, new, session, inserted)          # festival progress, claims, event-banner grants
+            rewards.move_user_data(data, new, session, inserted)          # festival progress, claims, event-banner grants
             res = _mc(mongo_db.USERS).update_one({"_id": new}, {"$set": carry}, session=session)
             if not res.matched_count:
                 raise ValueError("the new account disappeared")
@@ -13245,9 +13252,9 @@ COMMANDS = {
     "logmappings": "Owner: list command -> log category mappings",
 }
 COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
-COMMANDS.update(festival.COMMAND_DESCRIPTIONS)
+COMMANDS.update(rewards.COMMAND_DESCRIPTIONS)
 
-PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | festival.PUBLIC_COMMANDS | {
+PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | rewards.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
@@ -14137,7 +14144,7 @@ OWNER_COMMANDS = {
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
     "logroute", "unlogroute", "logroutes", "logdefault",
-} | festival.OWNER_COMMANDS       # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
+} | rewards.OWNER_COMMANDS       # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
 def register_owner_commands(app):
@@ -14419,11 +14426,11 @@ def main():
     badge_banner.bind(is_owner=is_owner, is_executive=is_executive, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text,
                       cancel_all=cancel_conversation, mark_success=mark_success, items_per_page=ITEMS_PER_PAGE)
     badge_banner.register(app)   # /badges /claimbadge /banner /usebanner + staff /addbanner /editbanner /delbanner
-    festival.bind(is_owner=is_owner, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text, cancel_all=cancel_conversation,
+    rewards.bind(is_owner=is_owner, conv_timeout=CONV_TIMEOUT, safe_reply=safe_reply_text, cancel_all=cancel_conversation,
                   mark_success=mark_success, save_user=save_user_async, timestamp=timestamp,
                   rarities=tuple(r for r in SYMBOL if r not in ("Heavenly", "Special")), symbols=SYMBOL,
                   items_per_page=ITEMS_PER_PAGE)
-    festival.register(app)       # /quests + owner /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
+    rewards.register(app)       # /quests + owner /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 
     register_executive_commands(app)
     register_owner_commands(app)
