@@ -3355,7 +3355,7 @@ def _hub_page(cfg, uid):
         rows.append([_btn(f"✏️ {_ms_label(m)}", f"rf:o:m:{m['id']}")])
     rows.append([_btn("➕ New Box", "rf:o:new"), _btn("♻️ Reset", "rf:o:rs")])
     rows.append([_btn("🤝 Friend Tasks", "rf:o:tk")])
-    rows.append([_btn("« Owner Commands", f"help:{uid}:owner")])
+    rows.append([_btn("« Back", f"help:{uid}:owner:invites")])      # back to Help -> Owner Commands -> 🎁 Invites (📦 Boxes / 📋 Commands)
     return "\n".join(lines), InlineKeyboardMarkup(rows)
 
 

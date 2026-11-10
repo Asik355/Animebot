@@ -2226,7 +2226,21 @@ for _role in ("executive", "scout"):
             _owner_keys.add(_module[0])
 HELP_MODULES["owner"].append(("customize", "🎨 Customize Bot", "🎨 Customize Bot"))    # Owner only (opens theme.py's hub)
 HELP_MODULES["owner"].append(("autoapprove", "✅ Auto Approve", "✅ Auto Approve"))     # Owner only (opens the Auto Approve page)
-HELP_MODULES["owner"].append(("invites", "🎁 Invites", "🎁 Invites"))                  # Owner only (opens the Invite & Mystery Box settings, same as /boxes)
+INVITES_HELP_TEXT = (
+    "🎁 Invites (Owner)\n\n"
+    "📌 Overview\n"
+    "Invite links, Mystery Boxes and friend tasks. Members share their invite link, new members who join "
+    "through it count as invites, and invites unlock Mystery Boxes.\n\n"
+    "Tap Boxes to manage the settings, or Commands to see the command list."
+)
+INVITES_COMMANDS_TEXT = (
+    "📋 Invite Commands\n\n"
+    "⌨️ Commands & usage\n"
+    "1. /invite - Everyone: invite link, progress, claim and open Mystery Boxes\n"
+    "2. /boxes - Owner: Invite & Mystery Box settings (same as the Boxes button)\n\n"
+    "💡 Mystery Boxes also show in /item."
+)
+HELP_MODULES["owner"].append(("invites", "🎁 Invites", INVITES_HELP_TEXT))                  # Owner only: page with 📦 Boxes (opens the manager) and 📋 Commands
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -2259,8 +2273,6 @@ def help_grid_keyboard(role, owner_id):
             return f"aa:{owner_id}:hub"
         if key == "festival":
             return f"fs:hub:{owner_id}"          # 🪔 Festival Manager (rewards.py)
-        if key == "invites":
-            return "rf:o:hub"                    # 🎁 Invite & Mystery Box settings (rewards.py, Owner check inside)
         if key == "broadcast":
             return "bc:h"
         return f"help:{owner_id}:{role}:{key}"
@@ -2277,8 +2289,16 @@ def help_grid_text(role):
 
 def help_detail(role, key, owner_id):
     """LAYER 3: (text, keyboard) for one module, or None for an unknown key. « Back returns to Layer 2."""
+    if key == "invitecmds" and _help_module_visible("invites", owner_id):          # 📋 Commands page of 🎁 Invites
+        return INVITES_COMMANDS_TEXT, InlineKeyboardMarkup(
+            [[InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}:invites")]])
     for k, _label, text in HELP_MODULES[role]:
         if k == key and _help_module_visible(k, owner_id):
+            if k == "invites":
+                return text, InlineKeyboardMarkup([
+                    [_module_button("📦 Boxes", "rf:o:hub"),               # the Invite & Mystery Box manager (Owner check inside)
+                     _module_button("📋 Commands", f"help:{owner_id}:{role}:invitecmds")],
+                    [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             return text, InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
     return None
@@ -3182,6 +3202,18 @@ def mark_success(update):
         pass
 
 
+_SKIP_KB_CHATS = set()      # chats where the "⏭ Skip" reply keyboard is on screen right now
+
+async def _drop_skip_keyboard(bot, chat_id):
+    """A reply keyboard can only be removed by a message that carries ReplyKeyboardRemove (an inline-button message cannot):
+    send a tiny one and delete it straight away."""
+    _SKIP_KB_CHATS.discard(chat_id)
+    try:
+        gone = await bot.send_message(chat_id=chat_id, text="⌨️", reply_markup=ReplyKeyboardRemove())
+        await gone.delete()
+    except Exception as e:
+        print("Skip keyboard cleanup failed:", e)
+
 async def safe_reply_text(message, text, **kwargs):
     if message is None:
         return None
@@ -3193,6 +3225,21 @@ async def safe_reply_text(message, text, **kwargs):
     if not text.strip():
         print("Safe reply skipped: empty message text")
         return None
+
+    # The Skip button only lives on the step that asks for it. The next normal reply in that chat clears it
+    # (❌ validation messages keep it, because the same step is still waiting for an answer).
+    markup = kwargs.get("reply_markup")
+    if isinstance(markup, ReplyKeyboardMarkup):
+        _SKIP_KB_CHATS.add(message.chat_id)
+    elif message.chat_id in _SKIP_KB_CHATS:
+        if isinstance(markup, ReplyKeyboardRemove):
+            _SKIP_KB_CHATS.discard(message.chat_id)
+        elif not text.lstrip().startswith("❌"):
+            if markup is None:
+                kwargs["reply_markup"] = ReplyKeyboardRemove()
+                _SKIP_KB_CHATS.discard(message.chat_id)
+            else:
+                await _drop_skip_keyboard(message.get_bot(), message.chat_id)
 
     text = add_display_name_header(message, text)
     try:
@@ -11748,7 +11795,7 @@ async def cancel_conversation(update, context):
                 "\n\nAnything already finished (sales, evolutions, claims, accepted transfers) cannot be undone.")
     else:
         text = "❌ Cancelled. The active process has been stopped and its temporary data cleared."
-    await safe_reply_text(update.effective_message, text)
+    await safe_reply_text(update.effective_message, text, reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 # ==========================================================================
