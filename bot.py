@@ -2233,13 +2233,24 @@ INVITES_HELP_TEXT = (
     "through it count as invites, and invites unlock Mystery Boxes.\n\n"
     "Tap Boxes to manage the settings, or Commands to see the command list."
 )
-INVITES_COMMANDS_TEXT = (
-    "📋 Invite Commands\n\n"
-    "⌨️ Commands & usage\n"
-    "1. /invite - Everyone: invite link, progress, claim and open Mystery Boxes\n"
-    "2. /boxes - Owner: Invite & Mystery Box settings (same as the Boxes button)\n\n"
-    "💡 Mystery Boxes also show in /item."
-)
+_INVITE_CMD_ORDER = ("invite", "openbox", "myinvites", "topinvites", "boxes")
+
+
+def invites_commands_text():
+    """Every invite / Mystery Box command the bot has (read from rewards.py, so a new one shows up here by itself)."""
+    desc = getattr(rewards, "COMMAND_DESCRIPTIONS", {}) or {}
+    owner_cmds = set(getattr(rewards, "OWNER_COMMANDS", ()) or ())
+    related = [n for n in desc if "invite" in n or "box" in n]
+    names = [n for n in _INVITE_CMD_ORDER if n in related] + sorted(n for n in related if n not in _INVITE_CMD_ORDER)
+    lines, number = ["📋 Invite Commands", "", "⌨️ Commands & usage"], 0
+    for title, group in (("👥 Everyone", [n for n in names if n not in owner_cmds]), ("👑 Owner", [n for n in names if n in owner_cmds])):
+        if not group:
+            continue
+        lines += ["", title]
+        for n in group:
+            number += 1
+            lines.append(f"{number}. /{n} - {str(desc[n]).removeprefix('Owner: ')}")
+    return "\n".join(lines)
 HELP_MODULES["owner"].append(("invites", "🎁 Invites", INVITES_HELP_TEXT))                  # Owner only: page with 📦 Boxes (opens the manager) and 📋 Commands
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
@@ -2290,7 +2301,7 @@ def help_grid_text(role):
 def help_detail(role, key, owner_id):
     """LAYER 3: (text, keyboard) for one module, or None for an unknown key. « Back returns to Layer 2."""
     if key == "invitecmds" and _help_module_visible("invites", owner_id):          # 📋 Commands page of 🎁 Invites
-        return INVITES_COMMANDS_TEXT, InlineKeyboardMarkup(
+        return invites_commands_text(), InlineKeyboardMarkup(
             [[InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}:invites")]])
     for k, _label, text in HELP_MODULES[role]:
         if k == key and _help_module_visible(k, owner_id):

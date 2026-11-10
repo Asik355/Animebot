@@ -53,9 +53,10 @@ from urllib.parse import quote as _urlquote
 import mongo_db
 from pymongo import ASCENDING, ReturnDocument
 from pymongo.errors import DuplicateKeyError
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions
 
 logger = logging.getLogger(__name__)
+NO_LINK_PREVIEW = LinkPreviewOptions(is_disabled=True)      # the invite link is a normal clickable link, without the big bot preview card
 
 IST = timezone(timedelta(hours=5, minutes=30))
 
@@ -840,10 +841,12 @@ async def _reply(msg, text, **kw):
         raise
 
 
-async def _edit(q, text, kb=None):
+async def _edit(q, text, kb=None, no_preview=False):
     try:
         if q.message is not None and getattr(q.message, "photo", None):
             await q.edit_message_caption(caption=text[:CAPTION_LIMIT], parse_mode="HTML", reply_markup=kb)
+        elif no_preview:
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb, link_preview_options=NO_LINK_PREVIEW)
         else:
             await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
     except Exception as e:
@@ -3065,7 +3068,7 @@ def _invite_page(uid, bot_username, state):
     lines = ["🎁 <b>INVITE &amp; EARN</b>", ""]
     if not cfg["enabled"]:
         lines += ["⚠️ The invite system is turned off right now.", ""]
-    lines += ["🔗 Your invite link (tap it to copy):", f"<code>{_esc(link)}</code>", "", f"👥 Total invites: <b>{total}</b>"]
+    lines += ["🔗 Your invite link (tap to open, hold to copy):", _esc(link), "", f"👥 Total invites: <b>{total}</b>"]
     live = [m for m in cfg["milestones"] if m["enabled"]]          # already sorted by invites
     nxt = next((m for m in live if m["invites"] > total), None)
     if nxt:
@@ -3126,13 +3129,13 @@ async def invite_command(update, context):
             logger.warning("referral: save_user failed: %s", e)
     state = await asyncio.to_thread(_invite_state_sync, user.id)
     text, kb = await asyncio.to_thread(_invite_page, user.id, context.bot.username, state)
-    await _reply(msg, text, parse_mode="HTML", reply_markup=kb)
+    await _reply(msg, text, parse_mode="HTML", reply_markup=kb, link_preview_options=NO_LINK_PREVIEW)
 
 
 async def _show_invite(q, context, uid):
     state = await asyncio.to_thread(_invite_state_sync, uid)
     text, kb = await asyncio.to_thread(_invite_page, uid, context.bot.username, state)
-    await _edit(q, text, kb)
+    await _edit(q, text, kb, no_preview=True)
 
 
 async def rf_user_callback(update, context):
