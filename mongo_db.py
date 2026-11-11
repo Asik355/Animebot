@@ -2500,3 +2500,503 @@ def apply_code_move(moves):
         return run_transaction(_work)
     finally:
         invalidate_character_cache()
+
+
+# ==========================================================================
+# FILLING RANGES AND SHIFTING RANGES (renumbering many characters safely)
+#   plan_fill_ranges()  -> every normal character moves INTO its anime's range (characters already inside keep their code)
+#   plan_range_extend() -> a range grows; the ranges it runs into (and their characters) shift up by the amount needed
+# Both only PLAN (nothing is written). The plan is saved as a "move job" and executed in small transactions:
+# every step is valid on its own and idempotent, so a stop halfway never breaks anything - the job just continues.
+# ==========================================================================
+import uuid
+
+CODE_JOBS = "code_move_jobs"
+
+
+def _order_moves(items, used_codes):
+    """
+    items: [{"id", "old", "new", "name"}] (old/new are ints, one character each, unique new codes).
+    Returns the steps in an order where every step's target code is free at that moment. A cycle (A->B, B->A) is broken
+    with one temporary pivot code that nobody uses. Raises ValueError when no pivot is available.
+    """
+    pending = {it["old"]: dict(it) for it in items if it["old"] != it["new"]}
+    occupied = set(used_codes)
+    steps = []
+    while pending:
+        progressed = False
+        for old in sorted(pending):
+            it = pending.get(old)
+            if it is None:
+                continue
+            if it["new"] not in occupied:
+                steps.append(dict(it))
+                occupied.discard(old)
+                occupied.add(it["new"])
+                del pending[old]
+                progressed = True
+        if progressed:
+            continue
+        targets = {it["new"] for it in pending.values()}
+        pivot = next((c for c in range(CODE_MAX, CODE_MIN - 1, -1) if c not in occupied and c not in targets), None)
+        if pivot is None:
+            raise ValueError("No free code is available to resolve the renumbering.")
+        old = min(pending)
+        it = pending.pop(old)
+        steps.append({**it, "new": pivot})
+        occupied.discard(old)
+        occupied.add(pivot)
+        pending[pivot] = {**it, "old": pivot}
+    return steps
+
+
+def _rows_for_planning():
+    rows = []
+    for d in _chars():
+        rows.append({"id": d["_id"], "code": _numeric_code(d), "name": d.get("name"),
+                     "akey": anime_key(d.get("anime")), "evo": d.get("char_type") == CHAR_TYPE_EVOLUTION})
+    return rows
+
+
+def plan_fill_ranges(spawned=None, only_anime=None):
+    """
+    Plan that moves every NORMAL character into the range of its anime. Characters already inside keep their code; the
+    ones outside take the lowest free codes of the range, in the order of their current codes. Evolution characters,
+    characters of anime without a range, and characters spawned right now (`spawned` = codes) stay where they are.
+    An anime whose characters do not all fit is skipped (extend its range first). `only_anime` limits the moves to one anime.
+    Returns {"per_anime": [{name,start,end,total_slots,inside,moving,need,slots,status}], "steps": [...], "moving": int,
+             "inside": int, "skipped": [names], "deferred": int, "evolution": int, "unranged": {anime: count}, "samples": [...]}.
+    """
+    spawned = {int(c) for c in (spawned or []) if str(c).isdigit()}
+    ranges = get_ranges()
+    rmap = {r["anime_key"]: r for r in ranges}
+    only_key = anime_key(only_anime) if only_anime else None
+    rows = _rows_for_planning()
+    numeric = [r for r in rows if r["code"] is not None]
+    skipped = set()
+    while True:
+        out_by, in_by = {}, {}
+        for r in numeric:
+            rg = rmap.get(r["akey"])
+            if rg is None or r["evo"] or r["akey"] in skipped or (only_key and r["akey"] != only_key):
+                continue
+            if rg["start_code"] <= r["code"] <= rg["end_code"]:
+                in_by.setdefault(r["akey"], []).append(r)
+            elif r["code"] not in spawned:
+                out_by.setdefault(r["akey"], []).append(r)
+        moving_ids = {id(r) for lst in out_by.values() for r in lst}
+        stay_codes = {r["code"] for r in numeric if id(r) not in moving_ids}
+        slots_by, newly = {}, False
+        for rg in ranges:
+            k = rg["anime_key"]
+            outs = out_by.get(k, [])
+            if not outs:
+                continue
+            slots = [c for c in range(rg["start_code"], rg["end_code"] + 1) if c not in stay_codes]
+            slots_by[k] = slots
+            if len(outs) > len(slots):
+                skipped.add(k)
+                newly = True
+        if not newly:
+            break
+    items, per_anime = [], []
+    unranged = {}
+    for r in rows:
+        if r["akey"] and r["akey"] not in rmap and not r["evo"] and r["code"] is not None:
+            unranged[r["akey"]] = unranged.get(r["akey"], 0) + 1
+    names = {}
+    for d in _chars():
+        a = " ".join(str(d.get("anime") or "").split())
+        if a:
+            names.setdefault(anime_key(a), a)
+    for rg in ranges:
+        k = rg["anime_key"]
+        if only_key and k != only_key:
+            continue
+        outs = sorted(out_by.get(k, []), key=lambda r: (r["code"], str(r["name"])))
+        slots = slots_by.get(k, [])
+        inside = len(in_by.get(k, []))
+        total_chars = sum(1 for r in numeric if r["akey"] == k and not r["evo"])
+        entry = {"name": rg["anime_name"], "start": rg["start_code"], "end": rg["end_code"], "inside": inside,
+                 "moving": 0, "need": 0, "slots": 0, "status": "ok"}
+        if k in skipped:
+            outside_all = [r for r in numeric if r["akey"] == k and not r["evo"]
+                           and not (rg["start_code"] <= r["code"] <= rg["end_code"]) and r["code"] not in spawned]
+            stay2 = {r["code"] for r in numeric if r["akey"] != k or r["evo"] or r["code"] in spawned
+                     or (rg["start_code"] <= r["code"] <= rg["end_code"])}
+            free2 = [c for c in range(rg["start_code"], rg["end_code"] + 1) if c not in stay2]
+            entry.update(status="too_small", need=len(outside_all), slots=len(free2))
+        else:
+            for r, c in zip(outs, slots):
+                items.append({"id": r["id"], "old": r["code"], "new": c, "name": r["name"]})
+            entry.update(moving=len(outs), slots=len(slots), need=len(outs))
+            if outs:
+                entry["status"] = "moves"
+        entry["total"] = total_chars
+        per_anime.append(entry)
+    used = {r["code"] for r in numeric}
+    steps = _order_moves(items, used) if items else []
+    deferred = sum(1 for r in numeric if r["code"] in spawned and rmap.get(r["akey"]) is not None and not r["evo"]
+                   and not (rmap[r["akey"]]["start_code"] <= r["code"] <= rmap[r["akey"]]["end_code"])
+                   and (not only_key or r["akey"] == only_key))
+    return {"per_anime": per_anime, "steps": steps, "moving": len(items), "inside": sum(len(v) for v in in_by.values()),
+            "skipped": [e["name"] for e in per_anime if e["status"] == "too_small"], "deferred": deferred,
+            "evolution": sum(1 for r in numeric if r["evo"]),
+            "unranged": {names.get(k, k): n for k, n in sorted(unranged.items())},
+            "samples": [(it["old"], it["new"], it["name"]) for it in sorted(items, key=lambda i: i["old"])[:5]]}
+
+
+def plan_range_extend(anime, new_start, new_end, spawned=None):
+    """
+    Plan for growing an EXISTING range to new_start-new_end when it runs into the next ranges: every range that would
+    overlap shifts up only as far as needed (gaps absorb part of it) and its characters move with it, keeping their
+    position (Bleach 0301 -> 0401). All or nothing: any problem sets "error" and nothing may be moved.
+    Returns {"ok": bool, "error": text|None, "shifts": [{name, old:(s,e), new:(s,e), shift, chars}], "steps": [...],
+             "ranges_after": [{anime_key, anime_name, start, end}], "moving": int}.
+    """
+    ns, ne = parse_code(new_start), parse_code(new_end)
+    key = anime_key(anime)
+    cur = get_range(anime)
+    plan = {"ok": False, "error": None, "shifts": [], "steps": [], "ranges_after": [], "moving": 0}
+    if cur is None or ns is None or ne is None or ns > ne:
+        plan["error"] = "Only an existing range can be extended."
+        return plan
+    spawned = {int(c) for c in (spawned or []) if str(c).isdigit()}
+    others = sorted((r for r in get_ranges() if r["anime_key"] != key), key=lambda r: r["start_code"])
+    limit, shifts = ne, []
+    for r in others:
+        if r["end_code"] < ns:
+            continue
+        if r["start_code"] > limit:
+            break
+        if r["start_code"] < ns:
+            plan["error"] = (f"{r['anime_name']} ({fmt_code(r['start_code'])}-{fmt_code(r['end_code'])}) starts before the new "
+                             "range, so it cannot be shifted. Extend the end of the range instead.")
+            return plan
+        shift = limit + 1 - r["start_code"]
+        new_r = (r["start_code"] + shift, r["end_code"] + shift)
+        if new_r[1] > CODE_MAX:
+            plan["error"] = (f"There is no room: {r['anime_name']} would have to end at {new_r[1]}, "
+                             f"but codes stop at {CODE_MAX}.")
+            return plan
+        shifts.append({"key": r["anime_key"], "name": r["anime_name"], "old": (r["start_code"], r["end_code"]),
+                       "new": new_r, "shift": shift, "chars": 0})
+        limit = new_r[1]
+    rows = _rows_for_planning()
+    numeric = [r for r in rows if r["code"] is not None]
+    items, moving_codes = [], set()
+    for sh in shifts:
+        for r in numeric:
+            if r["akey"] == sh["key"] and not r["evo"] and sh["old"][0] <= r["code"] <= sh["old"][1]:
+                items.append({"id": r["id"], "old": r["code"], "new": r["code"] + sh["shift"], "name": r["name"]})
+                moving_codes.add(r["code"])
+                sh["chars"] += 1
+    busy = sorted(it["old"] for it in items if it["old"] in spawned)
+    if busy:
+        plan["error"] = ("These characters are spawned in a group right now: " + ", ".join(fmt_code(c) for c in busy[:10]) +
+                         ". Try again in a minute.")
+        return plan
+    occupant = {r["code"]: r["name"] for r in numeric if r["code"] not in moving_codes}
+    clash = [(it["new"], occupant[it["new"]]) for it in items if it["new"] in occupant]
+    if clash:
+        shown = ", ".join(f"{fmt_code(c)} is used by {nm}" for c, nm in clash[:3])
+        plan["error"] = (f"{len(clash)} new code(s) are used by characters that cannot move here ({shown}). "
+                         "Run /fillranges first, or move them with /editcode.")
+        return plan
+    try:
+        plan["steps"] = _order_moves(items, {r["code"] for r in numeric})
+    except ValueError as exc:
+        plan["error"] = str(exc)
+        return plan
+    plan["ranges_after"] = [{"anime_key": key, "anime_name": cur["anime_name"], "start": ns, "end": ne}] + [
+        {"anime_key": sh["key"], "anime_name": sh["name"], "start": sh["new"][0], "end": sh["new"][1]} for sh in shifts]
+    plan["shifts"], plan["moving"], plan["ok"] = shifts, len(items), True
+    return plan
+
+
+@retry_write
+def create_move_job(kind, steps, ranges_after, user_id):
+    """Save a plan as a job (returns its id). Run it with run_move_job() until it reports finished."""
+    stamp = datetime.now(_IST).replace(tzinfo=None).isoformat(timespec="seconds")
+    job_id = uuid.uuid4().hex[:16]
+    before = [{"anime_key": r["anime_key"], "anime_name": r["anime_name"], "start": r["start_code"], "end": r["end_code"]}
+              for r in get_ranges()]
+    col(CODE_JOBS).insert_one({
+        "_id": job_id, "kind": kind, "status": "pending", "created_at": stamp, "created_ns": time.time_ns(),
+        "created_by": int(user_id) if user_id is not None else None, "done": 0, "total": len(steps),
+        "steps": [{"id": s["id"], "old": int(s["old"]), "new": int(s["new"]), "name": s.get("name")} for s in steps],
+        "ranges_after": list(ranges_after or []), "ranges_before": before})
+    return job_id
+
+
+def get_move_job(job_id):
+    job = col(CODE_JOBS).find_one({"_id": job_id})
+    return None if job is None else {"id": job["_id"], "kind": job.get("kind"), "status": job.get("status"),
+                                     "done": job.get("done", 0), "total": len(job.get("steps") or [])}
+
+
+def run_move_job(job_id, batch=40):
+    """
+    Run the next `batch` steps of a job in ONE transaction. Each step is idempotent (a character already at its new code is
+    skipped) and checked (a character that is not where the plan expects it stops the job with an error). When the last step is
+    done the planned range changes are saved. Returns {"done", "total", "finished"}.
+    """
+    job = col(CODE_JOBS).find_one({"_id": job_id})
+    if job is None:
+        raise KeyError("Job not found")
+    steps = job.get("steps") or []
+    start = int(job.get("done", 0))
+    chunk = steps[start:start + max(1, int(batch))]
+
+    def _work(session):
+        for st in chunk:
+            doc = col(CHARACTERS).find_one({"_id": st["id"]}, session=session)
+            if not doc:
+                raise RuntimeError(f"{st.get('name') or st['id']} no longer exists")
+            cur, new = str(doc.get("code")), fmt_code(st["new"])
+            if cur == new:
+                continue
+            if cur != fmt_code(st["old"]):
+                raise RuntimeError(f"{doc.get('name')} is at {cur}, not at {fmt_code(st['old'])} as planned")
+            if not update_character_tx(session, cur, new, doc.get("name"), doc.get("anime"), doc.get("rarity"),
+                                       doc.get("worth") or 0):
+                raise RuntimeError(f"{doc.get('name')} could not be changed")
+            col("shop_v3").update_many({"character_code": cur}, {"$set": {"character_code": new}}, session=session)
+
+    try:
+        if chunk:
+            run_transaction(_work)
+    except Exception:
+        col(CODE_JOBS).update_one({"_id": job_id}, {"$set": {"status": "failed"}})
+        raise
+    finally:
+        invalidate_character_cache()
+    done = start + len(chunk)
+    finished = done >= len(steps)
+    col(CODE_JOBS).update_one({"_id": job_id}, {"$set": {"done": done, "status": "running"}})
+    if finished:
+        stamp = datetime.now(_IST).replace(tzinfo=None).isoformat(timespec="seconds")
+        for r in job.get("ranges_after") or []:
+            col(ANIME_RANGES).update_one(
+                {"anime_key": r["anime_key"]},
+                {"$set": {"anime_name": r["anime_name"], "anime_key": r["anime_key"], "start_code": int(r["start"]),
+                          "end_code": int(r["end"]), "updated_at": stamp}}, upsert=True)
+        col(CODE_JOBS).update_one({"_id": job_id}, {"$set": {"status": "done", "finished_at": stamp}})
+    return {"done": done, "total": len(steps), "finished": finished}
+
+
+# --------------------------------------------------------------------------
+# Undo of the last code move
+# --------------------------------------------------------------------------
+def get_last_move_job():
+    """
+    The most recent code-move job and whether it can be undone:
+    {"id", "kind", "status", "done", "total", "created_at", "can_undo", "reason"} or None when no job exists.
+    Only the LATEST job can be undone (an older one may overlap with what came after), only fill/extend jobs, only once.
+    """
+    jobs = list(col(CODE_JOBS).find({}, {"kind": 1, "status": 1, "done": 1, "total": 1, "created_at": 1, "created_ns": 1, "undone": 1}))
+    if not jobs:
+        return None
+    j = max(jobs, key=lambda d: (int(d.get("created_ns") or 0), str(d.get("created_at") or "")))
+    info = {"id": j["_id"], "kind": j.get("kind"), "status": j.get("status"), "done": int(j.get("done", 0)),
+            "total": int(j.get("total", 0)), "created_at": j.get("created_at"), "can_undo": True, "reason": None}
+    if j.get("kind") == "undo":
+        info.update(can_undo=False, reason="The last code move was already an undo.")
+    elif j.get("undone"):
+        info.update(can_undo=False, reason="The last code move was already undone.")
+    elif info["done"] == 0 and j.get("status") != "done":
+        info.update(can_undo=False, reason="The last code move did not change any character.")
+    return info
+
+
+@retry_write
+def create_undo_job(job_id, user_id):
+    """
+    Save a job that reverses the executed steps of `job_id` (newest first) and puts the ranges back as they were.
+    Run it with run_move_job() like any other job. Returns the new job id.
+    """
+    job = col(CODE_JOBS).find_one({"_id": job_id})
+    if job is None:
+        raise KeyError("Job not found")
+    done = int(job.get("done", 0))
+    reverse = [{"id": st["id"], "old": st["new"], "new": st["old"], "name": st.get("name")}
+               for st in reversed((job.get("steps") or [])[:done])]
+    undo_id = create_move_job("undo", reverse, job.get("ranges_before") or [], user_id)
+    col(CODE_JOBS).update_one({"_id": job_id}, {"$set": {"undone": True}})
+    return undo_id
+
+
+# --------------------------------------------------------------------------
+# Full database export (the /exportdb command)
+# --------------------------------------------------------------------------
+def export_database(dest_dir, only=None, chunk_bytes=4 * 1024 * 1024, part_bytes=10 * 1024 * 1024):
+    """
+    Stream every collection of the database (or only the names in `only`) into zip files inside dest_dir. Documents are
+    written as Extended JSON, one per line (<collection>.0001.jsonl, ...), so the files keep every type (dates, ids). A
+    part is closed after about `part_bytes` so each file fits Telegram's upload limit; manifest.json (collections, counts,
+    date) goes into the last part. Parts stay well under 15 MB because a bot can only DOWNLOAD files up to 20 MB, and
+    /importdb has to read them back. Returns {"parts": [paths], "collections": {name: count}, "docs": int}.
+    """
+    import json
+    import os
+    import zipfile
+    from bson import json_util
+
+    db = get_db()
+    names = sorted(n for n in db.list_collection_names() if not n.startswith("system."))
+    if only:
+        wanted = {str(n).casefold() for n in only}
+        names = [n for n in names if n.casefold() in wanted]
+    parts, counts = [], {}
+    state = {"zf": None, "path": None}
+
+    def _open_part():
+        path = os.path.join(dest_dir, f"part{len(parts) + 1:03d}.zip")
+        state["zf"], state["path"] = zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED), path
+        parts.append(path)
+
+    def _write(name, data):
+        if state["zf"] is None:
+            _open_part()
+        state["zf"].writestr(name, data)
+        state["zf"].fp.flush()
+        if os.path.getsize(state["path"]) >= part_bytes:
+            state["zf"].close()
+            state["zf"] = None
+
+    for name in names:
+        chunk, size, n_chunk, total = [], 0, 0, 0
+        for doc in col(name).find({}, batch_size=500):
+            line = json_util.dumps(doc, json_options=json_util.CANONICAL_JSON_OPTIONS)
+            chunk.append(line)
+            size += len(line) + 1
+            total += 1
+            if size >= chunk_bytes:
+                n_chunk += 1
+                _write(f"{name}.{n_chunk:04d}.jsonl", "\n".join(chunk) + "\n")
+                chunk, size = [], 0
+        if chunk or n_chunk == 0:
+            n_chunk += 1
+            _write(f"{name}.{n_chunk:04d}.jsonl", ("\n".join(chunk) + "\n") if chunk else "")
+        counts[name] = total
+    manifest = {"database": _db_name(), "exported_at_ist": datetime.now(_IST).replace(tzinfo=None).isoformat(timespec="seconds"),
+                "format": "Extended JSON v2 (canonical), one document per line", "collections": counts}
+    if state["zf"] is None:
+        _open_part()
+    state["zf"].writestr("manifest.json", json.dumps(manifest, indent=2))
+    state["zf"].close()
+    return {"parts": parts, "collections": counts, "docs": sum(counts.values())}
+
+
+# --------------------------------------------------------------------------
+# Restore from /exportdb files (the /importdb command)
+# --------------------------------------------------------------------------
+_CHUNK_RE = None
+
+
+def inspect_backup(zip_paths, only=None):
+    """
+    Read the zip parts of an export WITHOUT changing anything. Returns
+      {"collections": {name: documents found}, "members": {name: [(zip, member, chunk no)]}, "manifest": dict|None,
+       "problems": [text]}
+    A problem is reported for: a part that is not a valid export, a missing manifest (the last part is missing), a missing
+    chunk, or a collection whose document count differs from the manifest.
+    """
+    import json
+    import re
+    import zipfile
+    global _CHUNK_RE
+    if _CHUNK_RE is None:
+        _CHUNK_RE = re.compile(r"^(.+)\.(\d{4})\.jsonl$")
+    wanted = {str(n).casefold() for n in only} if only else None
+    members, manifest, problems, seen = {}, None, [], set()
+    for path in zip_paths:
+        try:
+            with zipfile.ZipFile(path) as z:
+                for info in z.infolist():
+                    n = info.filename
+                    if "/" in n or "\\" in n or n.startswith(".."):
+                        problems.append(f"Unexpected file name in a part: {n}")
+                        continue
+                    if n == "manifest.json":
+                        manifest = json.loads(z.read(n).decode("utf-8"))
+                        continue
+                    m = _CHUNK_RE.match(n)
+                    if not m:
+                        problems.append(f"Unknown file in a part: {n}")
+                        continue
+                    name, no = m.group(1), int(m.group(2))
+                    if name.startswith("system."):
+                        continue
+                    if (name, no) in seen:
+                        continue                                  # the same part was sent twice
+                    seen.add((name, no))
+                    members.setdefault(name, []).append((path, n, no))
+        except Exception as e:
+            problems.append(f"A file is not a valid export part ({type(e).__name__}).")
+    counts = {}
+    for name, items in list(members.items()):
+        if wanted is not None and name.casefold() not in wanted:
+            del members[name]
+            continue
+        items.sort(key=lambda t: t[2])
+        if [t[2] for t in items] != list(range(1, len(items) + 1)):
+            problems.append(f"{name}: a chunk is missing - send all parts of the backup.")
+        total = 0
+        for path, member, _no in items:
+            with zipfile.ZipFile(path) as z, z.open(member) as fh:
+                total += sum(1 for line in fh if line.strip())
+        counts[name] = total
+    if manifest is None:
+        problems.append("manifest.json was not found: the LAST part of the backup is missing.")
+    else:
+        for name, expected in (manifest.get("collections") or {}).items():
+            if wanted is not None and name.casefold() not in wanted:
+                continue
+            if counts.get(name, 0) != expected:
+                problems.append(f"{name}: the backup should hold {expected} documents, the files hold {counts.get(name, 0)}.")
+    return {"collections": counts, "members": members, "manifest": manifest, "problems": problems}
+
+
+def import_collection(name, members, mode):
+    """
+    Put ONE collection of a backup back. mode "merge" adds only the documents that are missing (existing ones are left
+    untouched, so it is safe to run twice); mode "replace" first empties the collection, then fills it from the backup.
+    Returns {"inserted": int, "skipped": int}. Run inspect_backup() first.
+    """
+    import zipfile
+    from bson import json_util
+    from pymongo.errors import BulkWriteError
+    c = col(name)
+    if mode == "replace":
+        c.delete_many({})
+    out = {"inserted": 0, "skipped": 0}
+    batch = []
+
+    def _flush():
+        if not batch:
+            return
+        try:
+            res = c.insert_many(batch, ordered=False)
+            out["inserted"] += len(res.inserted_ids)
+        except BulkWriteError as e:
+            details = getattr(e, "details", None) or {}
+            if any(w.get("code") != 11000 for w in (details.get("writeErrors") or [])):
+                raise
+            done = int(details.get("nInserted", 0))
+            out["inserted"] += done
+            out["skipped"] += len(batch) - done
+        batch.clear()
+
+    for path, member, _no in sorted(members, key=lambda t: t[2]):
+        with zipfile.ZipFile(path) as z, z.open(member) as fh:
+            for raw in fh:
+                line = raw.decode("utf-8").strip()
+                if not line:
+                    continue
+                batch.append(json_util.loads(line))
+                if len(batch) >= 500:
+                    _flush()
+    _flush()
+    invalidate_character_cache()
+    return out

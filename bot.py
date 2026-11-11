@@ -2191,6 +2191,8 @@ HELP_MODULES = {
              ("/deleteuser <user_id>", "Preview what would be deleted, then press 🗑 Delete Data (private chat) to permanently delete that user's data. A backup file is sent to your PM first (nothing is stored on the bot)"),
              ("/restoreuser <user_id>", "Show the latest backup of a deleted user, then press ✅ Confirm Restore (private chat). Refused if the user already has data or the backup was already transferred. You can also reply to a backup file the bot sent you with /restoreuser (no ID needed)"),
              ("/moveuser <old_id> <new_id>", "Show a preview of copying a deleted account's data to the same person's NEW account (it must have pressed /start first), then press ✅ Confirm Transfer. The old data or backup is kept and cannot be transferred twice"),
+             ("/exportdb [collection ...]", "Send the WHOLE database (every collection, not only user data) to your PM as zip file(s) of JSON files, in private chat. Add collection names to export only those. Nothing is stored on the bot"),
+             ("/importdb [collection ...]", "Restore the database from the zip files made by /exportdb, in private chat: send all the parts, tap Done to see what they contain, then choose ➕ Add missing only (safe) or ♻ Replace (a safety copy is sent first and you must type REPLACE). Add collection names to restore only those"),
              ("/removechar <user_id> <code/name> [quantity]", "Remove characters from a user's collection (also listed under Characters)")],
             "🔔 Deleted-account notices: when the bot thinks an account may be deleted it sends you a notice with "
             "🗑️ Delete Data and ❌ Keep Data. Delete Data asks for a second confirmation and saves a backup first; "
@@ -2283,7 +2285,9 @@ RANGE_COMMANDS_TEXT = (
     "2. /delrange - delete an anime's range\n"
     "3. /range - show all ranges, or /range <anime> for one anime\n"
     "4. /freecode - show used and free codes (all anime, or one)\n"
-    "5. /nextcode - show the next free code (all anime, or one)"
+    "5. /nextcode - show the next free code (all anime, or one)\n"
+    "6. /fillranges - move every character into the range of its anime\n"
+    "7. /undocodes - undo the last /fillranges or range shift"
 )
 HELP_MODULES["owner"].append(("range", "📏 Range", RANGE_HELP_TEXT))
 HELP_MODULES["executive"].append(("range", "📏 Range", RANGE_HELP_TEXT))
@@ -3839,6 +3843,10 @@ async def rg_do_set(context, user, chat, name, start, end):
     the Change codes / Preview / Keep codes buttons; the log prompt then waits for that decision."""
     result = await asyncio.to_thread(mongo_db.set_range, name, start, end, user.id)
     if not result["ok"]:
+        if result["error"] == "overlap":
+            offer = await rg_extend_offer(user.id, name, start, end)
+            if offer:
+                return False, offer[0], offer[1]
         return False, "❌ " + result["message"], None
     r, prev = result["range"], result["previous"]
     anime = r["anime_name"]
@@ -4064,7 +4072,7 @@ async def setrange_command(update, context):
         return
     name = " ".join(args[:-2])
     ok, text, rows = await rg_do_set(context, user, update.effective_chat, name, args[-2], args[-1])
-    await safe_reply_text(msg, text if ok else text + "\n\n" + usage,
+    await safe_reply_text(msg, text if (ok or rows) else text + "\n\n" + usage,
                           reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 
@@ -4079,6 +4087,526 @@ async def delrange_command(update, context):
         return
     chunks, rows = await rg_lookup_view("d", query, user.id)
     await rg_reply(msg, chunks, rows)
+
+
+def _rg_spawned(context):
+    """Codes of the characters spawned in groups right now (they must not be renumbered at this moment)."""
+    active = context.application.bot_data.get("active_spawns", {}) or {}
+    return {int(str(sp.get("code"))) for sp in active.values() if str(sp.get("code")).isdigit()}
+
+
+async def rg_fill_view(uid, context, only_name=None, back=None):
+    """([texts], [button rows]) of the /fillranges preview: what would move where. Nothing is changed here."""
+    plan = await asyncio.to_thread(mongo_db.plan_fill_ranges, _rg_spawned(context), only_name)
+    h = mongo_db.anime_hash(only_name) if only_name else ""
+    arg = f":{h}" if h else ""
+    lines = ["🧩 Fill ranges — preview" + (f" ({only_name})" if only_name else ""), ""]
+    if not plan["per_anime"]:
+        lines.append("No ranges are set yet. Set them first with /setrange.")
+    elif plan["moving"] == 0:
+        lines.append("✅ Nothing to move: every character is already inside its anime's range.")
+    else:
+        lines.append(f"Characters to move into their anime's range: {plan['moving']}")
+        lines.append(f"Already inside their range (they keep their codes): {plan['inside']}")
+    lines.append("")
+    n = 0
+    for e in plan["per_anime"]:
+        n += 1
+        span = _rg_span(e["start"], e["end"])
+        if e["status"] == "too_small":
+            lines.append(f"{n}. {e['name']}: skipped - needs {e['need']} free codes, the range {span} has {e['slots']}. Extend it first")
+        elif e["status"] == "moves":
+            lines.append(f"{n}. {e['name']}: {e['moving']} to move (range {span})")
+        else:
+            lines.append(f"{n}. {e['name']}: nothing to move ✓")
+    if plan["samples"]:
+        lines += ["", "Examples:"] + [f"{_rg_fc(o)} → {_rg_fc(nw)}  {nm}" for o, nw, nm in plan["samples"]]
+    notes = []
+    if plan["evolution"]:
+        notes.append(f"{plan['evolution']} Evolution character(s) (use /editevo)")
+    if plan["unranged"]:
+        notes.append(f"{sum(plan['unranged'].values())} character(s) of anime without a range ("
+                     + ", ".join(list(plan["unranged"])[:5]) + (", …" if len(plan["unranged"]) > 5 else "") + ")")
+    if plan["deferred"]:
+        notes.append(f"{plan['deferred']} spawned in a group right now (run it again later)")
+    if notes:
+        lines += ["", "Not moved: " + "; ".join(notes)]
+    rows = []
+    if plan["moving"]:
+        rows.append([_rg_btn("✅ Apply", f"rg:{uid}:fy{arg}"), _rg_btn("🔄 Refresh", f"rg:{uid}:fv{arg}"),
+                     _rg_btn("❌ Cancel", f"rg:{uid}:x")])
+    if back:
+        rows.append(_rg_nav_row(uid, back))
+    return rg_chunks(lines), rows
+
+
+async def rg_run_job(query, context, job_id, title):
+    """Run a saved move job to the end in small batches, with progress in the same message. Returns True when finished.
+    A stop halfway leaves everything consistent: the Continue button resumes the same job."""
+    uid = query.from_user.id
+    lock = context.application.bot_data.setdefault("code_job_lock", asyncio.Lock())
+    if lock.locked():
+        await _rg_edit(query, "⏳ Another code move is running right now. Wait for it to finish, then try again.")
+        return False
+    async with lock:
+        info = await asyncio.to_thread(mongo_db.get_move_job, job_id)
+        total = info["total"] if info else 0
+        await _rg_edit(query, f"⏳ {title}…\n{info['done'] if info else 0}/{total} characters moved. Please wait.")
+        while True:
+            try:
+                res = await asyncio.to_thread(mongo_db.run_move_job, job_id, 40)
+            except Exception as e:
+                print("Move job error:", repr(e))
+                now = await asyncio.to_thread(mongo_db.get_move_job, job_id)
+                await _rg_edit(query, f"❌ Stopped: {e}\n{now['done'] if now else '?'}/{total} characters were moved. "
+                                      "Nothing is broken; tap Continue to carry on.",
+                               [[_rg_btn("🔁 Continue", f"rg:{uid}:jr:{job_id}"), _rg_btn("📋 Ranges", f"rg:{uid}:l:r:0"),
+                                 _rg_btn("❌ Close", f"rg:{uid}:x")]])
+                return False
+            if res["finished"]:
+                return True
+            await _rg_edit(query, f"⏳ {title}…\n{res['done']}/{res['total']} characters moved. Please wait.")
+
+
+async def rg_fill_apply(query, context, user, chat, h):
+    """Apply /fillranges (the ✅ Apply button): re-plan with the current data, save the job, run it."""
+    only = await asyncio.to_thread(mongo_db.anime_by_hash, h) if h else None
+    plan = await asyncio.to_thread(mongo_db.plan_fill_ranges, _rg_spawned(context), only)
+    if not plan["steps"]:
+        await _rg_edit(query, "✅ Nothing to move: every character is already inside its anime's range.")
+        return
+    job_id = await asyncio.to_thread(mongo_db.create_move_job, "fill", plan["steps"], [], user.id)
+    if not await rg_run_job(query, context, job_id, "Filling ranges"):
+        return
+    text = f"✅ Ranges filled\n{plan['moving']} character(s) moved into their anime's range."
+    if plan["skipped"]:
+        text += "\nSkipped (range too small): " + ", ".join(plan["skipped"]) + ". Extend them, then run /fillranges again."
+    if plan["deferred"]:
+        text += f"\n{plan['deferred']} spawned character(s) were skipped; run /fillranges again later."
+    await _rg_edit(query, text)
+    await log_range_change(context, user, chat, "fillranges", f"{plan['moving']} characters moved into their ranges")
+
+
+async def rg_extend_offer(uid, name, start, end):
+    """A range that grows into the next one: ([text], rows) offering to shift the following ranges, or None when this is
+    not an extension of an existing range."""
+    plan = await asyncio.to_thread(mongo_db.plan_range_extend, name, start, end)
+    cur = await asyncio.to_thread(mongo_db.get_range, name)
+    s_, e_ = mongo_db.parse_code(start), mongo_db.parse_code(end)
+    if cur is None or s_ is None or e_ is None or s_ != cur["start_code"] or e_ <= cur["end_code"]:
+        return None                                    # only a range that keeps its start and grows its end can shift the next ones
+    head = f"❌ {cur['anime_name']} {_rg_span(s_, e_)} runs into the next range."
+    if not plan["ok"]:
+        return head + "\n⚠️ " + plan["error"], None
+    lines = [head, "Shift the following ranges up so everything still fits? Their characters keep their position:"]
+    for i, sh in enumerate(plan["shifts"], 1):
+        lines.append(f"{i}. {sh['name']}: {_rg_span(*sh['old'])} → {_rg_span(*sh['new'])} (+{sh['shift']}, {sh['chars']} characters)")
+    lines.append(f"Characters to move: {plan['moving']}")
+    h = mongo_db.anime_hash(cur["anime_name"])
+    rows = [[_rg_btn("✅ Shift & move", f"rg:{uid}:xs:{h}:{s_}:{e_}"), _rg_btn("📋 Ranges", f"rg:{uid}:l:r:0"),
+             _rg_btn("❌ Cancel", f"rg:{uid}:x")]]
+    return "\n".join(lines), rows
+
+
+async def rg_extend_apply(query, context, user, chat, h, new_start, new_end):
+    """Apply a range extension with shifting (the ✅ Shift & move button)."""
+    name = await asyncio.to_thread(mongo_db.anime_by_hash, h)
+    plan = await asyncio.to_thread(mongo_db.plan_range_extend, name, new_start, new_end, _rg_spawned(context)) if name else None
+    if not plan or not plan["ok"]:
+        await _rg_edit(query, "❌ " + ((plan or {}).get("error") or "That range no longer exists.") + "\nNothing was changed.")
+        return
+    job_id = await asyncio.to_thread(mongo_db.create_move_job, "extend", plan["steps"], plan["ranges_after"], user.id)
+    if not await rg_run_job(query, context, job_id, "Shifting ranges"):
+        return
+    lines = [f"✅ Range extended\n{name}: now {_rg_span_sp(new_start, new_end)}"]
+    lines += [f"{sh['name']}: {_rg_span(*sh['old'])} → {_rg_span(*sh['new'])}" for sh in plan["shifts"]]
+    lines.append(f"{plan['moving']} character(s) moved with their ranges.")
+    await _rg_edit(query, "\n".join(lines))
+    await log_range_change(context, user, chat, "setrange", f"{name} {_rg_fc(new_start)} {_rg_fc(new_end)} (following ranges shifted)")
+
+
+async def rg_resume_job(query, context, user, chat, job_id):
+    """The 🔁 Continue button after a stopped job."""
+    info = await asyncio.to_thread(mongo_db.get_move_job, job_id)
+    if info is None:
+        await _rg_edit(query, "That job no longer exists.")
+        return
+    if info["status"] == "done":
+        await _rg_edit(query, "✅ That job is already finished.")
+        return
+    if not await rg_run_job(query, context, job_id, "Continuing"):
+        return
+    await _rg_edit(query, f"✅ Finished\n{info['total']} characters were moved.")
+    await log_range_change(context, user, chat,
+                           {"fill": "fillranges", "undo": "undocodes"}.get(info["kind"], "setrange"),
+                           f"code move finished ({info['total']} characters)")
+
+
+async def fillranges_command(update, context):
+    """/fillranges [anime] - preview, then move every character into the range of its anime (PM only)."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not _rg_allowed(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /fillranges can only be used in the bot's PM (private chat).")
+        return
+    query = " ".join(context.args or []).strip()
+    only = None
+    if query:
+        res = await asyncio.to_thread(mongo_db.resolve_anime, query)
+        if res["status"] not in ("exact", "one"):
+            chunks, rows = await rg_lookup_view("r", query, user.id)
+            await rg_reply(msg, chunks, rows)
+            return
+        only = res["name"]
+    chunks, rows = await rg_fill_view(user.id, context, only)
+    await rg_reply(msg, chunks, rows)
+
+
+async def rg_undo_view(uid, back=None):
+    """([text], rows) of the 'undo the last code move' screen."""
+    last = await asyncio.to_thread(mongo_db.get_last_move_job)
+    lines = ["↩ Undo last code move", ""]
+    rows = []
+    if last is None:
+        lines.append("No code move has been run yet.")
+    elif not last["can_undo"]:
+        lines.append(last["reason"])
+    else:
+        what = {"fill": "Fill ranges", "extend": "Range shift"}.get(last["kind"], str(last["kind"]))
+        when = str(last["created_at"] or "").replace("T", " ")[:16]
+        state = "finished" if last["status"] == "done" else "stopped halfway"
+        lines += [f"Last move: {what} ({when}, {state})",
+                  f"Characters moved: {last['done']} of {last['total']}", "",
+                  "Undo puts those characters back on their old codes and restores the ranges as they were. "
+                  "It only works if nobody changed those characters in the meantime."]
+        rows.append([_rg_btn("↩ Undo it", f"rg:{uid}:uy:{last['id']}"), _rg_btn("🔄 Refresh", f"rg:{uid}:uv"),
+                     _rg_btn("❌ Cancel", f"rg:{uid}:x")])
+    if back:
+        rows.append(_rg_nav_row(uid, back))
+    return "\n".join(lines), rows
+
+
+async def rg_undo_apply(query, context, user, chat, job_id):
+    """The ↩ Undo it button: only the latest move can be undone, and only once."""
+    last = await asyncio.to_thread(mongo_db.get_last_move_job)
+    if not last or last["id"] != job_id or not last["can_undo"]:
+        await _rg_edit(query, "That code move can no longer be undone (a newer move exists, or it was already undone).")
+        return
+    undo_id = await asyncio.to_thread(mongo_db.create_undo_job, job_id, user.id)
+    if not await rg_run_job(query, context, undo_id, "Undoing the code move"):
+        return
+    await _rg_edit(query, f"✅ Undone\n{last['done']} character(s) are back on their old codes and the ranges were restored.")
+    await log_range_change(context, user, chat, "undocodes", f"undid the last code move ({last['done']} characters)")
+
+
+async def undocodes_command(update, context):
+    """/undocodes - undo the last /fillranges or range shift (PM only, with a confirmation button)."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not _rg_allowed(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /undocodes can only be used in the bot's PM (private chat).")
+        return
+    text, rows = await rg_undo_view(user.id)
+    await safe_reply_text(msg, text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+
+
+async def exportdb_command(update, context):
+    """/exportdb [collection ...] - Owner only, PM only: the whole database (or the named collections) as zip file(s) of
+    JSON files, sent to your PM. Nothing is stored on the bot."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not is_owner(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /exportdb can only be used in the bot's PM (private chat).")
+        return
+    lock = context.application.bot_data.setdefault("export_lock", asyncio.Lock())
+    if lock.locked():
+        await safe_reply_text(msg, "⏳ An export is already running. Please wait for it to finish.")
+        return
+    import shutil
+    import tempfile
+    only = list(context.args or []) or None
+    async with lock:
+        await safe_reply_text(msg, "⏳ Exporting the database… this can take a minute. Please wait.")
+        tmp = tempfile.mkdtemp(prefix="exportdb_")
+        try:
+            result = await asyncio.to_thread(mongo_db.export_database, tmp, only)
+            if not result["collections"]:
+                await safe_reply_text(msg, "❌ No collection matches those names. Nothing was exported.")
+                return
+            parts = result["parts"]
+            db_name = os.getenv("MONGO_DB_NAME", "anime_bot")
+            stamp = datetime.now(IST).strftime("%Y-%m-%d_%H-%M")
+            for i, path in enumerate(parts, 1):
+                caption = (f"Database backup {i}/{len(parts)} ({db_name}, {stamp} IST). Keep these files private and "
+                           "save them outside Telegram too (for example Google Drive).")
+                with open(path, "rb") as fh:
+                    await context.bot.send_document(chat_id=user.id, document=fh,
+                                                    filename=f"{db_name}_{stamp}_part{i}of{len(parts)}.zip",
+                                                    caption=caption, write_timeout=300, read_timeout=300)
+            lines = [f"✅ Export finished: {result['docs']} documents in {len(result['collections'])} collection(s), "
+                     f"sent as {len(parts)} file(s).", ""]
+            lines += [f"{name}: {count}" for name, count in result["collections"].items()]
+            lines += ["", "The files are JSON (one document per line), so they can be read or restored later. "
+                          "Save all parts before you run /fillranges."]
+            for chunk in rg_chunks(lines):
+                await safe_reply_text(msg, chunk)
+        except Exception as e:
+            print("exportdb error:", repr(e))
+            await safe_reply_text(msg, "❌ The export failed. Please try again (open a private chat with me and press Start "
+                                       "if you have not yet). Nothing was changed.")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------------------------------
+# /importdb (Owner, PM): restore from the zip parts that /exportdb produced.
+#   1. /importdb [collection ...]   2. send every zip part   3. ✅ Done -> preview (nothing changed yet)
+#   4. ➕ Add missing only (safe) or ♻ Replace (sends a safety copy first, then needs the word REPLACE)
+# ---------------------------------------------------------------------------------------------------
+IMPORT_TTL = 1800                       # the restore session expires after 30 minutes
+IMPORT_MAX_DOWNLOAD = 20 * 1024 * 1024  # a bot can only download files up to 20 MB (exports are split below that)
+_imp_state = {}                         # owner id -> {dir, files, only, step, exp}
+
+
+def _imp_cleanup(uid):
+    import shutil
+    st = _imp_state.pop(uid, None)
+    if st:
+        shutil.rmtree(st["dir"], ignore_errors=True)
+
+
+def _imp_live(uid):
+    st = _imp_state.get(uid)
+    if st and time.monotonic() > st["exp"]:
+        _imp_cleanup(uid)
+        return None
+    if st:
+        st["exp"] = time.monotonic() + IMPORT_TTL
+    return st
+
+
+def _imp_rows(uid, files):
+    row = [_rg_btn("✅ Done", f"imp:{uid}:d"), _rg_btn("🗑 Clear files", f"imp:{uid}:c"), _rg_btn("❌ Cancel", f"imp:{uid}:x")]
+    return [row] if files else [[_rg_btn("❌ Cancel", f"imp:{uid}:x")]]
+
+
+async def importdb_command(update, context):
+    """/importdb [collection ...] - Owner only, PM only. Starts a restore session; nothing changes until you confirm."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not is_owner(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /importdb can only be used in the bot's PM (private chat).")
+        return
+    import tempfile
+    _imp_cleanup(user.id)
+    only = list(context.args or []) or None
+    _imp_state[user.id] = {"dir": tempfile.mkdtemp(prefix="importdb_"), "files": [], "only": only, "step": "collect",
+                           "exp": time.monotonic() + IMPORT_TTL, "inspected": None}
+    scope = ("only: " + ", ".join(only)) if only else "every collection in the backup"
+    await safe_reply_text(
+        msg,
+        "📥 Restore the database\n\n"
+        f"Restoring {scope}.\n"
+        "Send the backup .zip file(s) from /exportdb here, one after another (all parts, any order). "
+        "Then tap Done. I will show what they contain before anything changes.\n\n"
+        "Files must be the parts made by /exportdb (each is at most 15 MB).",
+        reply_markup=InlineKeyboardMarkup(_imp_rows(user.id, False)))
+
+
+async def importdb_file(update, context):
+    """A .zip sent while a restore session waits for backup files."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not msg.document:
+        return
+    st = _imp_live(user.id)
+    if not st or st["step"] != "collect" or not is_owner(user.id):
+        return
+    doc = msg.document
+    if not (doc.file_name or "").lower().endswith(".zip"):
+        await safe_reply_text(msg, "⚠️ Send the .zip files made by /exportdb.")
+        return
+    if doc.file_size and doc.file_size > IMPORT_MAX_DOWNLOAD:
+        await safe_reply_text(msg, "⚠️ That file is bigger than 20 MB, which a bot cannot download. Export again with "
+                                   "the current /exportdb (its parts are small enough).")
+        return
+    import zipfile
+    path = os.path.join(st["dir"], f"{len(st['files']) + 1:03d}.zip")
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        await tg_file.download_to_drive(path)
+        if not zipfile.is_zipfile(path):
+            raise ValueError("not a zip")
+    except Exception as e:
+        print("importdb download error:", repr(e))
+        await safe_reply_text(msg, "⚠️ I could not read that file. Please send it again.")
+        return
+    st["files"].append(path)
+    await safe_reply_text(
+        msg, f"📦 Received {len(st['files'])} file(s). Send the next part, or tap Done when you have sent them all.",
+        reply_markup=InlineKeyboardMarkup(_imp_rows(user.id, True)))
+
+
+async def _imp_preview(query, uid, st):
+    inspected = await asyncio.to_thread(mongo_db.inspect_backup, st["files"], st["only"])
+    st["inspected"] = inspected
+    lines = ["📥 Backup check (nothing has been changed yet)", ""]
+    man = inspected["manifest"]
+    if man:
+        lines.append(f"Database: {man.get('database')} - exported {man.get('exported_at_ist')} IST")
+    lines.append(f"Files received: {len(st['files'])}")
+    lines.append("")
+    if inspected["collections"]:
+        lines += [f"{n}: {c} documents" for n, c in sorted(inspected["collections"].items())]
+    else:
+        lines.append("No collections found in these files.")
+    if inspected["problems"]:
+        lines += ["", "⚠️ Problems:"] + [f"- {p}" for p in inspected["problems"][:10]]
+        lines += ["", "Send the missing parts (or tap Clear files and start again), then tap Done."]
+        await _rg_edit(query, "\n".join(lines), _imp_rows(uid, True))
+        return
+    st["step"] = "mode"
+    lines += ["", "Choose how to restore:",
+              "➕ Add missing only: puts back documents that are gone; everything that exists stays untouched (safe).",
+              "♻ Replace: makes these collections exactly like the backup. A safety copy of the current data is sent "
+              "to your PM first."]
+    await _rg_edit(query, "\n".join(lines),
+                   [[_rg_btn("➕ Add missing only", f"imp:{uid}:m"), _rg_btn("♻ Replace", f"imp:{uid}:r"),
+                     _rg_btn("❌ Cancel", f"imp:{uid}:x")]])
+
+
+async def _imp_run(context, user, mode, status_edit):
+    """Restore every collection of the inspected backup. status_edit(text) updates the status message."""
+    st = _imp_state.get(user.id)
+    inspected = st["inspected"]
+    lock = context.application.bot_data.setdefault("import_lock", asyncio.Lock())
+    job_lock = context.application.bot_data.get("code_job_lock")
+    if lock.locked() or (job_lock is not None and job_lock.locked()):
+        await status_edit("⏳ Another restore or code move is running. Wait for it to finish, then try again.")
+        return
+    async with lock:
+        names = sorted(inspected["collections"])
+        results = {}
+        try:
+            if mode == "replace":
+                import shutil
+                import tempfile
+                await status_edit("⏳ Saving a safety copy of the current data first…")
+                tmp = tempfile.mkdtemp(prefix="safety_")
+                try:
+                    safety = await asyncio.to_thread(mongo_db.export_database, tmp, names)
+                    for i, path in enumerate(safety["parts"], 1):
+                        with open(path, "rb") as fh:
+                            await context.bot.send_document(
+                                chat_id=user.id, document=fh, filename=f"safety_copy_before_restore_part{i}of{len(safety['parts'])}.zip",
+                                caption="Safety copy of the current data, made before the restore. Keep it.",
+                                write_timeout=300, read_timeout=300)
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+            for i, name in enumerate(names, 1):
+                await status_edit(f"⏳ Restoring… {i}/{len(names)}: {name}")
+                results[name] = await asyncio.to_thread(mongo_db.import_collection, name, inspected["members"][name], mode)
+        except Exception as e:
+            print("importdb error:", repr(e))
+            done = ", ".join(results) or "none"
+            await status_edit(f"❌ The restore stopped: {e}\nCollections finished: {done}.\n"
+                              "Nothing else was changed. You can run /importdb again (Add missing only is safe to repeat).")
+            _imp_cleanup(user.id)
+            return
+        lines = ["✅ Restore finished" + (" (replace)" if mode == "replace" else " (add missing only)"), ""]
+        for name, r in results.items():
+            lines.append(f"{name}: {r['inserted']} restored" + (f", {r['skipped']} already existed" if r["skipped"] else ""))
+        lines += ["", "Restart the bot on Render now so it reloads the restored data, then check /range and a few characters."]
+        await status_edit("\n".join(lines))
+        _imp_cleanup(user.id)
+
+
+async def importdb_callback(update, context):
+    """Buttons of /importdb (Owner only, session owner only)."""
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split(":")
+    try:
+        if len(parts) < 3 or not parts[1].isdigit():
+            await query.answer(HELP_STALE_TEXT, show_alert=True)
+            return
+        uid, act = int(parts[1]), parts[2]
+        if user.id != uid:
+            await query.answer(NOT_YOURS_TEXT, show_alert=True)
+            return
+        if not is_owner(uid):
+            await deny_callback(query)
+            return
+        st = _imp_live(uid)
+        if act == "x":
+            _imp_cleanup(uid)
+            await query.answer()
+            await _rg_edit(query, "❌ Cancelled. Nothing was changed.")
+            return
+        if st is None:
+            await query.answer("⌛ This restore session expired. Run /importdb again.", show_alert=True)
+            return
+        await query.answer()
+        if act == "c":
+            import shutil
+            shutil.rmtree(st["dir"], ignore_errors=True)
+            os.makedirs(st["dir"], exist_ok=True)
+            st.update(files=[], step="collect", inspected=None)
+            await _rg_edit(query, "🗑 Files cleared. Send the backup .zip file(s) again.", _imp_rows(uid, False))
+        elif act == "d":
+            if not st["files"]:
+                await _rg_edit(query, "Send the backup .zip file(s) first.", _imp_rows(uid, False))
+                return
+            await _rg_edit(query, "⏳ Checking the backup files…")
+            await _imp_preview(query, uid, st)
+        elif act == "m" and st["step"] == "mode":
+            await _imp_run(context, user, "merge", lambda text: _rg_edit(query, text))
+        elif act == "r" and st["step"] == "mode":
+            st["step"] = "confirm"
+            names = ", ".join(sorted(st["inspected"]["collections"]))
+            await _rg_edit(query,
+                           f"⚠️ Replace will EMPTY these collections and fill them from the backup:\n{names}\n\n"
+                           "A safety copy of the current data is sent to your PM first.\n"
+                           "To continue, send the word REPLACE now. Any other message is ignored - tap Cancel to stop.",
+                           [[_rg_btn("❌ Cancel", f"imp:{uid}:x")]])
+            st["status_msg"] = (query.message.chat_id, query.message.message_id)
+        else:
+            await _rg_edit(query, "That step is no longer available. Run /importdb again.")
+    except Exception as e:
+        print("importdb callback error:", repr(e))
+        try:
+            await query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def importdb_confirm_text(update, context):
+    """The word REPLACE after choosing Replace."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user:
+        return
+    st = _imp_state.get(user.id)
+    if not st or st["step"] != "confirm":
+        return
+    if not is_owner(user.id) or _imp_live(user.id) is None:
+        return
+    if (msg.text or "").strip() != "REPLACE":
+        await safe_reply_text(msg, "Send exactly REPLACE to continue, or tap Cancel.")
+        return
+    chat_id, message_id = st["status_msg"]
+    st["step"] = "running"
+
+    async def _status(text):
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                print("importdb status error:", repr(e))
+
+    await _imp_run(context, user, "replace", _status)
 
 
 async def editcode_command(update, context):
@@ -4181,8 +4709,9 @@ def _rg_home_view(uid, st):
     text = "📏 Range Panel\n\nPick an action. Everything happens in this one message."
     buttons = [_rg_btn("➕ Set Range", f"rg:{uid}:sa:0"), _rg_btn("🗑 Delete Range", f"rg:{uid}:dl:0"),
                _rg_btn("📋 View Ranges", f"rg:{uid}:l:r:0"), _rg_btn("🔍 Search Anime", f"rg:{uid}:q"),
-               _rg_btn("🆓 Free Codes", f"rg:{uid}:fl:0"), _rg_btn("➡️ Next Code", f"rg:{uid}:nl:0")]
-    rows = _rg_grid(buttons, 3)
+               _rg_btn("🆓 Free Codes", f"rg:{uid}:fl:0"), _rg_btn("➡️ Next Code", f"rg:{uid}:nl:0"),
+               _rg_btn("🧩 Fill Ranges", f"rg:{uid}:fv"), _rg_btn("↩ Undo Moves", f"rg:{uid}:uv")]
+    rows = _rg_grid(buttons, 4)
     rows.append(_rg_nav_row(uid, f"help:{uid}:{role}:range"))
     return text, rows
 
@@ -4354,7 +4883,7 @@ async def range_callback(update, context):
                     st["step"] = None
                     await _rg_edit(query, text, rows or [[_rg_btn("📏 Panel", f"rg:{uid}:p:{st['role']}")]])
                 else:
-                    await _rg_edit(query, text, [_rg_nav_row(uid, f"rg:{uid}:se")])
+                    await _rg_edit(query, text, rows or [_rg_nav_row(uid, f"rg:{uid}:se")])
             return
 
         if act == "l":                                           # numbered list page: l:<kind>:<page>
@@ -4391,6 +4920,46 @@ async def range_callback(update, context):
             text = await rg_do_delete(context, user, chat, name)
             await query.answer()
             await _rg_edit(query, text, [[_rg_btn("⬅ Back", f"rg:{uid}:dl:0")]] if st else None)
+            return
+
+        if act in ("fv", "fy"):                                  # /fillranges preview and apply: fv|fy[:<anime hash>]
+            if chat is None or chat.type != "private":
+                await query.answer("Use Fill Ranges in a private chat with the bot.", show_alert=True)
+                return
+            await query.answer()
+            if act == "fv":
+                only = await asyncio.to_thread(mongo_db.anime_by_hash, arg) if arg else None
+                st = _rg_panel_state(query)
+                chunks, rows = await rg_fill_view(uid, context, only, f"rg:{uid}:p:{st['role']}" if st else None)
+                await rg_show(query, context, chunks, rows)
+            else:
+                await rg_fill_apply(query, context, user, chat, arg)
+            return
+
+        if act == "xs":                                          # shift the following ranges: xs:<hash>:<start>:<end>
+            if len(parts) < 6 or not (parts[4].isdigit() and parts[5].isdigit()):
+                await query.answer(HELP_STALE_TEXT, show_alert=True)
+                return
+            await query.answer()
+            await rg_extend_apply(query, context, user, chat, arg, int(parts[4]), int(parts[5]))
+            return
+
+        if act in ("uv", "uy"):                                  # undo the last code move: uv = view, uy:<job id> = undo it
+            if chat is None or chat.type != "private":
+                await query.answer("Use Undo in a private chat with the bot.", show_alert=True)
+                return
+            await query.answer()
+            if act == "uv":
+                st = _rg_panel_state(query)
+                text, rows = await rg_undo_view(uid, f"rg:{uid}:p:{st['role']}" if st else None)
+                await _rg_edit(query, text, rows)
+            else:
+                await rg_undo_apply(query, context, user, chat, arg)
+            return
+
+        if act == "jr":                                          # continue a stopped job
+            await query.answer()
+            await rg_resume_job(query, context, user, chat, arg)
             return
 
         if act in ("mp", "mc", "mk"):                            # after a range moved: mp:<hash>:<old start>:<old end>
@@ -4447,6 +5016,9 @@ async def range_panel_input(update, context):
             view = await rg_step_view("se", st, uid, f"⚠️ The ending code must not be smaller than {_rg_fc(st['start'])}.")
         else:
             other = await asyncio.to_thread(mongo_db.find_overlap, st["anime"], st["start"], code)
+            existing = await asyncio.to_thread(mongo_db.get_range, st["anime"])
+            if other and existing is not None and st["start"] == existing["start_code"] and code > existing["end_code"]:
+                other = None                                   # extending an existing range: the shift is offered at Confirm
             if other:
                 view = await rg_step_view("se", st, uid,
                                           f"⚠️ {_rg_span(st['start'], code)} overlaps with {other['anime_name']} "
@@ -12865,6 +13437,9 @@ async def cancel_everything(update, context):
         stopped.append("Change Worth input")
     if _rg_state.pop(uid, None) is not None:
         stopped.append("Range Panel")
+    if uid in _imp_state:
+        _imp_cleanup(uid)
+        stopped.append("Restore session")
     try:
         if theme.cancel_input(uid):
             stopped.append("Customize Bot input")
@@ -12904,7 +13479,7 @@ LOG_CATEGORIES = {
                   "Spawns, catches, adding/editing/deleting characters, gifts, collection changes",
                   {"spawn", "callcharacter", "add", "addcharacter", "addphoto", "editphoto",
                    "addevo", "editevo", "delevo", "edit", "editcharacter", "gift", "removechar", "delete", "discontinue", "continue", "clearspawn",
-                   "setrange", "delrange", "editcode"}),
+                   "setrange", "delrange", "editcode", "fillranges", "undocodes"}),
     "shop": ("Shop activities", "Opening and using the daily character shop", {"shop"}),
     "economy": ("Economy", "Daily rewards, Berry transfers, selling, exchanging and transferring characters, redeem codes",
                 {"daily", "berrytransfer", "berry", "sell", "exchange", "transfer", "redeem"}),
@@ -12951,7 +13526,7 @@ LOG_IGNORED_COMMANDS = {
     "logmap", "unlogmap", "logmappings", "logroute", "unlogroute", "logroutes", "logdefault",
     # Range commands: read-only ones are never logged; /setrange and /delrange are logged by log_range_change()
     # (Executive: Yes/No prompt after the whole action succeeded; Owner: never).
-    "range", "ranges", "freecode", "freecodes", "nextcode", "setrange", "delrange",
+    "range", "ranges", "freecode", "freecodes", "nextcode", "setrange", "delrange", "fillranges", "undocodes",
 } | {c.strip().lstrip("/").lower() for c in os.getenv("LOG_IGNORED_EXTRA", "").split(",") if c.strip()}
 LOG_COMMANDS = {"setlog", "unsetlog", "log", "nolog", "logcategories", "logchannel", "addcategory", "removecategory",
                 "logmap", "unlogmap", "logmappings", "logroute", "unlogroute", "logroutes", "logdefault"}
@@ -14404,6 +14979,10 @@ COMMANDS = {
     "freecode": "Owner/Executive: show used and free codes (all anime, or /freecode <anime>)",
     "nextcode": "Owner/Executive: show the next free code (/nextcode [anime] [count])",
     "editcode": "Owner/Executive: change a character's code directly (/editcode <code/name> <new code>)",
+    "fillranges": "Owner/Executive: move every character into its anime's code range (/fillranges [anime])",
+    "undocodes": "Owner/Executive: undo the last /fillranges or range shift",
+    "exportdb": "Owner: send the whole database as zip file(s) to your PM (/exportdb [collections])",
+    "importdb": "Owner: restore the database from /exportdb zip files (/importdb [collections])",
 }
 COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 COMMANDS.update(rewards.COMMAND_DESCRIPTIONS)
@@ -15223,6 +15802,7 @@ EXECUTIVE_COMMANDS = {
     "btransfer", "unbtransfer", "setrules", "resetrules", "dm", "dmhistory",
     "setrange", "delrange", "range", "ranges", "freecode", "freecodes", "nextcode",      # anime code ranges (Owner + Executive)
     "editcode",                                                                          # change a character's code directly
+    "fillranges", "undocodes",                                                           # move characters into their ranges / undo that
 } | badge_banner.STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
@@ -15238,6 +15818,8 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler(["freecode", "freecodes"], freecode_command))
     app.add_handler(CommandHandler("nextcode", nextcode_command))
     app.add_handler(CommandHandler("editcode", editcode_command))
+    app.add_handler(CommandHandler("fillranges", fillranges_command))
+    app.add_handler(CommandHandler("undocodes", undocodes_command))
     app.add_handler(CommandHandler("restrictions", restrictions_list))
     app.add_handler(CommandHandler("botoff", bot_off))
     app.add_handler(CommandHandler("spawnoff", spawn_off_command))
@@ -15305,7 +15887,7 @@ OWNER_COMMANDS = {
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
-    "logroute", "unlogroute", "logroutes", "logdefault",
+    "logroute", "unlogroute", "logroutes", "logdefault", "exportdb", "importdb",
 } | rewards.OWNER_COMMANDS       # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
@@ -15317,6 +15899,11 @@ def register_owner_commands(app):
     app.add_handler(CommandHandler("finduser", finduser))
     app.add_handler(CommandHandler("restoreuser", restoreuser))
     app.add_handler(CommandHandler("moveuser", moveuser))
+    app.add_handler(CommandHandler("exportdb", exportdb_command))
+    app.add_handler(CommandHandler("importdb", importdb_command))
+    app.add_handler(CallbackQueryHandler(importdb_callback, pattern=r"^imp:"))
+    app.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.PRIVATE, importdb_file), group=54)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, importdb_confirm_text), group=55)
     app.add_handler(CallbackQueryHandler(data_confirm_callback, pattern=r"^dconf:(go|no):[0-9a-f]{10}$"))
     app.add_handler(CommandHandler("discontinue", discontinue_command))
     app.add_handler(CommandHandler("continue", continue_command))
