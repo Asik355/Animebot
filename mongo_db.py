@@ -335,6 +335,7 @@ def ensure_indexes():
     )
     col(CHARACTERS).create_index([("code_int", ASCENDING)], name="code_int")
     col(CHARACTERS).create_index([("rarity", ASCENDING)], name="rarity")
+    col("anime_ranges").create_index([("anime_key", ASCENDING)], unique=True, name="uniq_anime_key")
     col(COLLECTIONS).create_index([("user_id", ASCENDING), ("character_code", ASCENDING)], name="user_char")
     col(COLLECTIONS).create_index([("character_code", ASCENDING)], name="char")
     col(GROUPS).create_index([("approved", ASCENDING)], name="approved")
@@ -2077,3 +2078,425 @@ def sh_spawn_row(history_id):
     """(spawned_at, caught_by) for one spawn, or None."""
     d = col(SH).find_one({"_id": int(history_id)}, {"spawned_at": 1, "caught_by": 1})
     return (d.get("spawned_at"), d.get("caught_by")) if d else None
+
+
+# ==========================================================================
+# ANIME CODE RANGES (collection `anime_ranges`)
+# Every anime owns a reserved block of 4-digit character codes (like a serial): Naruto 0001-0200, Bleach 0201-0400.
+# Document: {anime_name, start_code, end_code, anime_key (case-folded name, unique), updated_at (IST), updated_by}.
+# Typed commands (/range, /freecode, /nextcode, /setrange, /delrange) and the Range Panel buttons in bot.py call
+# THESE functions, so both always show identical results. A code counts as "used" when ANY character owns it.
+# ==========================================================================
+import bisect
+import difflib
+import hashlib
+
+ANIME_RANGES = "anime_ranges"
+CODE_MIN = 1
+CODE_MAX = 9999
+_IST = timezone(timedelta(hours=5, minutes=30))          # Asia/Kolkata
+
+
+def fmt_code(n):
+    """4-digit code with leading zeros: 7 -> '0007'."""
+    return f"{int(n):04d}"
+
+
+def parse_code(value):
+    """'0001' / '1' / ' 0200 ' -> int 1..9999, or None when it is not a valid code."""
+    text = str(value or "").strip()
+    if not text.isdigit() or len(text) > 4:
+        return None
+    n = int(text)
+    return n if CODE_MIN <= n <= CODE_MAX else None
+
+
+def anime_key(name):
+    """Matching key: case-insensitive, extra spaces ignored."""
+    return " ".join(str(name or "").split()).casefold()
+
+
+def anime_hash(name):
+    """Short stable id of an anime name for button callback data (names are too long for it)."""
+    return hashlib.sha1(anime_key(name).encode("utf-8")).hexdigest()[:10]
+
+
+def compress_codes(codes):
+    """Sorted ints -> [(first, last), ...] runs: [71, 72, 73, 75] -> [(71, 73), (75, 75)]."""
+    runs = []
+    for c in sorted(set(int(x) for x in codes)):
+        if runs and c == runs[-1][1] + 1:
+            runs[-1][1] = c
+        else:
+            runs.append([c, c])
+    return [(a, b) for a, b in runs]
+
+
+def format_runs(runs):
+    """[(71, 74), (76, 200)] -> '0071-0074, 0076-0200' (a single code is shown alone)."""
+    return ", ".join(fmt_code(a) if a == b else f"{fmt_code(a)}-{fmt_code(b)}" for a, b in runs)
+
+
+def _range_row(d):
+    return {"anime_name": d.get("anime_name"), "start_code": int(d.get("start_code")), "end_code": int(d.get("end_code")),
+            "anime_key": d.get("anime_key") or anime_key(d.get("anime_name"))}
+
+
+@retry_read
+def get_ranges():
+    """Every range, ordered by start code: [{anime_name, start_code, end_code, anime_key}]."""
+    rows = [_range_row(d) for d in col(ANIME_RANGES).find({})]
+    rows.sort(key=lambda r: (r["start_code"], r["anime_key"]))
+    return rows
+
+
+@retry_read
+def get_range(anime):
+    """The range of one anime (exact name, case-insensitive), or None."""
+    d = col(ANIME_RANGES).find_one({"anime_key": anime_key(anime)})
+    return _range_row(d) if d else None
+
+
+def _numeric_code(d):
+    """Integer value of a character's code, or None when the code is not numeric."""
+    code = str(d.get("code") or "")
+    if code.isdigit():
+        return int(code)
+    try:
+        n = int(d.get("code_int") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return n or None
+
+
+def _used_codes():
+    """Sorted list of every numeric code currently owned by a character (normal or evolution)."""
+    out = []
+    for d in _chars():
+        n = _numeric_code(d)
+        if n is not None:
+            out.append(n)
+    return sorted(set(out))
+
+
+def canonical_anime_name(name):
+    """The spelling already used by characters for this anime (so 'naruto' becomes 'Naruto'); else the cleaned input."""
+    key = anime_key(name)
+    for d in _chars():
+        a = d.get("anime")
+        if a and anime_key(a) == key:
+            return " ".join(str(a).split())
+    return " ".join(str(name or "").split())
+
+
+def all_anime_names():
+    """Every known anime (from ranges AND characters), spelling of its range first, sorted A-Z."""
+    names = {}
+    for d in _chars():
+        a = " ".join(str(d.get("anime") or "").split())
+        if a:
+            names.setdefault(anime_key(a), a)
+    for r in get_ranges():
+        names[r["anime_key"]] = r["anime_name"]
+    return sorted(names.values(), key=lambda n: n.casefold())
+
+
+def anime_by_hash(h):
+    """Anime name for a callback hash (see anime_hash), or None."""
+    for name in all_anime_names():
+        if anime_hash(name) == h:
+            return name
+    return None
+
+
+def resolve_anime(query):
+    """
+    Shared name matching for every range command and button (case-insensitive, extra spaces ignored, multi-word ok).
+      {"status": "exact"|"one", "name": ...}   exact match, or exactly one partial match
+      {"status": "multi", "names": [...]}      several partial matches (shown as buttons)
+      {"status": "none", "closest": [...]}     nothing found: the 3 closest names
+    """
+    key = anime_key(query)
+    names = all_anime_names()
+    if not key or not names:
+        return {"status": "none", "closest": names[:3]}
+    by_key = {anime_key(n): n for n in names}
+    if key in by_key:
+        return {"status": "exact", "name": by_key[key]}
+    partial = [n for n in names if key in anime_key(n)]
+    if len(partial) == 1:
+        return {"status": "one", "name": partial[0]}
+    if len(partial) > 1:
+        return {"status": "multi", "names": partial}
+    close_keys = difflib.get_close_matches(key, list(by_key), n=3, cutoff=0.0)
+    return {"status": "none", "closest": [by_key[k] for k in close_keys]}
+
+
+def find_overlap(anime, start, end):
+    """The OTHER anime whose range overlaps start-end: {anime_name, start_code, end_code}, or None."""
+    key = anime_key(anime)
+    for r in get_ranges():
+        if r["anime_key"] != key and not (end < r["start_code"] or start > r["end_code"]):
+            return r
+    return None
+
+
+@retry_write
+def set_range(anime, start, end, user_id=None):
+    """
+    Create or update an anime's range. Returns
+      {"ok": True, "created": bool, "range": {...}, "previous": {...}|None}
+      {"ok": False, "error": "invalid"|"overlap", "message": text, "overlap": {...}|None}
+    """
+    name = canonical_anime_name(anime)
+    if not name:
+        return {"ok": False, "error": "invalid", "message": "Anime name is required.", "overlap": None}
+    s, e = parse_code(start), parse_code(end)
+    if s is None or e is None:
+        return {"ok": False, "error": "invalid", "message": f"Codes must be numbers from {fmt_code(CODE_MIN)} to {fmt_code(CODE_MAX)}.", "overlap": None}
+    if s > e:
+        return {"ok": False, "error": "invalid", "message": "The starting code must not be bigger than the ending code.", "overlap": None}
+    other = find_overlap(name, s, e)
+    if other:
+        return {"ok": False, "error": "overlap", "overlap": other,
+                "message": f"{name} ({fmt_code(s)}-{fmt_code(e)}) overlaps with {other['anime_name']} "
+                           f"({fmt_code(other['start_code'])}-{fmt_code(other['end_code'])})."}
+    key = anime_key(name)
+    previous = get_range(name)
+    stamp = datetime.now(_IST).replace(tzinfo=None).isoformat(timespec="seconds")
+    col(ANIME_RANGES).update_one(
+        {"anime_key": key},
+        {"$set": {"anime_name": name, "anime_key": key, "start_code": s, "end_code": e,
+                  "updated_at": stamp, "updated_by": int(user_id) if user_id is not None else None},
+         "$setOnInsert": {"created_at": stamp}},
+        upsert=True)
+    return {"ok": True, "created": previous is None, "previous": previous,
+            "range": {"anime_name": name, "start_code": s, "end_code": e, "anime_key": key}}
+
+
+@retry_write
+def delete_range(anime):
+    """Delete an anime's range (characters are not touched). True when a range was deleted."""
+    return col(ANIME_RANGES).delete_one({"anime_key": anime_key(anime)}).deleted_count > 0
+
+
+def _status_from(r, used_sorted):
+    s, e = r["start_code"], r["end_code"]
+    lo, hi = bisect.bisect_left(used_sorted, s), bisect.bisect_right(used_sorted, e)
+    used = used_sorted[lo:hi]
+    total = e - s + 1
+    used_set = set(used)
+    free_runs, cur = [], None
+    for c in range(s, e + 1):
+        if c in used_set:
+            if cur:
+                free_runs.append((cur, c - 1))
+                cur = None
+        elif cur is None:
+            cur = c
+    if cur:
+        free_runs.append((cur, e))
+    return {"name": r["anime_name"], "start": s, "end": e, "total": total,
+            "used": used, "used_count": len(used), "free_count": total - len(used),
+            "used_runs": compress_codes(used), "free_runs": free_runs}
+
+
+def range_status(anime):
+    """Used/free numbers of one anime's range, or None when it has no range. Keys: name, start, end, total, used,
+    used_count, free_count, used_runs, free_runs (runs are [(first, last)])."""
+    r = get_range(anime)
+    return _status_from(r, _used_codes()) if r else None
+
+
+def all_range_status():
+    """range_status() of every anime that has a range, ordered by start code (one character scan for all)."""
+    used = _used_codes()
+    return [_status_from(r, used) for r in get_ranges()]
+
+
+def next_free_codes(anime, count=1):
+    """
+    {"name", "start", "end", "codes": [next free codes], "free_count", "full": bool}, or None without a range.
+    """
+    st = range_status(anime)
+    if st is None:
+        return None
+    codes = []
+    for a, b in st["free_runs"]:
+        for c in range(a, b + 1):
+            codes.append(c)
+            if len(codes) >= max(1, int(count)):
+                break
+        if len(codes) >= max(1, int(count)):
+            break
+    return {"name": st["name"], "start": st["start"], "end": st["end"], "codes": codes,
+            "free_count": st["free_count"], "full": not codes}
+
+
+def code_owner_name(code):
+    """Name of the character that uses this code, or None."""
+    row = get_character_by_code(str(code))
+    return row[1] if row else None
+
+
+def check_code_for_anime(anime, code, exclude_code=None):
+    """
+    Add/edit validation of a 4-digit code against the anime's range.
+      {"status": "no_range"}                                  anime has no range (nothing is enforced)
+      {"status": "ok", ...}                                   inside the range and free
+      {"status": "outside", "name", "start", "end"}           outside the range
+      {"status": "taken", "name", "start", "end", "owner", "suggestions": [next 5 free codes]}
+    `exclude_code`: a character's own current code (editing) never counts as taken.
+    """
+    r = get_range(anime) if anime_key(anime) else None
+    if r is None:
+        return {"status": "no_range"}
+    n = parse_code(code)
+    base = {"name": r["anime_name"], "start": r["start_code"], "end": r["end_code"]}
+    if n is None or not (r["start_code"] <= n <= r["end_code"]):
+        return {"status": "outside", **base}
+    if exclude_code is not None and str(exclude_code) == fmt_code(n):
+        return {"status": "ok", **base}
+    owner = code_owner_name(fmt_code(n))
+    if owner is not None:
+        nxt = next_free_codes(r["anime_name"], 5)
+        return {"status": "taken", **base, "owner": owner, "suggestions": nxt["codes"] if nxt else []}
+    return {"status": "ok", **base}
+
+
+def code_range_report():
+    """
+    REPORT ONLY (changes nothing): characters whose code is outside their anime's range.
+    {"total": int, "with_range": int,
+     "outside": [{code, name, anime, start, end}],            anime has a range but the code is outside it
+     "no_range": {anime: {"count", "min", "max"}},             characters of anime that have no range yet
+     "no_anime": [{code, name}],                               characters with no anime set
+     "bad_code": [{code, name, anime}]}                        non-numeric / out-of-format codes
+    """
+    ranges = {r["anime_key"]: r for r in get_ranges()}
+    out = {"total": 0, "with_range": 0, "outside": [], "no_range": {}, "no_anime": [], "bad_code": []}
+    for d in _chars():
+        out["total"] += 1
+        code, name, anime = str(d.get("code") or ""), d.get("name"), " ".join(str(d.get("anime") or "").split())
+        n = _numeric_code(d)
+        if n is None:
+            out["bad_code"].append({"code": code, "name": name, "anime": anime})
+            continue
+        if not anime:
+            out["no_anime"].append({"code": code, "name": name})
+            continue
+        r = ranges.get(anime_key(anime))
+        if r is None:
+            info = out["no_range"].setdefault(anime, {"count": 0, "min": n, "max": n})
+            info["count"] += 1
+            info["min"], info["max"] = min(info["min"], n), max(info["max"], n)
+            continue
+        out["with_range"] += 1
+        if not (r["start_code"] <= n <= r["end_code"]):
+            out["outside"].append({"code": code, "name": name, "anime": r["anime_name"],
+                                   "start": r["start_code"], "end": r["end_code"]})
+    return out
+
+
+def outside_count(anime):
+    """How many existing characters of this anime have a code outside the anime's range (0 without a range)."""
+    r = get_range(anime)
+    if r is None:
+        return 0
+    key = anime_key(anime)
+    total = 0
+    for d in _chars():
+        if anime_key(d.get("anime")) != key:
+            continue
+        n = _numeric_code(d)
+        if n is None or not (r["start_code"] <= n <= r["end_code"]):
+            total += 1
+    return total
+
+
+# --------------------------------------------------------------------------
+# Changing character codes: one character (/editcode) or a whole anime when its range moves (Change codes button)
+# --------------------------------------------------------------------------
+def change_character_code_tx(session, old_code, new_code):
+    """Change ONE normal character's code inside a transaction. Everything that points at the code follows
+    (collections, favorites, Evolution recipes - see update_character_tx - and the shop). False when it does not exist
+    or is an Evolution character (those are edited with /editevo)."""
+    old_code, new_code = str(old_code), str(new_code)
+    doc = col(CHARACTERS).find_one({"code": old_code, "char_type": {"$ne": CHAR_TYPE_EVOLUTION}}, session=session)
+    if not doc:
+        return False
+    if not update_character_tx(session, old_code, new_code, doc.get("name"), doc.get("anime"), doc.get("rarity"),
+                               doc.get("worth") or 0):
+        return False
+    if new_code != old_code:
+        col("shop_v3").update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
+    return True
+
+
+def change_character_code(old_code, new_code):
+    """/editcode: change one normal character's code (all or nothing). True when changed."""
+    try:
+        return run_transaction(lambda session: change_character_code_tx(session, old_code, new_code))
+    finally:
+        invalidate_character_cache()
+
+
+def plan_code_move(anime, old_start, old_end, new_start, new_end):
+    """
+    Plan for moving an anime's characters when its range changes from old_start-old_end to new_start-new_end: every
+    normal character whose code is inside the OLD range keeps its position (0001 -> 5000, 0002 -> 5001 ...). Nothing is written.
+      {"moves": [(old, new, name)] in a safe order, "shift": int, "evolution_left": int, "kept_outside": int, "error": text|None}
+    `error` is set (and nothing may be moved) when a new code would leave the new range or is used by another character.
+    """
+    key = anime_key(anime)
+    shift = int(new_start) - int(old_start)
+    plan = {"moves": [], "shift": shift, "evolution_left": 0, "kept_outside": 0, "error": None}
+    if shift == 0:
+        return plan
+    moving, others = {}, {}
+    for d in _chars():
+        n = _numeric_code(d)
+        if n is None:
+            continue
+        mine = anime_key(d.get("anime")) == key
+        is_evo = d.get("char_type") == CHAR_TYPE_EVOLUTION
+        if mine and old_start <= n <= old_end:
+            if is_evo:
+                plan["evolution_left"] += 1
+                others[n] = d.get("name")
+            else:
+                moving[n] = d.get("name")
+        else:
+            others[n] = d.get("name")
+            if mine and not is_evo:
+                plan["kept_outside"] += 1
+    if not moving:
+        return plan
+    too_big = [c for c in moving if not (new_start <= c + shift <= new_end)]
+    if too_big:
+        need = max(c + shift for c in moving)
+        plan["error"] = (f"The new range {fmt_code(new_start)}-{fmt_code(new_end)} is too small: "
+                         f"{len(too_big)} character(s) would need codes up to {fmt_code(need)}.")
+    else:
+        clash = [(c, c + shift, others[c + shift]) for c in sorted(moving) if c + shift in others]
+        if clash:
+            shown = ", ".join(f"{fmt_code(n)} is used by {nm}" for _o, n, nm in clash[:3])
+            plan["error"] = f"{len(clash)} new code(s) are already used by other characters ({shown})."
+    order = sorted(moving, reverse=shift > 0)      # moving up: highest first; moving down: lowest first (no clashes while moving)
+    plan["moves"] = [(c, c + shift, moving[c]) for c in order]
+    return plan
+
+
+def apply_code_move(moves):
+    """Run the moves of plan_code_move in ONE transaction (all or nothing). Returns how many characters moved."""
+    def _work(session):
+        moved = 0
+        for old, new, _name in moves:
+            if not change_character_code_tx(session, fmt_code(old), fmt_code(new)):
+                raise RuntimeError(f"Character {fmt_code(old)} could not be moved")
+            moved += 1
+        return moved
+    try:
+        return run_transaction(_work)
+    finally:
+        invalidate_character_cache()
