@@ -6866,18 +6866,44 @@ async def characters(update, context):
             await safe_reply_text(update.message, "❌ No characters found.")
             return
 
-    lines = [
-        f"{i}. {rarity_text(r)} {name} [{code}]"
-        for i, (code, name, anime, r, worth, photo) in enumerate(rows, 1)
-    ]
-    chunk = header + "\n\n"
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 3800:
-            await safe_reply_text(update.message, chunk)
-            chunk = ""
-        chunk += line + "\n"
+    # Group by anime: bold anime name on top, its characters below (sorted by code).
+    def _code_key(c):
+        c = str(c)
+        return (0, int(c)) if c.isdigit() else (1, c)
+    groups, order = {}, []
+    for row in sorted(rows, key=lambda r: _code_key(r[0])):
+        anime = (row[2] or "").strip()
+        key = anime.lower() if anime and anime.lower() not in ("not set", "none", "-") else ""
+        if key not in groups:
+            groups[key] = (anime if key else "Not set", [])
+            order.append(key)
+        groups[key][1].append(row)
+    order.sort(key=lambda k: (k == "",))          # "Not set" always last (stable: others keep first-code order)
+
+    def _anime_head(name, cont=False):
+        return f"📺 <b>Anime: {html_escape(name)}</b>" + (" <i>(continued)</i>" if cont else "")
+
+    blocks = []                                    # list of (anime_name, [lines])
+    for key in order:
+        name, members = groups[key]
+        blocks.append((name, [
+            f"{i}. {rarity_text(r)} {html_escape(str(cname))} [{html_escape(str(code))}]"
+            for i, (code, cname, _a, r, _w, _p) in enumerate(members, 1)
+        ]))
+
+    chunk = html_escape(header) + "\n\n"
+    for name, block_lines in blocks:
+        for idx, line in enumerate(block_lines):
+            need_head = idx == 0 or chunk == ""
+            head = (_anime_head(name, cont=idx > 0) + "\n") if need_head else ""
+            if chunk and len(chunk) + len(head) + len(line) + 1 > 3700:
+                await safe_reply_text(update.message, chunk.rstrip(), parse_mode="HTML")
+                chunk = ""
+                head = _anime_head(name, cont=idx > 0) + "\n"
+            chunk += head + line + "\n"
+        chunk += "\n"
     if chunk.strip():
-        await safe_reply_text(update.message, chunk)
+        await safe_reply_text(update.message, chunk.rstrip(), parse_mode="HTML")
 
 async def view(update, context):
     (await save_user_async(update.effective_user))
@@ -11906,10 +11932,20 @@ async def notify_admins(context, text, photo_file_id=None, reply_to=None, includ
 
     print(f"Staff notification result: {delivered}/{len(recipients)} delivered, {skipped} personally OFF")
 
+# Character / evolution add + update actions ALWAYS notify staff, even when the Owner does them.
+_ALWAYS_NOTIFY_PREFIXES = (
+    "🎭 NEW CHARACTER ADDED", "✏️ CHARACTER UPDATED", "📷 CHARACTER PHOTO UPDATED",
+    "🎭 NEW EVOLUTION ADDED", "✏️ EVOLUTION UPDATED",
+)
+
 async def notify_staff_action(context, action_text, actor_id=None, owner_choice=False):
     try:
         if actor_id is not None and is_owner(actor_id):
-            return          # Owner actions: no notification, no Yes/No prompt (the 3 allowed ones use the log prompt)
+            if not str(action_text).lstrip().startswith(_ALWAYS_NOTIFY_PREFIXES):
+                return      # Other Owner actions: no notification, no Yes/No prompt (the 3 allowed ones use the log prompt)
+            notification = f"🔔 BOT NOTIFICATION\n\n{action_text}"
+            await notify_admins(context, notification)   # Owner + Executives + Scouts (each personal /notificationoff respected)
+            return
         choice_id = int(actor_id) if actor_id is not None and is_owner(actor_id) else (int(ADMIN_IDS[0]) if owner_choice and ADMIN_IDS else None)
         if choice_id is not None:
             pending = context.application.bot_data.setdefault("pending_owner_notifications", {})

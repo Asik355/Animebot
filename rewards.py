@@ -429,7 +429,13 @@ def delete_festival(code):
     """Removes the festival, its quests, progress and wishes. Claims, grants, banners and cards that people already
     earned are NOT touched (earned things are permanent)."""
     code = str(code)
-    qids = [q["_id"] for q in _col(QUESTS).find({"festival_id": code}, {"_id": 1})]
+    fdoc = _col(FESTIVALS).find_one({"_id": code}) or {}
+    fname = fdoc.get("name")
+    quests = list(_col(QUESTS).find({"festival_id": code}))
+    qids = [q["_id"] for q in quests]
+    _archive_quest_cards(quests, fname)                 # cards + banners stay listed in /special after the event
+    if fname:
+        _col(BANNERS).update_many({"festival_id": code}, {"$set": {"festival_name": str(fname)[:60]}})
     deleted = _col(FESTIVALS).delete_one({"_id": code}).deleted_count > 0
     _col(QUESTS).delete_many({"festival_id": code})
     if qids:
@@ -442,6 +448,10 @@ def delete_festival(code):
 
 def delete_quest(qid):
     qid = str(qid)
+    qdoc = _col(QUESTS).find_one({"_id": qid})
+    if qdoc:
+        fdoc = _col(FESTIVALS).find_one({"_id": qdoc.get("festival_id")}) or {}
+        _archive_quest_cards([qdoc], fdoc.get("name"))
     deleted = _col(QUESTS).delete_one({"_id": qid}).deleted_count > 0
     _col(PROGRESS).delete_many({"quest_id": qid})
     _col(PAID).delete_many({"quest_id": qid})
@@ -478,8 +488,33 @@ def filter_hidden(rows):
     return [r for r in rows if str(r[0]) not in hide] if hide else rows
 
 
-def register_card(code, festival_id):
-    _col(CARDS).update_one({"_id": str(code)}, {"$set": {"festival_id": str(festival_id or ""), "at": _stamp()}}, upsert=True)
+def register_card(code, festival_id, listed=False, festival_name=None):
+    """Hide a character from every public list (it becomes an event card). listed=True also puts it in /special for
+    good, even when no quest uses it (the permanent archive of past events)."""
+    fields = {"festival_id": str(festival_id or ""), "at": _stamp()}
+    if listed:
+        fields["listed"] = True
+    if festival_name:
+        fields["festival_name"] = str(festival_name)[:60]
+    _col(CARDS).update_one({"_id": str(code)}, {"$set": fields}, upsert=True)
+    _hidden["ts"] = 0.0
+
+
+def unregister_card(code):
+    """Back to a normal character: visible in the normal lists again, gone from /special."""
+    _col(CARDS).delete_one({"_id": str(code)})
+    _hidden["ts"] = 0.0
+
+
+def _archive_quest_cards(quests, festival_name):
+    """Before quests are deleted: keep their event cards (and name the festival) in the permanent /special archive."""
+    for q in quests:
+        code = (q.get("reward") or {}).get("card")
+        if code:
+            fields = {"listed": True}
+            if festival_name:
+                fields["festival_name"] = str(festival_name)[:60]
+            _col(CARDS).update_one({"_id": str(code)}, {"$set": fields}, upsert=True)
     _hidden["ts"] = 0.0
 
 
@@ -1210,6 +1245,11 @@ async def fs_callback(update, context):
                 deleted = await asyncio.to_thread(delete_quest, target)
                 await q.answer("Deleted." if deleted else "Already deleted.", show_alert=not deleted)
                 await _edit(q, f"🗑 Quest {target} deleted." if deleted else f"ℹ️ Quest {target} no longer exists.", back)
+        elif kind in ("scd", "sbd", "scu"):                  # confirmed delete / remove-from-special (owner)
+            if not _is_owner(uid):
+                await q.answer(DENIED_TEXT, show_alert=True)
+                return
+            await _sp_action(q, kind, uid, parts[3], parts[4] if len(parts) > 4 else "ok")
         elif kind == "sp":                                   # /special screens (public, edited in place)
             page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
             text, kb = await asyncio.to_thread(_special_panel, parts[3] if len(parts) > 3 else "h", page, uid)
@@ -1954,7 +1994,7 @@ async def editquest_input(update, context):
 #   hub (home) | ls:<page> (festival list) | fm:<code> (festival menu) | ql:<code> (its quests) | qm:<qid> (quest menu)
 #   hp (command help) | dfa:<code> / dqa:<qid> (ask before deleting) | go:<action>[:<arg>] (start a guided flow)
 # ==========================================================================
-PANEL_KINDS = ("hub", "ls", "fm", "ql", "qm", "hp", "dfa", "dqa")
+PANEL_KINDS = ("hub", "ls", "fm", "ql", "qm", "hp", "dfa", "dqa", "sm", "sc", "sb", "sci", "sbi", "scx", "sbx")
 PANEL_PAGE = 8
 PANEL_TEXT_LIMIT = 3900
 
@@ -1972,6 +2012,7 @@ def _hub_kb(uid):
     return InlineKeyboardMarkup([
         [_btn("➕ New Festival", f"fs:go:{uid}:addfestival"), _btn("🎭 New Special Character", f"fs:go:{uid}:addtempchar")],
         [_btn("📋 Festivals & Quests", f"fs:ls:{uid}:0"), _btn("✨ Special Tier Symbol", f"fs:go:{uid}:specialtier")],
+        [_btn("🎁 Festival & Reward Management", f"fs:sm:{uid}")],
         [_btn("📖 Command Help", f"fs:hp:{uid}"), _btn("« Owner Commands", f"help:{uid}:owner")]])
 
 
@@ -1986,7 +2027,8 @@ def _hub_text():
             "Everything is asked step by step, so there are no commands to remember.\n\n"
             "Typical order:\n1️⃣ 🎭 New Special Character (the first time it asks for the Special tier symbol)\n"
             "2️⃣ ➕ New Festival\n3️⃣ open the festival → ➕ Add Quest (card, banner, pay per wish)\n\n"
-            "Everyone can see all special characters and banners with /special.")
+            "🎁 Festival & Reward Management: edit or delete special characters and banners, or move a normal character into /special.\n"
+            "Everyone can see all special characters and banners (past ones too) with /special.")
 
 
 def _panel(kind, parts, uid):
@@ -1995,6 +2037,8 @@ def _panel(kind, parts, uid):
     home = [_btn("🪔 Festival Manager", f"fs:hub:{uid}")]
     if kind == "hub":
         return _hub_text(), _hub_kb(uid)
+    if kind in ("sm", "sc", "sb", "sci", "sbi", "scx", "sbx"):
+        return _sp_panel(kind, arg, uid)
     if kind == "hp":
         return _panel_cut(_esc(help_page_text())), InlineKeyboardMarkup([home])
     if kind == "ls":
@@ -2112,9 +2156,19 @@ def _festival_names():
     return {f["_id"]: f for f in _col(FESTIVALS).find({})}
 
 
+def _fest_ref(fests, festival_id, snapshot_name):
+    """{'name': ...} of the festival (live data first, the saved name once the festival was deleted), or None."""
+    f = fests.get(festival_id)
+    if f:
+        return f
+    return {"name": snapshot_name} if snapshot_name else None
+
+
 def special_cards():
-    """Event cards that are the reward of some quest (a temp character that no quest uses yet stays secret)."""
+    """Every special card, for good: quest reward cards (even after the quest/festival was deleted) and every character
+    the owner listed by hand. A hidden temp character that nothing uses yet and nobody listed stays secret."""
     fests = _festival_names()
+    docs = {str(d["_id"]): d for d in _col(CARDS).find({})}
     out, seen = [], set()
     for q in sorted(_col(QUESTS).find({}), key=_qkey):
         code = (q.get("reward") or {}).get("card")
@@ -2124,7 +2178,14 @@ def special_cards():
         if not row:
             continue
         seen.add(str(code))
-        out.append({"code": str(code), "row": row, "festival": fests.get(q["festival_id"])})
+        out.append({"code": str(code), "row": row,
+                    "festival": _fest_ref(fests, q["festival_id"], (docs.get(str(code)) or {}).get("festival_name"))})
+    for code in sorted(c for c, d in docs.items() if d.get("listed") and c not in seen):
+        row = _character_row(code)
+        if not row:
+            continue
+        d = docs[code]
+        out.append({"code": code, "row": row, "festival": _fest_ref(fests, d.get("festival_id"), d.get("festival_name"))})
     return out
 
 
@@ -2133,8 +2194,16 @@ def special_banners():
     banners = [b for b in _col(BANNERS).find({}) if b.get("festival_id")]
     banners.sort(key=lambda b: (len(str(b["_id"])), str(b["_id"])))
     for b in banners:
-        b["_festival"] = fests.get(b.get("festival_id"))
+        b["_festival"] = _fest_ref(fests, b.get("festival_id"), b.get("festival_name"))
     return banners
+
+
+def _rarity_label(row):
+    """'💠 Special' for event characters, or the real tier + symbol for a normal character that was moved here."""
+    rar = str(row[3]) if len(row) > 3 and row[3] else SPECIAL
+    if rar == SPECIAL:
+        return f"{_special_sym()} {SPECIAL}".strip()
+    return f"{(_deps.get('symbols') or {}).get(rar, '')} {rar}".strip()
 
 
 def _owned_for(uid):
@@ -2160,13 +2229,13 @@ def _special_per_page():
 def _special_home(uid):
     cards, banners = special_cards(), special_banners()
     text = ("✨ Special Collection\n\n"
-            "Characters and banners you can win in festival events - past ones and coming ones.\n\n"
+            "Every special character and banner from festival events - past ones are kept here so you can prepare for the next.\n\n"
             f"🎭 Characters: {len(cards)}    🎌 Banners: {len(banners)}")
     return text, InlineKeyboardMarkup([[_btn("🎭 Characters", f"fs:sp:{uid}:c:0"), _btn("🎌 Banners", f"fs:sp:{uid}:b:0")]])
 
 
 def _special_list(kind, page, uid):
-    """Same look as the /banner list: numbered lines, 🔓/🔒 state, page buttons - plus number buttons to open an item."""
+    """Same look as the /banner list: numbered lines, 🔑/🔒 state, page buttons - plus number buttons to open an item."""
     cards = kind == "c"
     items = special_cards() if cards else special_banners()
     owned = _owned_for(uid)
@@ -2181,15 +2250,15 @@ def _special_list(kind, page, uid):
     for i, it in enumerate(items[page * per:(page + 1) * per], page * per + 1):
         if cards:
             code, name = it["code"], str(it["row"][1])
-            lines.append(f"{i}. {_esc(name)} — {code} {_special_sym()} " + ("✅" if code in owned else "🔒"))
+            lines.append(f"{i}. {_esc(name)} — {code} {_esc(_rarity_label(it['row']))} " + ("🔑" if code in owned else "🔒"))
         else:
             code, name = str(it["_id"]), str(it.get("name"))
             unlocked = banner_token(code) in owned
-            lines.append(f"{i}. {_esc(name)} — {code} " + ("🔓" if unlocked else "🔒") + (" ⭐" if unlocked and eq == code else ""))
+            lines.append(f"{i}. {_esc(name)} — {code} " + ("🔑" if unlocked else "🔒") + (" ⭐" if unlocked and eq == code else ""))
         nums.append(_btn(str(i), f"fs:sd:{uid}:{kind}:{code}"))
     if items:
         lines += ["", "Tap a number to see the picture and details.",
-                  "✅/🔓 = you own it    🔒 = not earned yet"]
+                  "🔑 = you own it    🔒 = not earned yet"]
     rows = [nums[k:k + 5] for k in range(0, len(nums), 5)]
     if pages > 1:
         nav = []
@@ -2218,11 +2287,11 @@ def special_detail(kind, code, uid):
         lines = [f"🎭 {_esc(str(row[1]))}"]
         if row[2]:
             lines.append(f"🎬 {_esc(str(row[2]))}")
-        lines.append(f"🏷 {_esc(_special_sym())} {SPECIAL}")
+        lines.append(f"🏷 {_esc(_rarity_label(row))}")
         lines.append(f"🔢 Code: {it['code']}")
         if fest:
             lines.append(f"🪔 From: {_esc(str(fest['name']))}")
-        lines.append("✅ You own this character." if it["code"] in owned else "🔒 You don't own this character yet.")
+        lines.append("🔑 You own this character." if it["code"] in owned else "🔒 You don't own this character yet.")
         return "\n".join(lines), (row[5] if len(row) > 5 else None)
     b = next((x for x in special_banners() if str(x["_id"]) == str(code)), None)
     if b is None:
@@ -2232,7 +2301,7 @@ def special_detail(kind, code, uid):
     lines = [f"🎌 {_esc(str(b['name']))}", f"Code: {b['_id']}"]
     if b.get("_festival"):
         lines.append(f"🪔 From: {_esc(str(b['_festival']['name']))}")
-    lines.append("Status: " + ("🔓 Unlocked" if unlocked else "🔒 Not earned yet") + ("  ⭐ EQUIPPED" if equipped else ""))
+    lines.append("Status: " + ("🔑 Unlocked" if unlocked else "🔒 Not earned yet") + ("  ⭐ EQUIPPED" if equipped else ""))
     if unlocked and not equipped:
         lines += ["", f"Equip it with /usebanner {b['_id']}"]
     return "\n".join(lines), b.get("photo_file_id")
@@ -2297,6 +2366,425 @@ async def special_command(update, context):
             for k, code, name in matches[:10]]
     await _reply(msg, "Several special items match. Tap the one you want:", reply_markup=InlineKeyboardMarkup(rows))
     _ok(update)
+
+
+# ==========================================================================
+# 🎁 Festival & Reward Management (owner, inside the Festival Manager)
+#   list / open / edit / delete every special character and banner, and move an existing character into /special
+# Screens (panel kinds, see _panel):  sm (menu) sc/sb (lists) sci/sbi (one item) scx/sbx (delete confirmation)
+# Actions (fs_callback):  scd/sbd (delete) scu (remove from /special)      Flows (conversation):  fs:se (edit) fs:sh (add)
+# ==========================================================================
+SM_INPUT, SM_HIDE_CODE, SM_HIDE_FEST = 80, 81, 82
+_SM = "fs_sm"
+_SM_FIELDS = {"name": "name", "anime": "anime", "worth": "worth in Berrys (a number)", "photo": "PHOTO",
+              "code": "CODE", "rarity": "RARITY"}
+
+
+def _sm_prompt(kind, field):
+    if field == "code":
+        return ("Send the new 2-digit banner code, digits only (01-99), for example 10. No letters."
+                if kind == "b" else "Send the new 4-digit character code (0001-9999). It must not be used yet.")
+    if field == "rarity":
+        names = list(dict.fromkeys([*_rarities(), SPECIAL]))
+        return "Send the new rarity: " + ", ".join(names) + "."
+    return f"Send the new {_SM_FIELDS[field]}."
+
+
+def _rekey_card(old, new):
+    """The festival-card record follows the character to its new code."""
+    doc = _col(CARDS).find_one({"_id": old})
+    if doc:
+        doc["_id"] = new
+        _col(CARDS).replace_one({"_id": new}, doc, upsert=True)
+        _col(CARDS).delete_one({"_id": old})
+    _col(QUESTS).update_many({"reward.card": old}, {"$set": {"reward.card": new}})
+    _hidden["ts"] = 0.0
+    invalidate()
+
+
+def rename_special_banner(old, new):
+    """Move a special banner to a new 2-digit code (players who earned it, people wearing it and quests follow).
+    Returns 'ok' | 'missing' | 'exists'."""
+    old, new = str(old), str(new)
+    doc = _col(BANNERS).find_one({"_id": old, "festival_id": {"$exists": True, "$ne": None}})
+    if not doc:
+        return "missing"
+    if _col(BANNERS).find_one({"_id": new}, {"_id": 1}):
+        return "exists"
+    _col(GRANTS).delete_many({"token": banner_token(new), "kind": "banner"})        # stale grants of a long-gone banner
+    doc.update({"_id": new, "code": new, "required_codes": [[banner_token(new)]], "updated_at": _stamp()})
+    try:
+        _col(BANNERS).insert_one(doc)
+    except DuplicateKeyError:
+        return "exists"
+    _col(GRANTS).update_many({"token": banner_token(old), "kind": "banner"}, {"$set": {"token": banner_token(new)}})
+    mongo_db.col("user_banners_v1").update_many({"banner_code": old}, {"$set": {"banner_code": new}})
+    _col(QUESTS).update_many({"reward.banner": old}, {"$set": {"reward.banner": new}})
+    _col(BANNERS).delete_one({"_id": old})
+    invalidate()
+    return "ok"
+
+
+def _owner_count_char(code):
+    try:
+        return len(mongo_db.col(mongo_db.COLLECTIONS).distinct("user_id", {"character_code": str(code)}))
+    except Exception:
+        return 0
+
+
+def _owner_count_banner(code):
+    try:
+        return len(_col(GRANTS).distinct("user_id", {"token": banner_token(code), "kind": "banner"}))
+    except Exception:
+        return 0
+
+
+def _sp_quests_using(kind, code):
+    key = "reward.card" if kind == "c" else "reward.banner"
+    return list(_col(QUESTS).find({key: str(code)}, {"_id": 1, "festival_id": 1}))
+
+
+def delete_special_banner(code):
+    """Removes the banner for everyone: the banner, every grant, equipped copies, and its slot in quest rewards."""
+    code = str(code)
+    deleted = _col(BANNERS).delete_one({"_id": code, "festival_id": {"$exists": True, "$ne": None}}).deleted_count > 0
+    if not deleted:
+        return False, 0
+    _col(GRANTS).delete_many({"token": banner_token(code), "kind": "banner"})
+    mongo_db.col("user_banners_v1").delete_many({"banner_code": code})
+    res = _col(QUESTS).update_many({"reward.banner": code}, {"$unset": {"reward.banner": ""}})
+    invalidate()
+    return True, res.modified_count
+
+
+def delete_special_character(code):
+    """Deletes the character completely (it is also taken out of the quests that gave it)."""
+    code = str(code)
+    mongo_db.delete_character(code)
+    unregister_card(code)
+    res = _col(QUESTS).update_many({"reward.card": code}, {"$unset": {"reward.card": ""}})
+    invalidate()
+    return res.modified_count
+
+
+def _sp_page(items, arg):
+    page = int(arg) if str(arg).isdigit() else 0
+    pages = max(1, -(-len(items) // PANEL_PAGE))
+    page = min(max(page, 0), pages - 1)
+    return page, pages, items[page * PANEL_PAGE:(page + 1) * PANEL_PAGE]
+
+
+def _sp_nav(kind, uid, page, pages):
+    nav = []
+    if page > 0:
+        nav.append(_btn("‹ Prev", f"fs:{kind}:{uid}:{page - 1}"))
+    if page < pages - 1:
+        nav.append(_btn("Next ›", f"fs:{kind}:{uid}:{page + 1}"))
+    return nav
+
+
+def _sp_panel(kind, arg, uid):
+    """(HTML text, keyboard) of one management screen."""
+    back_menu = [_btn("« Back", f"fs:sm:{uid}"), _btn("🪔 Festival Manager", f"fs:hub:{uid}")]
+    if kind == "sm":
+        n_c, n_b = len(special_cards()), len(special_banners())
+        text = ("🎁 Festival & Reward Management\n\n"
+                f"🎭 Special characters: {n_c}\n🎌 Special banners: {n_b}\n\n"
+                "Everything listed here shows in /special for everybody, also after the event ended, so players can see "
+                "what came in earlier years. A special character is hidden from the normal character list.\n\n"
+                "• Open an item to edit or delete it.\n"
+                "• ➕ Add Existing Character moves a normal character into /special (hides it from the main list).")
+        return text, InlineKeyboardMarkup([
+            [_btn(f"🎭 Characters ({n_c})", f"fs:sc:{uid}:0"), _btn(f"🎌 Banners ({n_b})", f"fs:sb:{uid}:0")],
+            [_btn("➕ Add Existing Character", f"fs:sh:{uid}"), _btn("🎭 New Special Character", f"fs:go:{uid}:addtempchar")],
+            [_btn("🪔 Festival Manager", f"fs:hub:{uid}")]])
+    if kind == "sc":
+        page, pages, chunk = _sp_page(special_cards(), arg)
+        lines = [f"🎭 Special Characters (page {page + 1}/{pages})", ""]
+        rows = []
+        for it in chunk:
+            fest = (it.get("festival") or {}).get("name")
+            lines.append(f"{it['code']} · {_esc(str(it['row'][1]))} · {_esc(_rarity_label(it['row']))}"
+                         + (f" · 🪔 {_esc(str(fest))}" if fest else ""))
+            rows.append([_btn(f"{it['code']} · {_short(it['row'][1], 28)}", f"fs:sci:{uid}:{it['code']}")])
+        if not chunk:
+            lines.append("No special characters yet.")
+        nav = _sp_nav("sc", uid, page, pages)
+        if nav:
+            rows.append(nav)
+        rows.append(back_menu)
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+    if kind == "sb":
+        page, pages, chunk = _sp_page(special_banners(), arg)
+        lines = [f"🎌 Special Banners (page {page + 1}/{pages})", ""]
+        rows = []
+        for b in chunk:
+            fest = (b.get("_festival") or {}).get("name")
+            lines.append(f"{b['_id']} · {_esc(str(b.get('name')))}" + (f" · 🪔 {_esc(str(fest))}" if fest else ""))
+            rows.append([_btn(f"{b['_id']} · {_short(b.get('name'), 28)}", f"fs:sbi:{uid}:{b['_id']}")])
+        if not chunk:
+            lines.append("No special banners yet.")
+        nav = _sp_nav("sb", uid, page, pages)
+        if nav:
+            rows.append(nav)
+        rows.append(back_menu)
+        return "\n".join(lines), InlineKeyboardMarkup(rows)
+    code = str(arg)
+    if kind in ("sci", "scx"):
+        it = next((c for c in special_cards() if c["code"] == code), None)
+        if it is None:
+            return "ℹ️ That special character no longer exists.", InlineKeyboardMarkup([[_btn("« Characters", f"fs:sc:{uid}:0")]])
+        row = it["row"]
+        if kind == "scx":
+            used = _sp_quests_using("c", code)
+            text = (f"🗑 Delete {_esc(str(row[1]))} [{code}] for good?\n\n"
+                    f"👥 Owned by {_owner_count_char(code)} player(s) - their copies and favorites of it are removed, and evolution recipes using it are deleted.\n"
+                    f"🎯 Used as the reward of {len(used)} quest(s) - it is taken out of them.\n\n"
+                    "This cannot be undone. To only bring it back to the normal character list, use “Remove from Special”.")
+            return text, InlineKeyboardMarkup([[_btn("🗑 Delete", f"fs:scd:{uid}:{code}:ok"), _btn("↩️ Cancel", f"fs:sci:{uid}:{code}")]])
+        fest = (it.get("festival") or {}).get("name")
+        text = (f"🎭 {_esc(str(row[1]))}\n🎬 {_esc(str(row[2] or '') or 'Not set')}\n🏷 {_esc(_rarity_label(row))}\n"
+                f"💰 Worth: {row[4]}\n🔢 Code: {code}\n" + (f"🪔 From: {_esc(str(fest))}\n" if fest else "")
+                + f"👥 Owners: {_owner_count_char(code)}\n🎯 Quests using it: {len(_sp_quests_using('c', code))}")
+        return text, InlineKeyboardMarkup([
+            [_btn("✏️ Name", f"fs:se:{uid}:c:{code}:name"), _btn("🎬 Anime", f"fs:se:{uid}:c:{code}:anime")],
+            [_btn("💰 Worth", f"fs:se:{uid}:c:{code}:worth"), _btn("🖼 Photo", f"fs:se:{uid}:c:{code}:photo")],
+            [_btn("🔢 Code", f"fs:se:{uid}:c:{code}:code"), _btn("🏷 Rarity", f"fs:se:{uid}:c:{code}:rarity")],
+            [_btn("👁 Remove from Special", f"fs:scu:{uid}:{code}:ok"), _btn("🗑 Delete", f"fs:scx:{uid}:{code}")],
+            [_btn("« Characters", f"fs:sc:{uid}:0"), _btn("🏠 Home", f"fs:hub:{uid}")]])
+    b = next((x for x in special_banners() if str(x["_id"]) == code), None)
+    if b is None:
+        return "ℹ️ That special banner no longer exists.", InlineKeyboardMarkup([[_btn("« Banners", f"fs:sb:{uid}:0")]])
+    if kind == "sbx":
+        used = _sp_quests_using("b", code)
+        text = (f"🗑 Delete banner {_esc(str(b.get('name')))} [{code}] for good?\n\n"
+                f"👥 {_owner_count_banner(code)} player(s) earned it - it disappears for everyone, and anyone wearing it is unequipped.\n"
+                f"🎯 Used in {len(used)} quest(s) - it is taken out of them"
+                + (" (" + ", ".join(str(q['_id']) for q in used[:6]) + ")" if used else "") + ".\n\nThis cannot be undone.")
+        return text, InlineKeyboardMarkup([[_btn("🗑 Delete", f"fs:sbd:{uid}:{code}:ok"), _btn("↩️ Cancel", f"fs:sbi:{uid}:{code}")]])
+    fest = (b.get("_festival") or {}).get("name")
+    text = (f"🎌 {_esc(str(b.get('name')))}\n🔢 Code: {code}\n" + (f"🪔 From: {_esc(str(fest))}\n" if fest else "")
+            + f"👥 Owners: {_owner_count_banner(code)}\n🎯 Quests using it: {len(_sp_quests_using('b', code))}")
+    return text, InlineKeyboardMarkup([
+        [_btn("✏️ Name", f"fs:se:{uid}:b:{code}:name"), _btn("🖼 Photo", f"fs:se:{uid}:b:{code}:photo")],
+        [_btn("🔢 Code", f"fs:se:{uid}:b:{code}:code")],
+        [_btn("🗑 Delete Banner", f"fs:sbx:{uid}:{code}")],
+        [_btn("« Banners", f"fs:sb:{uid}:0"), _btn("🏠 Home", f"fs:hub:{uid}")]])
+
+
+async def _sp_action(q, kind, uid, code, action):
+    """Confirmed delete / remove-from-special buttons. Returns nothing; edits the panel."""
+    if kind == "scu":
+        await asyncio.to_thread(unregister_card, code)
+        await q.answer("Removed from Special.")
+        await _edit(q, f"👁 {code} is a normal character again (back in the normal character list, gone from /special).",
+                    InlineKeyboardMarkup([[_btn("« Characters", f"fs:sc:{uid}:0"), _btn("🏠 Home", f"fs:hub:{uid}")]]))
+    elif kind == "scd":
+        try:
+            n = await asyncio.to_thread(delete_special_character, code)
+        except Exception as e:
+            logger.error("delete special character failed: %s", e)
+            await q.answer("❌ Could not delete it.", show_alert=True)
+            return
+        await q.answer("Deleted.")
+        await _edit(q, f"🗑 Character {code} deleted ({n} quest(s) updated).",
+                    InlineKeyboardMarkup([[_btn("« Characters", f"fs:sc:{uid}:0"), _btn("🏠 Home", f"fs:hub:{uid}")]]))
+    else:
+        ok, n = await asyncio.to_thread(delete_special_banner, code)
+        await q.answer("Deleted." if ok else "Already deleted.", show_alert=not ok)
+        await _edit(q, f"🗑 Banner {code} deleted ({n} quest(s) updated)." if ok else f"ℹ️ Banner {code} no longer exists.",
+                    InlineKeyboardMarkup([[_btn("« Banners", f"fs:sb:{uid}:0"), _btn("🏠 Home", f"fs:hub:{uid}")]]))
+
+
+# ---------------- edit one field ----------------
+async def special_edit_start(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")             # fs:se:<uid>:<c|b>:<code>:<field>
+    if len(parts) != 6 or q.from_user.id != int(parts[2]):
+        await q.answer(NOT_YOURS_TEXT, show_alert=True)
+        return -1
+    if not _is_owner(q.from_user.id):
+        await q.answer(DENIED_TEXT, show_alert=True)
+        return -1
+    if q.message is not None and q.message.chat.type != "private":
+        await q.answer("Open the Festival Manager in my private chat.", show_alert=True)
+        return -1
+    await q.answer()
+    context.user_data[_SM] = {"kind": parts[3], "code": parts[4], "field": parts[5]}
+    extra = "\nSend skip to remove the current anime." if parts[5] == "anime" else ""
+    await _reply(q.message, f"✏️ {_sm_prompt(parts[3], parts[5])} (editing {parts[4]}){extra}\n\nSend /cancel to stop.")
+    return SM_INPUT
+
+
+async def special_edit_input(update, context):
+    if not await _guard_owner(update):
+        return -1
+    msg = update.effective_message
+    st = context.user_data.get(_SM)
+    if not st:
+        await _reply(msg, "❌ This edit expired. Open it again from /festival.")
+        return -1
+    kind, code, field = st["kind"], st["code"], st["field"]
+    value = None
+    if field == "photo":
+        if not msg.photo:
+            await _reply(msg, "❌ Send a photo (not a file).")
+            return SM_INPUT
+        value = msg.photo[-1].file_id
+    elif field == "name":
+        value = _clean_name(msg.text, 60)
+        if not value:
+            await _reply(msg, "❌ Send a valid name (max 60 characters).")
+            return SM_INPUT
+    elif field == "code":
+        raw = (msg.text or "").strip()
+        if kind == "b":
+            if not re.fullmatch(r"\d{2}", raw) or int(raw) < 1:
+                await _reply(msg, "❌ A special banner code is exactly 2 digits (01-99), digits only - no letters, like 10.")
+                return SM_INPUT
+            value = raw
+        else:
+            value = normalize_char_code(raw)
+            if not value or len(raw) != 4:
+                await _reply(msg, "❌ The character code must be exactly 4 digits (0001-9999).")
+                return SM_INPUT
+        if value == code:
+            await _reply(msg, "ℹ️ That is already the current code. Send a different one.")
+            return SM_INPUT
+        if kind == "c" and await asyncio.to_thread(_character_row, value):
+            await _reply(msg, "❌ That code is already used by another character. Send another code.")
+            return SM_INPUT
+    elif field == "rarity":
+        want = " ".join((msg.text or "").split()).casefold()
+        names = list(dict.fromkeys([*_rarities(), SPECIAL]))
+        value = next((n for n in names if n.casefold() == want), None)
+        if value is None:
+            await _reply(msg, "❌ Unknown rarity. Send one of: " + ", ".join(names) + ".")
+            return SM_INPUT
+    elif field == "anime":
+        text = " ".join((msg.text or "").split())
+        value = "" if _is_none_word(text) else text
+        if len(value) > 80:
+            await _reply(msg, "❌ The anime name is too long (max 80 characters).")
+            return SM_INPUT
+    else:
+        value = _to_int(msg.text, 0, 100_000_000)
+        if value is None:
+            await _reply(msg, "❌ Worth must be a number.")
+            return SM_INPUT
+    uid = update.effective_user.id
+    try:
+        if kind == "b":
+            if field not in ("name", "photo", "code"):
+                await _reply(msg, "❌ A banner only has a name, a photo and a code.")
+                return -1
+            if field == "code":
+                state = await asyncio.to_thread(rename_special_banner, code, value)
+                if state == "exists":
+                    await _reply(msg, "❌ That banner code is already used. Send another 2-digit code.")
+                    return SM_INPUT
+                ok = state == "ok"
+            else:
+                key = "name" if field == "name" else "photo_file_id"
+                res = await asyncio.to_thread(lambda: _col(BANNERS).update_one({"_id": code}, {"$set": {key: value, "updated_at": _stamp()}}))
+                ok = bool(res.matched_count)
+        else:
+            ok = await asyncio.to_thread(_edit_special_character, code, field, value)
+        if ok and field == "code":
+            code = value                                  # the open-item button must use the new code
+    except Exception as e:
+        logger.error("special edit failed: %s", e)
+        await _reply(msg, "❌ Could not save that (the name may already exist). Nothing was changed.")
+        return -1
+    context.user_data.pop(_SM, None)
+    back = InlineKeyboardMarkup([[_btn("« Open item", f"fs:{'sbi' if kind == 'b' else 'sci'}:{uid}:{code}"),
+                                  _btn("🏠 Home", f"fs:hub:{uid}")]])
+    await _reply(msg, "✅ Saved." if ok else "❌ That item no longer exists.", reply_markup=back)
+    return -1
+
+
+def _edit_special_character(code, field, value):
+    row = _character_row(code)
+    if not row:
+        return False
+    if field == "photo":
+        return bool(mongo_db.update_character_photo(code, value))
+    name, anime, rarity, worth, new_code = row[1], row[2], row[3], row[4], code
+    if field == "name":
+        name = value
+    elif field == "anime":
+        anime = value
+    elif field == "code":
+        new_code = value
+    elif field == "rarity":
+        rarity = value
+    else:
+        worth = value
+    recruit = mongo_db.get_recruit_names(code)
+    done = bool(mongo_db.update_character(code, new_code, name, anime, rarity, worth, recruit))
+    if done and new_code != code:
+        _rekey_card(code, new_code)
+    return done
+
+
+# ---------------- move an existing character into /special ----------------
+async def special_hide_start(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")             # fs:sh:<uid>
+    if len(parts) != 3 or q.from_user.id != int(parts[2]):
+        await q.answer(NOT_YOURS_TEXT, show_alert=True)
+        return -1
+    if not _is_owner(q.from_user.id):
+        await q.answer(DENIED_TEXT, show_alert=True)
+        return -1
+    if q.message is not None and q.message.chat.type != "private":
+        await q.answer("Open the Festival Manager in my private chat.", show_alert=True)
+        return -1
+    await q.answer()
+    context.user_data[_SM] = {}
+    await _reply(q.message, "➕ Move an existing character into /special.\n\nSend its 4-digit CODE (for example the Diwali "
+                            "character you gave in the event). It disappears from the normal character list and is shown in "
+                            "/special for everyone.\n\nSend /cancel to stop.")
+    return SM_HIDE_CODE
+
+
+async def special_hide_code(update, context):
+    if not await _guard_owner(update):
+        return -1
+    msg = update.effective_message
+    code = normalize_char_code(msg.text)
+    if not code:
+        await _reply(msg, "❌ Send a 4-digit code (0001-9999).")
+        return SM_HIDE_CODE
+    row = await asyncio.to_thread(_character_row, code)
+    if not row:
+        await _reply(msg, "❌ No character has that code. Send another code.")
+        return SM_HIDE_CODE
+    context.user_data[_SM] = {"hide": code}
+    await _reply(msg, f"🎭 {_esc(str(row[1]))} [{code}]\n\nWhich festival was it from? Send the festival name (for example "
+                      "Diwali 2026), or send skip.", parse_mode="HTML")
+    return SM_HIDE_FEST
+
+
+async def special_hide_fest(update, context):
+    if not await _guard_owner(update):
+        return -1
+    msg = update.effective_message
+    st = context.user_data.get(_SM) or {}
+    code = st.get("hide")
+    if not code:
+        await _reply(msg, "❌ This setup expired. Open it again from /festival.")
+        return -1
+    text = " ".join((msg.text or "").split())
+    fest = None if _is_none_word(text) else text[:60]
+    await asyncio.to_thread(register_card, code, None, True, fest)
+    context.user_data.pop(_SM, None)
+    uid = update.effective_user.id
+    await _reply(msg, f"✅ {code} is now a special character: hidden from the normal character list and shown in /special"
+                      + (f" under {_esc(fest)}" if fest else "") + ".",
+                 parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[_btn("« Open item", f"fs:sci:{uid}:{code}"),
+                                                                      _btn("🏠 Home", f"fs:hub:{uid}")]]))
+    return -1
 
 
 # ==========================================================================
@@ -2590,6 +3078,15 @@ def register(app):
         states={
             EQ_MENU: [CallbackQueryHandler(editquest_menu, pattern=r"^fs:eq:\d+:Q\d+:(target|berrys|stones|card|bphoto|bname|rberrys|done)$")],
             EQ_INPUT: [MessageHandler(filters.PHOTO, editquest_input), MessageHandler(text, editquest_input)],
+        },
+        fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(special_edit_start, pattern=r"^fs:se:\d+:(c|b):[0-9A-Za-z]+:(name|anime|worth|photo|code|rarity)$"),
+                      CallbackQueryHandler(special_hide_start, pattern=r"^fs:sh:\d+$")],
+        states={
+            SM_INPUT: [MessageHandler(filters.PHOTO, special_edit_input), MessageHandler(text, special_edit_input)],
+            SM_HIDE_CODE: [MessageHandler(text, special_hide_code)],
+            SM_HIDE_FEST: [MessageHandler(text, special_hide_fest)],
         },
         fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))
     for name, callback in (("quests", quests_command), ("special", special_command), ("festival", festival_command),
