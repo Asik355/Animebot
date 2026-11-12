@@ -1525,7 +1525,7 @@ PROMO_BOT_TEXT = (
     "🤖 Looking for a smarter way to manage your group?\n\n"
     "Try our group management bot with AI-powered smart features. "
     "It helps keep your group organized, safe and active.\n\n"
-    f"👇 Tap the username to copy it, then add the bot to your group:\n<code>@{PROMO_BOT_USERNAME}</code>"
+    f"👇 Tap the username to open the bot:\n@{PROMO_BOT_USERNAME}"
 )
 PROMO_SENT_COLL = "promo_sent_groups"
 
