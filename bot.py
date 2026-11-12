@@ -1509,14 +1509,54 @@ async def get_group_link(bot, app, chat_id, chat=None, allow_fetch=True):
         return None
 
 
-GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot must be an admin with the 'Add users' right to share one. "
+GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot is not an admin, or the group has no link the bot can use. "
                       "No characters spawn in this group until the bot is an admin.")
 
 # Characters spawn only in groups where the bot is an admin. Set to False to turn this rule off.
 REQUIRE_BOT_ADMIN_FOR_SPAWN = True
-BOT_JOIN_ADMIN_TEXT = "🤖 Thanks for adding me! I need <b>admin</b> rights with the <b>Add users</b> right to work properly. Please promote me."
-BOT_ADMIN_SPAWN_TEXT = ("❌ Make me an admin with the 'Add users' right in this group first. "
-                        "Characters spawn only where the bot is an admin with the 'Add users' right.")
+BOT_JOIN_ADMIN_TEXT = "🤖 Thanks for adding me! I need <b>admin</b> rights to work properly. Please promote me."
+BOT_ADMIN_SPAWN_TEXT = ("❌ Make me an admin in this group first. "
+                        "Characters spawn only where the bot is an admin.")
+
+
+# Promo for our other bot: sent as its own message, ONCE per join (cleared when the bot leaves, so a re-add sends it once again).
+PROMO_BOT_USERNAME = "GroupRealmBot"
+PROMO_BOT_TEXT = (
+    "🤖 Looking for a smarter way to manage your group?\n\n"
+    "Try our group management bot with AI-powered smart features. "
+    "It helps keep your group organized, safe and active.\n\n"
+    f"👇 Tap the username to copy it, then add the bot to your group:\n<code>@{PROMO_BOT_USERNAME}</code>"
+)
+PROMO_SENT_COLL = "promo_sent_groups"
+
+
+async def send_group_promo_once(bot, chat_id):
+    """Send the promo message once for the current join. Safe against double join updates; a new join after the bot
+    left or was removed sends it again (see clear_group_promo)."""
+    cid = int(chat_id)
+    try:
+        res = await asyncio.to_thread(_mc(PROMO_SENT_COLL).update_one, {"_id": cid},
+                                      {"$setOnInsert": {"sent_at": datetime.now(IST).isoformat()}}, True)
+        if res.upserted_id is None:
+            return                                   # already sent for this join
+    except Exception as e:
+        print(f"Promo check error for {cid}:", e)
+        return                                       # when unsure, do not send
+    try:
+        await bot.send_message(
+            chat_id=cid, text=PROMO_BOT_TEXT, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "➕ Invite Bot", url=f"https://t.me/{PROMO_BOT_USERNAME}?startgroup=true")]]))
+    except Exception as e:
+        print(f"Promo message error for {cid}:", e)
+
+
+async def clear_group_promo(chat_id):
+    """The bot left / was removed: forget the promo marker so the next join sends it once again."""
+    try:
+        await asyncio.to_thread(_mc(PROMO_SENT_COLL).delete_one, {"_id": int(chat_id)})
+    except Exception as e:
+        print(f"Promo reset error for {chat_id}:", e)
 
 
 def approval_markup(link, cid):
@@ -1563,8 +1603,8 @@ async def _admin_required(app, chat_id):
 
 
 async def bot_is_group_admin(bot, app, chat_id):
-    """True when spawning is allowed here: the bot is an admin WITH the 'Add users' right (it needs that right to make a join
-    link, so the Owner can join and check the group). Applies to EVERY group, old and new, and to every kind of spawn.
+    """True when spawning is allowed here: the bot is an admin (the 'Add users' right is not required).
+    Applies to EVERY group, old and new, and to every kind of spawn.
     Short cache (30 s while not allowed, 5 min once allowed).
     If Telegram can't be asked, this returns True so a temporary error never stops spawns."""
     if not REQUIRE_BOT_ADMIN_FOR_SPAWN:
@@ -1582,7 +1622,7 @@ async def bot_is_group_admin(bot, app, chat_id):
         if member.status == "creator":
             ok = True
         else:
-            ok = member.status == "administrator" and bool(getattr(member, "can_invite_users", False))
+            ok = member.status == "administrator"      # any admin is enough; the 'Add users' right is NOT required
     except Exception as e:
         print(f"Bot admin check error for {cid}:", e)
         return True
@@ -1604,7 +1644,7 @@ async def group_link_callback(update, context):
         return
     link = await get_group_link(context.bot, context.application, cid)
     if not link:
-        await query.answer("Still no link. Make the bot an admin with the 'Add users' right, then tap again.",
+        await query.answer("Still no link. Make sure the bot is an admin, then tap again.",
                            show_alert=True)
         return
     await query.answer("Link ready.")
@@ -1679,6 +1719,8 @@ async def track_bot_membership(update, context):
                 await context.bot.send_message(chat_id=chat.id, text=BOT_JOIN_ADMIN_TEXT, parse_mode="HTML")
             except Exception as e:
                 print(f"Admin request message error for {chat.id}:", e)
+        if getattr(member_update.old_chat_member, "status", None) in ("left", "kicked"):
+            await send_group_promo_once(context.bot, chat.id)             # new group: promo message, once only
         if await is_group_approved(chat.id):
             (await asyncio.to_thread(register_auto_spawn_group, chat.id))
             context.application.bot_data.setdefault("active_chats", set()).add(chat.id)
@@ -1727,6 +1769,7 @@ async def track_bot_membership(update, context):
         (await asyncio.to_thread(unregister_auto_spawn_group, chat.id))
         context.application.bot_data.setdefault("active_chats", set()).discard(chat.id)
     elif status in ("left", "kicked"):
+        await clear_group_promo(chat.id)                       # next join sends the promo once again
         (await asyncio.to_thread(unregister_bot_group, chat.id))
         (await asyncio.to_thread(unregister_auto_spawn_group, chat.id))
         context.application.bot_data.setdefault("active_chats", set()).discard(chat.id)
@@ -2281,7 +2324,7 @@ HELP_MODULES = {
              ("/gstats", "View bot group statistics"),
              ("/cooldown", "View character cooldowns for a group (in PM: all groups, or /cooldown <group_id>)"),
              ("/spawncooldown", "Personal /spawn cooldown for members and Scouts in ONE group: /spawncooldown <minutes> [group_id] (inside the group the id is optional), /spawncooldown reset [group_id], or /spawncooldown alone to view. Owner and Executives always keep 30 minutes. Main group -1003379716050 starts at 45 minutes; every other group stays at 1 hour")],
-            "✅ Approval requests sent to you have an Approve Group button (same as /approve). Characters spawn only in a group where the bot is an admin with the 'Add users' right (any kind of spawn, old and new groups).")),
+            "✅ Approval requests sent to you have an Approve Group button (same as /approve). Characters spawn only in a group where the bot is an admin (any kind of spawn, old and new groups).")),
         ("characters", "🎴 Characters", _help_page(
             "🎴 Characters (Owner only)",
             "Spawn, gift, discontinue and delete characters.",
