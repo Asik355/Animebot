@@ -20,11 +20,13 @@ groups. Owner, Executives, Scouts and allowed users are never blocked.
 import asyncio
 import logging
 import re
+from html import escape as _h
 import time
 from datetime import datetime, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, TypeHandler
+from telegram.ext import (ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler,
+                          TypeHandler, filters)
 from telegram import Update
 
 import mongo_db
@@ -37,7 +39,7 @@ ALLOWED_USERS = "security_allowed_users"
 SPAWN_HISTORY = "spawn_history_v2"
 
 OWNER_COMMANDS = {"bangroup", "unbangroup", "bannedgroups", "banuser", "unbanuser", "bannedusers",
-                  "allowuser", "removeallow", "allowlist", "checkuser"}
+                  "allowuser", "removeallow", "allowlist", "checkuser", "blockedmembers"}
 
 COMMAND_DESCRIPTIONS = {
     "bangroup": "Owner: ban a group - its players are blocked everywhere (/bangroup [group id])",
@@ -50,6 +52,7 @@ COMMAND_DESCRIPTIONS = {
     "removeallow": "Owner: remove special access (/removeallow <user id>)",
     "allowlist": "Owner: list users with special access",
     "checkuser": "Owner: see if a user is blocked and why (/checkuser <user id>)",
+    "blockedmembers": "Owner: who is blocked - browse or search by name, @username or id (/blockedmembers [text])",
 }
 
 BLOCKED_TEXT = "🚫 You can't use this bot."
@@ -189,7 +192,7 @@ def _user_label(uid):
     name = " ".join(x for x in (d.get("first_name"), d.get("last_name")) if x).strip()
     if d.get("username"):
         name = (name + " " if name else "") + "@" + d["username"]
-    return f"{name} ({uid})" if name else str(uid)
+    return f"{_h(name)} (<code>{int(uid)}</code>)" if name else f"<code>{int(uid)}</code>"   # HTML: tap the id to copy
 
 
 def _user_groups(uid, group_ids):
@@ -226,9 +229,9 @@ async def _refuse(update, context, uid, reason_text):
             where = update.effective_chat.title if update.effective_chat and update.effective_chat.title else (
                 "private chat" if update.effective_chat and update.effective_chat.type == "private" else "a chat")
             await context.bot.send_message(
-                chat_id=int(owner),
+                chat_id=int(owner), parse_mode="HTML",
                 text=f"🛡 SECURITY\n🚫 A blocked user tried to use the bot.\n👤 {await asyncio.to_thread(_user_label, uid)}\n"
-                     f"📍 {where}\n📌 {reason_text}\n\nAllow them with /allowuser {uid}")
+                     f"📍 {_h(str(where))}\n📌 {_h(reason_text)}\n\nAllow them with /allowuser <code>{uid}</code>")
         except Exception as e:
             logger.info("security owner notice failed: %s", e)
 
@@ -281,6 +284,7 @@ def _ok(update):
 
 
 async def _say(update, text, **kw):
+    kw.setdefault("parse_mode", "HTML")          # every id is <code>..</code> so a tap copies it
     return await _deps["safe_reply"](update.effective_message, text, **kw)
 
 
@@ -306,7 +310,7 @@ def _confirm_kb(uid, chat_id):
 async def _confirm_text(chat_id):
     title = await asyncio.to_thread(_group_title, chat_id)
     n = len(await asyncio.to_thread(_members_of, [chat_id]))
-    return (f"🚫 Ban this group?\n\n🏷 {title or 'Title not stored'}\n🆔 {chat_id}\n"
+    return (f"🚫 Ban this group?\n\n🏷 {_h(title) or 'Title not stored'}\n🆔 <code>{chat_id}</code>\n"
             f"👥 {n} player(s) caught characters there. They will be blocked everywhere (groups, PM and buttons) unless "
             "they are staff or allowed with /allowuser.\nThe bot will also ignore the group itself and leave it if it is still inside.")
 
@@ -318,20 +322,20 @@ async def bangroup_command(update, context):
     if context.args:
         chat_id = _parse_group_id(context.args[0])
         if chat_id is None:
-            await _say(update, "❌ A group id looks like -1001234567890.\nUse /bangroup alone to pick from the groups in the database.")
+            await _say(update, "❌ A group id looks like <code>-1001234567890</code>.\nUse /bangroup alone to pick from the groups in the database.")
             return
         await _say(update, await _confirm_text(chat_id), reply_markup=_confirm_kb(uid, chat_id))
         return
     choices = await asyncio.to_thread(_group_choices)
     if not choices:
-        await _say(update, "ℹ️ The database has no group with caught characters to pick from.\nUse /bangroup <group id>.")
+        await _say(update, "ℹ️ The database has no group with caught characters to pick from.\nUse /bangroup &lt;group id&gt;.")
         return
     lines, rows = ["🚫 Ban a group - tap one", ""], []
     for i, (cid, n, last, title, inside) in enumerate(choices, 1):
-        lines.append(f"{i}. {title or 'Title not stored'} · {cid}\n    👥 {n} players · {'🤖 bot inside' if inside else '🚪 bot left'}"
+        lines.append(f"{i}. {_h(title) or 'Title not stored'} · <code>{cid}</code>\n    👥 {n} players · {'🤖 bot inside' if inside else '🚪 bot left'}"
                      + (f" · last catch {last[:10]}" if last else ""))
         rows.append([InlineKeyboardButton(f"{i}. {(title or str(cid))[:30]} ({n})", callback_data=f"sec:bg:{uid}:{cid}")])
-    lines += ["", "Newest activity first. A group that is not here: /bangroup <group id>."]
+    lines += ["", "Newest activity first. A group that is not here: /bangroup &lt;group id&gt;."]
     await _say(update, "\n".join(lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -353,7 +357,7 @@ async def security_callback(update, context):
         chat_id = int(parts[3])
         if action == "bg":
             await q.answer()
-            await q.edit_message_text(await _confirm_text(chat_id), reply_markup=_confirm_kb(q.from_user.id, chat_id))
+            await q.edit_message_text(await _confirm_text(chat_id), parse_mode="HTML", reply_markup=_confirm_kb(q.from_user.id, chat_id))
         elif action == "by":
             title, n = await asyncio.to_thread(_ban_group, chat_id, q.from_user.id)
             left = ""
@@ -363,9 +367,10 @@ async def security_callback(update, context):
             except Exception:
                 pass
             await q.answer("Banned.")
-            await q.edit_message_text(f"✅ Group banned.\n🏷 {title or 'Title not stored'}\n🆔 {chat_id}\n"
+            await q.edit_message_text(f"✅ Group banned.\n🏷 {_h(title) or 'Title not stored'}\n🆔 <code>{chat_id}</code>\n"
                                       f"👥 {n} player(s) are now blocked.{left}\n\n"
-                                      "Give someone special access: /allowuser <user id>\nUndo: /unbangroup " + str(chat_id))
+                                      "Give someone special access: /allowuser &lt;user id&gt;\nUndo: /unbangroup <code>" + str(chat_id) + "</code>",
+                                      parse_mode="HTML")
     except Exception as e:
         logger.error("security callback failed: %s", e)
         try:
@@ -379,11 +384,11 @@ async def unbangroup_command(update, context):
         return
     chat_id = _parse_group_id(context.args[0]) if context.args else None
     if chat_id is None:
-        await _say(update, "Usage: /unbangroup <group id>\nSee /bannedgroups")
+        await _say(update, "Usage: /unbangroup &lt;group id&gt;\nSee /bannedgroups")
         return
     done = await asyncio.to_thread(_unban_group, chat_id)
-    await _say(update, f"✅ Group {chat_id} is not banned any more. Its players can use the bot again." if done
-               else f"ℹ️ Group {chat_id} was not banned.")
+    await _say(update, f"✅ Group <code>{chat_id}</code> is not banned any more. Its players can use the bot again." if done
+               else f"ℹ️ Group <code>{chat_id}</code> was not banned.")
     if done:
         _ok(update)
 
@@ -398,8 +403,8 @@ async def bannedgroups_command(update, context):
     lines = ["🛡 Banned Groups", ""]
     for i, d in enumerate(docs, 1):
         n = len(await asyncio.to_thread(_members_of, [d["_id"]]))
-        lines.append(f"{i}. {d.get('title') or 'Title not stored'} · {d['_id']}\n    👥 {n} players · banned {d.get('banned_at', '')}")
-    lines += ["", "Lift a ban: /unbangroup <group id>"]
+        lines.append(f"{i}. {_h(d.get('title') or '') or 'Title not stored'} · <code>{d['_id']}</code>\n    👥 {n} players · banned {_h(str(d.get('banned_at', '')))}")
+    lines += ["", "Lift a ban: /unbangroup &lt;group id&gt;"]
     await _say(update, "\n".join(lines))
 
 
@@ -408,14 +413,14 @@ async def banuser_command(update, context):
         return
     target = _target_user_id(update, context)
     if target is None:
-        await _say(update, "Usage: /banuser <user id> [reason]  (or reply to the user with /banuser)")
+        await _say(update, "Usage: /banuser &lt;user id&gt; [reason]  (or reply to the user with /banuser)")
         return
     if _deps["is_owner"](target) or await asyncio.to_thread(_is_staff, target):
         await _say(update, "❌ The Owner and staff cannot be banned. Remove their role first.")
         return
     reason = " ".join(context.args[1:]) if context.args and not (update.effective_message.reply_to_message) else " ".join(context.args)
     await asyncio.to_thread(_ban_user, target, update.effective_user.id, "manual", reason)
-    await _say(update, f"✅ {await asyncio.to_thread(_user_label, target)} is banned from the bot.\nUndo: /unbanuser {target}")
+    await _say(update, f"✅ {await asyncio.to_thread(_user_label, target)} is banned from the bot.\nUndo: /unbanuser <code>{target}</code>")
     _ok(update)
 
 
@@ -424,12 +429,12 @@ async def unbanuser_command(update, context):
         return
     target = _target_user_id(update, context)
     if target is None:
-        await _say(update, "Usage: /unbanuser <user id>  (or reply to the user)")
+        await _say(update, "Usage: /unbanuser &lt;user id&gt;  (or reply to the user)")
         return
     done = await asyncio.to_thread(_unban_user, target)
-    await _say(update, f"✅ {target} is not banned by hand any more." + (
+    await _say(update, f"✅ <code>{target}</code> is not banned by hand any more." + (
         "\nℹ️ They may still be blocked as a member of a banned group - use /allowuser to give them access." if done else "")
-        if done else f"ℹ️ {target} was not in the banned list.")
+        if done else f"ℹ️ <code>{target}</code> was not in the banned list.")
     if done:
         _ok(update)
 
@@ -442,7 +447,7 @@ async def bannedusers_command(update, context):
     lines = ["🛡 Banned Users", "", f"👥 Blocked as members of banned groups: {len(st['members'])}", f"🚫 Banned by hand / seen in a banned group: {len(docs)}", ""]
     for i, d in enumerate(docs[:40], 1):
         src = "by hand" if d.get("source") == "manual" else str(d.get("source", "")).replace("group:", "group ")
-        lines.append(f"{i}. {d['_id']} · {src}" + (f" · {d['reason']}" if d.get("reason") else ""))
+        lines.append(f"{i}. <code>{d['_id']}</code> · {_h(src)}" + (f" · {_h(str(d['reason']))}" if d.get("reason") else ""))
     if len(docs) > 40:
         lines.append(f"… and {len(docs) - 40} more")
     await _say(update, "\n".join(lines))
@@ -453,10 +458,10 @@ async def allowuser_command(update, context):
         return
     target = _target_user_id(update, context)
     if target is None:
-        await _say(update, "Usage: /allowuser <user id>  (or reply to the user)\nGives special access to someone from a banned group.")
+        await _say(update, "Usage: /allowuser &lt;user id&gt;  (or reply to the user)\nGives special access to someone from a banned group.")
         return
     await asyncio.to_thread(_allow_user, target, update.effective_user.id)
-    await _say(update, f"✅ {await asyncio.to_thread(_user_label, target)} has special access now.\nUndo: /removeallow {target}")
+    await _say(update, f"✅ {await asyncio.to_thread(_user_label, target)} has special access now.\nUndo: /removeallow <code>{target}</code>")
     _ok(update)
 
 
@@ -465,10 +470,10 @@ async def removeallow_command(update, context):
         return
     target = _target_user_id(update, context)
     if target is None:
-        await _say(update, "Usage: /removeallow <user id>")
+        await _say(update, "Usage: /removeallow &lt;user id&gt;")
         return
     done = await asyncio.to_thread(_remove_allow, target)
-    await _say(update, f"✅ Special access removed for {target}." if done else f"ℹ️ {target} had no special access.")
+    await _say(update, f"✅ Special access removed for <code>{target}</code>." if done else f"ℹ️ <code>{target}</code> had no special access.")
     if done:
         _ok(update)
 
@@ -482,7 +487,7 @@ async def allowlist_command(update, context):
         return
     lines = ["🛡 Special Access", ""]
     for i, d in enumerate(docs[:60], 1):
-        lines.append(f"{i}. {await asyncio.to_thread(_user_label, d['_id'])} · since {d.get('at', '')}")
+        lines.append(f"{i}. {await asyncio.to_thread(_user_label, d['_id'])} · since {_h(str(d.get('at', '')))}")
     await _say(update, "\n".join(lines))
 
 
@@ -491,7 +496,7 @@ async def checkuser_command(update, context):
         return
     target = _target_user_id(update, context)
     if target is None:
-        await _say(update, "Usage: /checkuser <user id>  (or reply to the user)")
+        await _say(update, "Usage: /checkuser &lt;user id&gt;  (or reply to the user)")
         return
     st = await _get_state()
     groups = await asyncio.to_thread(_user_groups, target, list(st["groups"].keys()))
@@ -503,8 +508,171 @@ async def checkuser_command(update, context):
              f"👔 Staff: {'yes' if staff else 'no'}", f"🚫 Banned by hand: {'yes' if manual else 'no'}",
              f"🔑 Special access: {'yes' if allowed else 'no'}"]
     if groups:
-        lines.append("🏠 Caught characters in banned group(s): " + ", ".join(str(g) for g in groups))
+        lines.append("🏠 Caught characters in banned group(s): " + ", ".join(f"<code>{g}</code>" for g in groups))
     await _say(update, "\n".join(lines))
+
+
+
+# ---------------- /blockedmembers: browse or search everybody who is blocked ----------------
+BM_PAGE = 12
+BM_SEARCH_MAX = 20
+SQ_INPUT = 1
+_SQ = "sec_search_scope"
+
+
+def _blocked_rows(gid=None):
+    """[(uid, name, username, catches, tag)] - players of the banned groups (gid = one group) plus users banned by hand."""
+    groups = [int(gid)] if gid else [int(d["_id"]) for d in _col(BANNED_GROUPS).find({}, {"_id": 1})]
+    counts = {}
+    if groups:
+        for r in _col(SPAWN_HISTORY).aggregate([
+                {"$match": {"chat_id": {"$in": groups}, "caught_by": {"$ne": None}}},
+                {"$group": {"_id": "$caught_by", "n": {"$sum": 1}}}]):
+            counts[int(r["_id"])] = int(r["n"])
+    manual = {} if gid else {int(d["_id"]): d for d in _col(BANNED_USERS).find({})}
+    ids = set(counts) | set(manual)
+    users = {int(d["_id"]): d for d in _col(mongo_db.USERS).find({"_id": {"$in": list(ids)}},
+                                                                {"username": 1, "first_name": 1, "last_name": 1})} if ids else {}
+    rows = []
+    for uid in ids:
+        d = users.get(uid) or {}
+        name = " ".join(x for x in (d.get("first_name"), d.get("last_name")) if x).strip()
+        tag = ""
+        if uid in manual:
+            tag = "🚫 banned by hand" if manual[uid].get("source") == "manual" else "🚫 spoke in a banned group"
+        rows.append((uid, name, d.get("username") or "", counts.get(uid, 0), tag))
+    rows.sort(key=lambda r: (-r[3], r[0]))
+    return rows
+
+
+def _bm_filter(rows, text):
+    q = (text or "").strip().lstrip("@").casefold()
+    if not q:
+        return rows
+    return [r for r in rows if q in r[1].casefold() or q in r[2].casefold() or q in str(r[0])]
+
+
+def _bm_lines(rows, start, allow):
+    lines = []
+    for i, (uid, name, username, n, tag) in enumerate(rows, start + 1):
+        who = _h(name) if name else "Unknown"
+        if username:
+            who += f" @{_h(username)}"
+        bits = [f"🆔 <code>{uid}</code>"]
+        if n:
+            bits.append(f"🎯 {n} catch{'es' if n != 1 else ''}")
+        if tag:
+            bits.append(tag)
+        if uid in allow:
+            bits.append("🔑 special access (not blocked)")
+        elif _is_staff(uid):
+            bits.append("👔 staff (not blocked)")
+        lines.append(f"{i}. {who}\n    " + " · ".join(bits))
+    return lines
+
+
+def _bm_page(gid, page):
+    rows = _blocked_rows(gid)
+    pages = max(1, -(-len(rows) // BM_PAGE))
+    page = min(max(page, 0), pages - 1)
+    allow = {int(d["_id"]) for d in _col(ALLOWED_USERS).find({}, {"_id": 1})}
+    chunk = rows[page * BM_PAGE:(page + 1) * BM_PAGE]
+    head = f"🛡 Blocked Members (page {page + 1}/{pages}) · {len(rows)} total"
+    if gid:
+        head += f"\n🏠 Group <code>{int(gid)}</code>"
+    body = _bm_lines(chunk, page * BM_PAGE, allow) if chunk else ["Nobody is blocked."]
+    return page, pages, "\n".join([head, ""] + body)
+
+
+def _bm_search(gid, text):
+    rows = _bm_filter(_blocked_rows(gid), text)
+    allow = {int(d["_id"]) for d in _col(ALLOWED_USERS).find({}, {"_id": 1})}
+    shown = rows[:BM_SEARCH_MAX]
+    head = f"🔍 Search: {_h(text)}\n{len(rows)} match(es)" + (f" - showing the first {BM_SEARCH_MAX}, type more letters to narrow it" if len(rows) > BM_SEARCH_MAX else "")
+    body = _bm_lines(shown, 0, allow) if shown else ["No blocked user matches that name, @username or id.\nA user who is not blocked will not show here - use /checkuser <id>.".replace("<id>", "&lt;id&gt;")]
+    return "\n".join([head, ""] + body)
+
+
+def _bm_kb(uid, gid, page, pages):
+    g = int(gid) if gid else 0
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"sec:bm:{uid}:{page - 1}:{g}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"sec:bm:{uid}:{page + 1}:{g}"))
+    rows = [[InlineKeyboardButton("🔍 Search by name, @username or id", callback_data=f"sec:sq:{uid}:{g}")]]
+    if nav:
+        rows.append(nav)
+    return InlineKeyboardMarkup(rows)
+
+
+async def blockedmembers_command(update, context):
+    if not await _owner_only(update):
+        return
+    uid = update.effective_user.id
+    args = list(context.args or [])
+    gid = None
+    if args and _parse_group_id(args[0]) is not None:
+        gid = _parse_group_id(args.pop(0))
+    if args:                                                    # /blockedmembers <text>  ->  search straight away
+        await _say(update, await asyncio.to_thread(_bm_search, gid, " ".join(args)))
+        return
+    page, pages, text = await asyncio.to_thread(_bm_page, gid, 0)
+    await _say(update, text, reply_markup=_bm_kb(uid, gid, page, pages))
+
+
+async def blockedmembers_callback(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")                          # sec:bm:<uid>:<page>:<group id or 0>
+    if len(parts) != 5 or not parts[2].isdigit() or q.from_user.id != int(parts[2]):
+        await q.answer("⚠️ This isn't yours.", show_alert=True)
+        return
+    if not _deps["is_owner"](q.from_user.id):
+        await q.answer("⚠️ Access Denied.", show_alert=True)
+        return
+    gid = int(parts[4]) or None
+    try:
+        page, pages, text = await asyncio.to_thread(_bm_page, gid, int(parts[3]))
+        await q.answer()
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=_bm_kb(q.from_user.id, gid, page, pages))
+    except Exception as e:
+        logger.info("blockedmembers page failed: %s", e)
+        try:
+            await q.answer()
+        except Exception:
+            pass
+
+
+async def search_start(update, context):
+    q = update.callback_query
+    parts = (q.data or "").split(":")                          # sec:sq:<uid>:<group id or 0>
+    if len(parts) != 4 or not parts[2].isdigit() or q.from_user.id != int(parts[2]):
+        await q.answer("⚠️ This isn't yours.", show_alert=True)
+        return ConversationHandler.END
+    if not _deps["is_owner"](q.from_user.id):
+        await q.answer("⚠️ Access Denied.", show_alert=True)
+        return ConversationHandler.END
+    context.user_data[_SQ] = int(parts[3]) or None
+    await q.answer()
+    await q.message.reply_text("🔍 Send a name, @username or id (part of it is enough).\nSend /cancel to stop.")
+    return SQ_INPUT
+
+
+async def search_input(update, context):
+    if not update.effective_user or not _deps["is_owner"](update.effective_user.id):
+        return ConversationHandler.END
+    text = (update.effective_message.text or "").strip()
+    if not text:
+        return SQ_INPUT
+    result = await asyncio.to_thread(_bm_search, context.user_data.get(_SQ), text)
+    await _say(update, result + "\n\n🔍 Send another name to search again, or /cancel.")
+    return SQ_INPUT                                            # stays open so you can keep searching
+
+
+async def search_cancel(update, context):
+    context.user_data.pop(_SQ, None)
+    await _say(update, "↩️ Search closed.")
+    return ConversationHandler.END
 
 
 # ---------------- help page ----------------
@@ -528,7 +696,9 @@ HELP_TEXT = (
     "8. /removeallow <user id> - Take the special access away\n"
     "9. /allowlist - List everyone with special access\n\n"
     "Check\n"
-    "10. /checkuser <user id> - See if a user is blocked and why"
+    "10. /checkuser <user id> - See if a user is blocked and why\n"
+    "11. /blockedmembers - Browse everybody who is blocked, with a 🔍 Search button (name, @username or id)\n"
+    "    /blockedmembers <text> - Search straight away (add a group id first to see one group)"
 )
 
 
@@ -544,4 +714,11 @@ def register(app):
                            ("allowuser", allowuser_command), ("removeallow", removeallow_command),
                            ("allowlist", allowlist_command), ("checkuser", checkuser_command)):
         app.add_handler(CommandHandler(name, callback))
+    app.add_handler(CommandHandler("blockedmembers", blockedmembers_command))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(search_start, pattern=r"^sec:sq:\d+:-?\d+$")],
+        states={SQ_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_input)]},
+        fallbacks=[CommandHandler("cancel", search_cancel)],
+        allow_reentry=True, conversation_timeout=180))
+    app.add_handler(CallbackQueryHandler(blockedmembers_callback, pattern=r"^sec:bm:\d+:\d+:-?\d+$"))
     app.add_handler(CallbackQueryHandler(security_callback, pattern=r"^sec:(bg|by|bn):\d+(:-?\d+)?$"))
