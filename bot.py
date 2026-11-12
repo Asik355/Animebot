@@ -728,6 +728,106 @@ async def approve_group(update, context):
         actor_id=update.effective_user.id,
     )
 
+async def approve_group_button(update, context):
+    """'✅ Approve Group' under an approval request: same as /approve <group id> (Owner, or Executive with permission)."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not (await asyncio.to_thread(has_group_approval_permission, uid)):
+        await query.answer(UNAUTHORIZED_TEXT, show_alert=True)
+        return
+    try:
+        chat_id = int((query.data or "").split(":", 1)[1])
+    except Exception:
+        await query.answer()
+        return
+    saved = await apply_group_approval(context, chat_id)
+    if not saved:
+        await query.answer("❌ Could not save the approval. Try /approve " + str(chat_id), show_alert=True)
+        return
+    group_notified = await send_group_approved_confirmation(context, chat_id)
+    await query.answer("✅ Group approved.")
+    note = "\n\n✅ Approved" + ("" if group_notified else " (could not post the confirmation in the group)")
+    try:
+        link_row = [row for row in (query.message.reply_markup.inline_keyboard if query.message.reply_markup else [])
+                    if not any((b.callback_data or "").startswith("apvg:") for b in row)]
+        await query.edit_message_text((query.message.text_html or "") + note, parse_mode="HTML",
+                                      reply_markup=InlineKeyboardMarkup(link_row) if link_row else None)
+    except Exception as e:
+        print("Approve button message update error:", e)
+    await notify_staff_action(
+        context,
+        f"✅ GROUP APPROVED\n🆔 Group ID: {chat_id}\n👤 Approved by: {display_user(query.from_user)}",
+        actor_id=uid,
+    )
+
+
+def _spawncooldown_line(minutes):
+    return f"{minutes} minutes" if minutes else "1 hour (normal)"
+
+
+async def spawncooldown_command(update, context):
+    """Owner: the personal /spawn cooldown of members and Scouts in ONE group. Owner and Executives keep 30 minutes everywhere."""
+    if not is_owner(update.effective_user.id):
+        await safe_reply_text(update.effective_message, UNAUTHORIZED_TEXT)
+        return
+    msg, chat = update.effective_message, update.effective_chat
+    args = list(context.args or [])
+    in_group = chat.type in ("group", "supergroup")
+
+    def parse_gid(text):
+        t = str(text).strip()
+        return int(t) if t.lstrip("-").isdigit() and t.startswith("-") else None
+
+    if not args:
+        if in_group:
+            m = await asyncio.to_thread(group_personal_cooldown_minutes, chat.id)
+            await safe_reply_text(msg, f"⏳ /spawn cooldown for members and Scouts in this group: {_spawncooldown_line(m)}\n"
+                                       "Owner and Executives: 30 minutes everywhere.\n\n"
+                                       "Change: /spawncooldown <minutes>   Back to normal: /spawncooldown reset")
+            return
+        await asyncio.to_thread(group_personal_cooldown_minutes, 0)          # refresh the cache
+        groups = (await asyncio.to_thread(load_bot_groups)) or {}
+        lines = ["⏳ Personal /spawn cooldown (members and Scouts)", "Normal: 1 hour. Owner and Executives: 30 minutes everywhere.", ""]
+        if _GCD["map"]:
+            for gid, minutes in sorted(_GCD["map"].items()):
+                title = (groups.get(gid) or {}).get("title") if isinstance(groups.get(gid), dict) else None
+                lines.append(f"• {html_escape(title or 'Group')} <code>{gid}</code>: {minutes} minutes")
+        else:
+            lines.append("No group has its own cooldown.")
+        lines += ["", "Set: /spawncooldown &lt;minutes&gt; &lt;group id&gt;", "Reset: /spawncooldown reset &lt;group id&gt;"]
+        await safe_reply_text(msg, "\n".join(lines), parse_mode="HTML")
+        return
+
+    reset = args[0].lower() == "reset"
+    rest = args[1:] if reset else args
+    if reset:
+        gid = parse_gid(rest[0]) if rest else (chat.id if in_group else None)
+    else:
+        if not args[0].isdigit() or not (1 <= int(args[0]) <= 720):
+            await safe_reply_text(msg, "Usage: /spawncooldown <minutes 1-720> [group_id]  or  /spawncooldown reset [group_id]")
+            return
+        gid = parse_gid(rest[1]) if len(rest) > 1 else (chat.id if in_group else None)
+    if gid is None:
+        await safe_reply_text(msg, "❌ Give the group id (it starts with -), or run this command inside the group.")
+        return
+    coll = _mc(GROUP_PERSONAL_CD_COLL)
+    try:
+        if reset:
+            await asyncio.to_thread(coll.delete_one, {"_id": int(gid)})
+            result = f"✅ Group {gid}: the /spawn cooldown for members and Scouts is back to 1 hour."
+        else:
+            minutes = int(args[0])
+            await asyncio.to_thread(coll.update_one, {"_id": int(gid)}, {"$set": {"minutes": minutes}}, upsert=True)
+            result = f"✅ Group {gid}: members and Scouts now wait {minutes} minutes between /spawn.\nOwner and Executives stay at 30 minutes."
+    except Exception as e:
+        print("spawncooldown error:", e)
+        await safe_reply_text(msg, "❌ Could not save that. Nothing was changed.")
+        return
+    _GCD["ts"] = 0.0                                                          # re-read right away
+    mark_success(update)
+    await safe_reply_text(msg, result)
+
+
 # ---------------------------------------------------------------------------------------------------
 # AUTO APPROVE (Owner only). While ON, a group the bot is added to is approved automatically, as long as it has
 # at least the minimum number of members the Owner set (0 = no limit). Smaller groups wait in "Pending".
@@ -1414,8 +1514,16 @@ GROUP_NO_LINK_NOTE = ("⚠️ No join link yet. The bot must be an admin with th
 
 # Characters spawn only in groups where the bot is an admin. Set to False to turn this rule off.
 REQUIRE_BOT_ADMIN_FOR_SPAWN = True
-BOT_JOIN_ADMIN_TEXT = "🤖 Thanks for adding me! I need <b>admin</b> rights to work properly. Please promote me."
-BOT_ADMIN_SPAWN_TEXT = "❌ Make me an admin in this group first. Characters spawn only where the bot is an admin."
+BOT_JOIN_ADMIN_TEXT = "🤖 Thanks for adding me! I need <b>admin</b> rights with the <b>Add users</b> right to work properly. Please promote me."
+BOT_ADMIN_SPAWN_TEXT = ("❌ Make me an admin with the 'Add users' right in this group first. "
+                        "Characters spawn only where the bot is an admin with the 'Add users' right.")
+
+
+def approval_markup(link, cid):
+    """Owner's approval request: '✅ Approve Group' (one tap) above '🔗 Open Group' / '🔄 Get Link'."""
+    rows = [[InlineKeyboardButton("✅ Approve Group", callback_data=f"apvg:{int(cid)}")]]
+    rows.extend(open_group_markup(link, cid).inline_keyboard if open_group_markup(link, cid) else [])
+    return InlineKeyboardMarkup(rows)
 
 
 def open_group_markup(link, cid=None):
@@ -1455,14 +1563,15 @@ async def _admin_required(app, chat_id):
 
 
 async def bot_is_group_admin(bot, app, chat_id):
-    """True when spawning is allowed here: the group is an older one (rule does not apply) or the bot is an admin.
-    Short cache (30 s while not admin, 5 min once admin).
+    """True when spawning is allowed here: the bot is an admin WITH the 'Add users' right (it needs that right to make a join
+    link, so the Owner can join and check the group). Applies to EVERY group, old and new, and to every kind of spawn.
+    Short cache (30 s while not allowed, 5 min once allowed).
     If Telegram can't be asked, this returns True so a temporary error never stops spawns."""
     if not REQUIRE_BOT_ADMIN_FOR_SPAWN:
         return True
     cid = int(chat_id)
-    if not await _admin_required(app, cid):
-        return True
+    if cid > 0:
+        return True                                   # private chat, not a group
     cache = app.bot_data.setdefault("bot_admin_cache", {})
     now = time.monotonic()
     hit = cache.get(cid)
@@ -1470,7 +1579,10 @@ async def bot_is_group_admin(bot, app, chat_id):
         return hit[0]
     try:
         member = await bot.get_chat_member(cid, bot.id)
-        ok = member.status in ("administrator", "creator")
+        if member.status == "creator":
+            ok = True
+        else:
+            ok = member.status == "administrator" and bool(getattr(member, "can_invite_users", False))
     except Exception as e:
         print(f"Bot admin check error for {cid}:", e)
         return True
@@ -1496,12 +1608,16 @@ async def group_link_callback(update, context):
                            show_alert=True)
         return
     await query.answer("Link ready.")
+    has_approve = any((b.callback_data or "").startswith("apvg:")
+                      for row in ((query.message.reply_markup.inline_keyboard if query.message and query.message.reply_markup else []))
+                      for b in row)
+    new_markup = approval_markup(link, cid) if has_approve else open_group_markup(link)
     try:
         text = re.sub(r"\n{3,}", "\n\n", (query.message.text_html or "").replace(html_escape(GROUP_NO_LINK_NOTE), "")).rstrip()
-        await query.edit_message_text(text, parse_mode="HTML", reply_markup=open_group_markup(link))
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=new_markup)
     except Exception:
         try:
-            await query.edit_message_reply_markup(reply_markup=open_group_markup(link))
+            await query.edit_message_reply_markup(reply_markup=new_markup)
         except Exception as e:
             print("Group link button update error:", e)
 
@@ -1594,7 +1710,7 @@ async def track_bot_membership(update, context):
                     group_link = await get_group_link(context.bot, context.application, chat.id, chat)
                     await context.bot.send_message(
                         chat_id=owner_id,
-                        reply_markup=open_group_markup(group_link, chat.id),
+                        reply_markup=approval_markup(group_link, chat.id),
                         text=(
                             "🔔 New Group Approval Request\n"
                             f"🏷 Group: {html_escape(chat.title or 'Unknown')}\n"
@@ -1602,7 +1718,7 @@ async def track_bot_membership(update, context):
                             f"👤 Requested by: {code_ids_html(html_escape(added_by_text))}\n"
                             + (f"{html_escape(aa_note)}\n" if aa_note else "") +
                             ("" if group_link else f"\n{html_escape(GROUP_NO_LINK_NOTE)}\n") +
-                            f"\nApprove with: <code>/approve {html_escape(str(chat.id))}</code>"
+                            f"\nApprove with: /approve <code>{html_escape(str(chat.id))}</code>"
                         ),
                         parse_mode="HTML",
                     )
@@ -2163,7 +2279,9 @@ HELP_MODULES = {
              ("/leavegroup", "In PM: /leavegroup <group_chat_id> — remove the group and leave it"),
              ("/status", "Bot status and active spawns"),
              ("/gstats", "View bot group statistics"),
-             ("/cooldown", "View character cooldowns for a group (in PM: all groups, or /cooldown <group_id>)")])),
+             ("/cooldown", "View character cooldowns for a group (in PM: all groups, or /cooldown <group_id>)"),
+             ("/spawncooldown", "Personal /spawn cooldown for members and Scouts in ONE group: /spawncooldown <minutes> [group_id] (inside the group the id is optional), /spawncooldown reset [group_id], or /spawncooldown alone to view. Owner and Executives always keep 30 minutes. Main group -1003379716050 starts at 45 minutes; every other group stays at 1 hour")],
+            "✅ Approval requests sent to you have an Approve Group button (same as /approve). Characters spawn only in a group where the bot is an admin with the 'Add users' right (any kind of spawn, old and new groups).")),
         ("characters", "🎴 Characters", _help_page(
             "🎴 Characters (Owner only)",
             "Spawn, gift, discontinue and delete characters.",
@@ -2488,13 +2606,49 @@ def berry_display_name(user):
     last = (user.last_name or "").strip()
     return " ".join(part for part in (first, last) if part) or "Unknown"
 
-def personal_spawn_cooldown(user_id):
-    """/spawn cooldown in seconds: Owner and Executive 30 minutes; Scouts and general members 1 hour (unchanged)."""
+GROUP_PERSONAL_CD_COLL = "group_personal_cooldown_v1"      # {_id: chat_id, minutes} - Owner-set /spawn cooldown of one group
+DEFAULT_GROUP_PERSONAL_COOLDOWNS = {-1003379716050: 45}    # main group: members and Scouts wait 45 min. Saved once at the first
+                                                            # start; after that only /spawncooldown changes it (also "reset").
+_GCD = {"ts": 0.0, "map": {}}
+
+
+def _load_group_cooldowns_sync():
+    coll = _mc(GROUP_PERSONAL_CD_COLL)
+    if coll.find_one({"_id": "_seeded"}) is None:
+        for gid, minutes in DEFAULT_GROUP_PERSONAL_COOLDOWNS.items():
+            coll.update_one({"_id": int(gid)}, {"$setOnInsert": {"minutes": int(minutes)}}, upsert=True)
+        coll.update_one({"_id": "_seeded"}, {"$set": {"v": 1}}, upsert=True)
+    return {int(d["_id"]): int(d["minutes"]) for d in coll.find({"minutes": {"$gt": 0}}) if isinstance(d["_id"], int)}
+
+
+def group_personal_cooldown_minutes(chat_id):
+    """Minutes set for this group with /spawncooldown, or None (= the normal 1 hour). Cached for 60 s."""
+    now = time.monotonic()
+    if now - _GCD["ts"] > 60:
+        try:
+            _GCD["map"] = _load_group_cooldowns_sync()
+            _GCD["ts"] = now
+        except Exception as e:
+            print("Group cooldown load error:", e)
+            _GCD["ts"] = now - 50                       # retry in 10 s, keep what is known
+    try:
+        return _GCD["map"].get(int(chat_id))
+    except Exception:
+        return None
+
+
+def personal_spawn_cooldown(user_id, chat_id=None):
+    """/spawn cooldown in seconds. Owner and Executive: 30 minutes everywhere. Scouts and general members: 1 hour, or the
+    minutes the Owner set for THIS group with /spawncooldown (main group: 45)."""
     try:
         if is_owner(user_id) or is_executive(user_id):
             return STAFF_SPAWN_COOLDOWN
     except Exception:
         pass
+    if chat_id is not None:
+        minutes = group_personal_cooldown_minutes(chat_id)
+        if minutes:
+            return int(minutes) * 60
     return PERSONAL_SPAWN_COOLDOWN
 
 
@@ -5231,7 +5385,7 @@ async def spawn(update, context):
 
     now_dt = datetime.now()
     last_calls = context.application.bot_data.setdefault("last_calls", {})
-    personal_remaining = personal_spawn_cooldown(user_id) - (now_dt - last_calls[user_id]).total_seconds() if user_id in last_calls else 0
+    personal_remaining = personal_spawn_cooldown(user_id, chat_id) - (now_dt - last_calls[user_id]).total_seconds() if user_id in last_calls else 0
     if personal_remaining > 0:
         await safe_reply_text(
             update.message,
@@ -5313,7 +5467,7 @@ async def build_cooldown_text(app, chat_id, user_id, title=None, personal=True):
 
     # Personal and group /spawn cooldowns.
     last_calls = app.bot_data.setdefault("last_calls", {})
-    personal_remaining = (personal_spawn_cooldown(user_id) - (now_dt - last_calls[user_id]).total_seconds()
+    personal_remaining = (personal_spawn_cooldown(user_id, chat_id) - (now_dt - last_calls[user_id]).total_seconds()
                           if user_id in last_calls else 0)
     personal_text = format_duration(personal_remaining) if personal_remaining > 0 else "Ready"
 
@@ -14971,6 +15125,7 @@ COMMANDS = {
     "redeems": "Owner: list redeem codes",
     "history": "Owner: spawn history",
     "approve": "Owner/trusted Executive: approve a group (PM: /approve <group_chat_id>)",
+    "spawncooldown": "Owner: personal /spawn cooldown of members and Scouts in one group (/spawncooldown <minutes> [group_id], reset)",
     "removeapprove": "Owner/trusted Executive: remove group approval (PM: /removeapprove <group_chat_id>)",
     "addgroupapprove": "Owner: give an Executive group approval permission",
     "removegroupapprove": "Owner: remove an Executive's group approval permission",
@@ -15924,7 +16079,7 @@ OWNER_COMMANDS = {
     "addexec", "removeexec", "addscout", "removescout",
     "addevent", "endevent", "addredeem", "deleteredeem", "redeems", "history",
     "approve", "removeapprove", "addgroupapprove", "removegroupapprove", "leavegroup", "autoapprove", "removechar", "boton", "dm", "dmhistory", "dmall",
-    "status", "gstats", "cooldown", "cd", "notifications", "notificationoff", "notificationon",
+    "status", "gstats", "cooldown", "cd", "spawncooldown", "notifications", "notificationoff", "notificationon",
     "notificationhistory",
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
@@ -15960,6 +16115,8 @@ def register_owner_commands(app):
     app.add_handler(CallbackQueryHandler(cooldown_refresh_callback, pattern=r"^cd:r:(all|-?\d+)$"))
     app.add_handler(CommandHandler("gstats", gstats))
     app.add_handler(CommandHandler("approve", approve_group))
+    app.add_handler(CommandHandler("spawncooldown", spawncooldown_command))
+    app.add_handler(CallbackQueryHandler(approve_group_button, pattern=r"^apvg:-?\d+$"))
     app.add_handler(CommandHandler("removeapprove", remove_approval))
     app.add_handler(CommandHandler("addgroupapprove", add_group_approval_permission))
     app.add_handler(CommandHandler("removegroupapprove", remove_group_approval_permission))
