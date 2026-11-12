@@ -116,6 +116,7 @@ import mongo_db
 import fusion  # Special Stone Daily Task System
 import theme   # Bot Theme Customization (Owner: /help -> Owner Commands -> 🎨 Customize Bot)
 import badge_banner  # Character badges + profile banners (all logic lives in badge_banner.py)
+import security  # Security: banned groups / banned users / special access (all logic lives in security.py)
 import rewards  # Rewards: festivals with timed quests + hidden event card/banner (all logic lives in rewards.py)
 
 
@@ -2330,6 +2331,7 @@ def invites_commands_text():
             lines.append(f"{number}. /{n} - {str(desc[n]).removeprefix('Owner: ')}")
     return "\n".join(lines)
 HELP_MODULES["owner"].append(("invites", "🎁 Invites", INVITES_HELP_TEXT))                  # Owner only: page with 📦 Boxes (opens the manager) and 📋 Commands
+HELP_MODULES["owner"].append(security.help_module())                                        # 🛡 Security (Owner only), right after Invites
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -2348,7 +2350,7 @@ def _help_module_visible(key, user_id):
         return False
     if key == "scouts" and is_owner(uid):
         return False
-    if key in ("customize", "autoapprove", "festival", "invites") and not is_owner(uid):
+    if key in ("customize", "autoapprove", "festival", "invites", "security") and not is_owner(uid):
         return False
     if key == "range" and not (is_owner(uid) or is_executive(uid)):
         return False
@@ -6884,12 +6886,14 @@ async def characters(update, context):
         return f"📺 <b>Anime: {html_escape(name)}</b>" + (" <i>(continued)</i>" if cont else "")
 
     blocks = []                                    # list of (anime_name, [lines])
+    number = 0                                     # one running number over the whole list (never restarts per anime)
     for key in order:
         name, members = groups[key]
-        blocks.append((name, [
-            f"{i}. {rarity_text(r)} {html_escape(str(cname))} [{html_escape(str(code))}]"
-            for i, (code, cname, _a, r, _w, _p) in enumerate(members, 1)
-        ]))
+        block_lines = []
+        for (code, cname, _a, r, _w, _p) in members:
+            number += 1
+            block_lines.append(f"{number}. {rarity_text(r)} {html_escape(str(cname))} [{html_escape(str(code))}]")
+        blocks.append((name, block_lines))
 
     chunk = html_escape(header) + "\n\n"
     for name, block_lines in blocks:
@@ -15022,6 +15026,7 @@ COMMANDS = {
 }
 COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 COMMANDS.update(rewards.COMMAND_DESCRIPTIONS)
+COMMANDS.update(security.COMMAND_DESCRIPTIONS)
 
 PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | rewards.PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
@@ -15924,7 +15929,7 @@ OWNER_COMMANDS = {
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
     "logroute", "unlogroute", "logroutes", "logdefault", "exportdb", "importdb",
-} | rewards.OWNER_COMMANDS       # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
+} | rewards.OWNER_COMMANDS | security.OWNER_COMMANDS       # security.py: /bangroup /unbangroup ...  # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
 def register_owner_commands(app):
@@ -16215,6 +16220,10 @@ def main():
                   mark_success=mark_success, save_user=save_user_async, timestamp=timestamp,
                   rarities=tuple(r for r in SYMBOL if r not in ("Heavenly", "Special")), symbols=SYMBOL,
                   items_per_page=ITEMS_PER_PAGE)
+    security.bind(is_owner=is_owner, is_staff=lambda u: is_owner(u) or is_executive(u) or bool(is_scout(u)),
+                  owner_id=ADMIN_IDS[0] if ADMIN_IDS else None, safe_reply=safe_reply_text,
+                  unauthorized_text=UNAUTHORIZED_TEXT, mark_success=mark_success)
+    security.register(app)      # gate (group -299) + /bangroup /unbangroup /bannedgroups /banuser /unbanuser /bannedusers /allowuser /removeallow /allowlist /checkuser
     rewards.register(app)       # /quests + owner /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 
     register_executive_commands(app)
