@@ -26,6 +26,9 @@ Evolution system (same file, second half): /addevo (Owner+Executive), /evolution
 `evolution_recipes` (one recipe per base character, _id = evolution character code). Evolution Stones = the same
 `users.special_stones` field the stone tasks pay into. See the "EVOLUTION SYSTEM" section below.
 
+Weapons (last section): weapon items, /weaponshop, group weapon drops and the weapon slot of an evolution recipe (/evoweapon);
+bot.py only merges fusion.WEAPON_*_COMMANDS / WEAPON_COMMAND_DESCRIPTIONS into its command lists.
+
 Stone task reminders (stone_remind) + Daily Missions (/dailytask) are the last sections of this file: separate system, independent of /daily and of the stone tasks.
     Hooks: dt_record_catch(...) in add(), dt_record_purchase(...) in the shop. See the DAILY MISSIONS section.
 
@@ -44,6 +47,7 @@ from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
 import mongo_db
+import rewards  # Mystery Box lines for /item (rewards.item_lines)
 
 logger = logging.getLogger(__name__)
 
@@ -469,10 +473,11 @@ def _register_stone(app):
 
 
 def register(app):
-    """Attach every Fusion handler (stone tasks + Evolution). Call fusion.bind(...) first."""
+    """Attach every Fusion handler (stone tasks + Evolution + Weapons). Call fusion.bind(...) first."""
     _register_stone(app)
     _register_evolution(app)
     _register_dailytask(app)
+    _register_weapons(app)
 
 
 # ==========================================================================
@@ -729,6 +734,26 @@ def create_evolution_sync(base_code, base_qty, name, anime, rarity, worth, stone
     return {"ok": True}
 
 
+def set_recipe_weapon_sync(evo_code, weapon_code, stones=None):
+    """Attach (weapon_code) or remove (None) the weapon an evolution needs. With a weapon the recipe may need 0 stones;
+    without one it needs at least EVO_MIN_STONES again. Returns {"ok": True, "stones": n} or {"ok": False, "error": text}."""
+    evo_code = str(evo_code)
+    recipe = get_recipe_sync(evo_code) if _valid_code(evo_code) else None
+    if recipe is None:
+        return {"ok": False, "error": "❌ No evolution recipe found for that code."}
+    if weapon_code is not None and get_weapon(weapon_code) is None:
+        return {"ok": False, "error": "❌ That weapon code does not exist."}
+    if stones is not None and not (isinstance(stones, int) and 0 <= stones <= EVO_MAX_STONES):
+        return {"ok": False, "error": f"❌ Stones must be a whole number from 0 to {EVO_MAX_STONES}."}
+    new_stones = int(recipe["stones"]) if stones is None else int(stones)
+    if weapon_code is None:
+        new_stones = max(new_stones, EVO_MIN_STONES)
+        _recipes().update_one({"_id": evo_code}, {"$set": {"stones": new_stones}, "$unset": {"weapon_code": ""}})
+    else:
+        _recipes().update_one({"_id": evo_code}, {"$set": {"stones": new_stones, "weapon_code": str(weapon_code)}})
+    return {"ok": True, "stones": new_stones}
+
+
 def delete_recipe_sync(evo_code):
     """Deletes ONLY the recipe. Evolution characters (and the copies users own) are untouched."""
     return _recipes().delete_one({"_id": str(evo_code)}).deleted_count == 1
@@ -752,10 +777,10 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
     user_id, evo_code = int(user_id), str(evo_code)
     # `state` records what was applied so it can be undone by hand ONLY when the server has no transactions
     # (mongo_db.run_transaction then calls fn(None)). With a real transaction MongoDB rolls everything back itself.
-    state = {"no_txn": False, "receipt": None, "deducted": None, "deleted": []}
+    state = {"no_txn": False, "receipt": None, "deducted": None, "deleted": [], "weapon": None}
 
     def _work(session):
-        state.update(no_txn=session is None, receipt=None, deducted=None, deleted=[])   # _work may be retried
+        state.update(no_txn=session is None, receipt=None, deducted=None, deleted=[], weapon=None)   # _work may be retried
         users = mongo_db.col(USERS_COL)
         recipe = _recipes().find_one({"_id": evo_code}, session=session)
         if not recipe:
@@ -786,6 +811,12 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
             have = mongo_db.count_user_copies(user_id, code, session=session)
             if have < need:
                 raise _EvoAbort("nocopies", have=have, need=need, code=code)
+        weapon_code = recipe.get("weapon_code")          # optional weapon slot: the player must own 1 of this weapon
+        if weapon_code:
+            if get_weapon(weapon_code) is None:
+                raise _EvoAbort("noweapon_def", code=weapon_code)
+            if count_user_weapon(user_id, weapon_code, session=session) < 1:
+                raise _EvoAbort("noweapon", code=weapon_code)
         have_stones, have_coins = int(user.get("special_stones") or 0), int(user.get("coins") or 0)
         if have_stones < stones:
             raise _EvoAbort("nostones", have=have_stones, need=stones)
@@ -799,6 +830,11 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
             raise _EvoAbort("changed")
         state["deducted"] = (stones, berries)
 
+        if weapon_code:                                  # the weapon is used up together with the cards
+            if not take_user_weapon(user_id, weapon_code, 1, session=session):
+                raise _EvoAbort("changed")
+            state["weapon"] = weapon_code
+
         copies = mongo_db.col(mongo_db.COLLECTIONS)
         for code, need in ingredients:
             for _ in range(need):                  # exactly `need` copies of each card; extra copies stay untouched
@@ -811,7 +847,7 @@ def evolve_sync(user_id, evo_code, receipt_key=None):
 
         mongo_db.add_collection(user_id, evo_code, _stamp(), session=session)   # exactly 1 result
         return {"status": "ok", "base_code": ingredients[0][0], "base_qty": ingredients[0][1], "ingredients": ingredients,
-                "stones": stones, "berries": berries, "evo_code": evo_code}
+                "stones": stones, "berries": berries, "evo_code": evo_code, "weapon": weapon_code}
 
     try:
         result = mongo_db.run_transaction(_work)
@@ -833,13 +869,15 @@ def _balances(user_id):
 
 
 def _undo_manually(user_id, state):
-    """No-transaction fallback only: put back deleted base copies, refund stones/berries, free the card receipt."""
+    """No-transaction fallback only: put back deleted base copies and the weapon, refund stones/berries, free the card receipt."""
     try:
         for doc in state["deleted"]:
             mongo_db.col(mongo_db.COLLECTIONS).insert_one(doc)
         if state["deducted"]:
             stones, berries = state["deducted"]
             mongo_db.col(USERS_COL).update_one({"_id": int(user_id)}, {"$inc": {"special_stones": stones, "coins": berries}})
+        if state.get("weapon"):
+            add_user_weapon(user_id, state["weapon"], 1)
         if state["receipt"]:
             mongo_db.col(mongo_db.OP_RECEIPTS).delete_one({"_id": state["receipt"]})
     except Exception as e:   # never hide the original problem
@@ -856,6 +894,11 @@ def evolve_error_text(res):
         return "❌ The base character no longer exists."
     if s == "nouser":
         return "❌ Please use /start first."
+    if s == "noweapon_def":
+        return "❌ The weapon this evolution needs no longer exists. Nothing was used."
+    if s == "noweapon":
+        w = get_weapon(res.get("code"))
+        return f"❌ You need the weapon {w['name'] if w else res.get('code')} to do this evolution. Nothing was used."
     if s == "nocopies":
         row = _row(res["code"]) if res.get("code") else None
         return f"❌ You need {res['need']}× {row[1] if row else 'the base character'} but only have {res['have']}. Nothing was used."
@@ -884,6 +927,9 @@ def evolution_list_pages_sync():
         if len(ingredients) > 1:
             lines.append(f"   + {ingredients[1][1]}× {_char_label(rows[1])}")
         lines.append(f"   ➡️ {_char_label(evo)}")
+        if r.get("weapon_code"):
+            wpn = get_weapon(r["weapon_code"])
+            lines.append(f"   ⚔️ Weapon: {wpn['name'] if wpn else '?'} [{r['weapon_code']}] ×1")
         lines.append(f"   💎 {r['stones']} Stones • 🪙 {r['berries']:,} Berries")
         blocks.append("\n".join(lines))
     if not blocks:
@@ -933,23 +979,33 @@ def build_card_sync(user_id, recipe):
     else:
         sym = fusion_symbol(recipe)
         who = f"{sym} Card A: {rows[0][1]} ×{ingredients[0][1]}\n{sym} Card B: {rows[1][1]} ×{ingredients[1][1]}\n"
+    weapon_line, weapon_have = "", ""
+    if recipe.get("weapon_code"):
+        wpn = get_weapon(recipe["weapon_code"])
+        owned = count_user_weapon(user_id, recipe["weapon_code"])
+        weapon_line = f"⚔️ Weapon: {wpn['name'] if wpn else '?'} [{recipe['weapon_code']}] ×1\n"
+        weapon_have = f" • ⚔️ {owned}"
     return (
         "EVOLUTION\n\n"
         f"{who}"
+        f"{weapon_line}"
         f"💎 Evolution Stone: ×{recipe['stones']}\n"
         f"🪙 Berries: {recipe['berries']:,}\n\n"
         "⬇️\n\n"
         f"✨ Result: {evo[1]} ×1\n\n"
-        f"You have: {have} • 💎 {stones} • 🪙 {coins:,}"
+        f"You have: {have}{weapon_have} • 💎 {stones} • 🪙 {coins:,}"
     )
 
 
 def success_text(res):
     used = " + ".join(f"{(_row(c)[1] if _row(c) else c)} ×{q}" for c, q in res.get("ingredients") or [(res["base_code"], res["base_qty"])])
     evo = _row(res["evo_code"])
+    wpn = get_weapon(res.get("weapon")) if res.get("weapon") else None
+    weapon_used = f"⚔️ Weapon used: {wpn['name']} [{res['weapon']}] ×1\n" if res.get("weapon") else ""
     return (
         "✅ EVOLUTION COMPLETE!\n\n"
         f"{FUSION_SYMBOL_DIFF if len(res.get('ingredients') or []) > 1 else FUSION_SYMBOL_SAME} Used: {used}\n"
+        f"{weapon_used}"
         f"💎 Stones used: {res['stones']}\n"
         f"🪙 Berries used: {res['berries']:,}\n\n"
         f"✨ Received: {evo[1] if evo else res['evo_code']} ×1\n\n"
@@ -1361,8 +1417,10 @@ def _creates_cycle(ingredient_codes, evo_code):
     return _is_ancestor(evo_code, ingredient_codes)
 
 
-def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berries, second_code=None, second_qty=None):
-    """Checks for /editevo (the evolution character already exists, so codes are compared against OTHER characters)."""
+def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berries, second_code=None, second_qty=None,
+                         weapon_code=None):
+    """Checks for /editevo (the evolution character already exists, so codes are compared against OTHER characters).
+    A recipe that needs a weapon may have 0 or more Evolution Stones; every other recipe needs at least EVO_MIN_STONES."""
     base_code, new_code = str(base_code), str(new_code)
     pair = second_code is not None
     if not _valid_code(new_code):
@@ -1385,8 +1443,9 @@ def validate_recipe_edit(evo_code0, new_code, base_code, base_qty, stones, berri
             return "❌ A character cannot evolve into itself (card B equals the evolution code)."
         if not isinstance(second_qty, int) or not (1 <= second_qty <= EVO_MAX_BASE_QTY):
             return f"❌ Card B quantity must be a whole number from 1 to {EVO_MAX_BASE_QTY}."
-    if not isinstance(stones, int) or stones < EVO_MIN_STONES:
-        return f"❌ Evolution Stones must be at least {EVO_MIN_STONES}."
+    min_stones = 0 if weapon_code else EVO_MIN_STONES
+    if not isinstance(stones, int) or stones < min_stones:
+        return f"❌ Evolution Stones must be at least {min_stones}."
     if stones > EVO_MAX_STONES:
         return f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}."
     if not isinstance(berries, int) or berries < 0 or berries > EVO_MAX_BERRIES:
@@ -1405,8 +1464,9 @@ def edit_evolution_sync(code0, v, edited_by):
     v = {name, anime, rarity, worth, photo (or None to keep), code, base, qty, stones, berries[, second, qty2]}
     """
     pair = v.get("second") is not None
+    weapon_code = (get_recipe_sync(code0) or {}).get("weapon_code")       # the weapon slot is kept as it is by /editevo
     err = validate_recipe_edit(code0, v["code"], v["base"], v["qty"], v["stones"], v["berries"],
-                               v.get("second") if pair else None, v.get("qty2") if pair else None) \
+                               v.get("second") if pair else None, v.get("qty2") if pair else None, weapon_code) \
         or heavenly_error(v["rarity"], [v["base"]] + ([v["second"]] if pair else []))
     if err:
         return {"ok": False, "error": err}
@@ -1637,6 +1697,7 @@ def item_text_sync(user_id):
     lines = ["🎒 YOUR ITEMS", ""]
     for _key, emoji, name, field in ITEM_REGISTRY:
         lines.append(f"{emoji} {name}: {_dotted_get(doc, field)}")
+    lines += rewards.item_lines(doc)         # Mystery Boxes the user owns (only listed here, opened from /invite)
     return "\n".join(lines)
 
 
@@ -1963,7 +2024,8 @@ async def editevo_qty2(update, context):
 async def _x_stones_prompt(msg, d):
     recipe = d["eevo_recipe"]
     cur = recipe["stones"] if recipe else None
-    await _reply(msg, f"{_xl(d, 9, 11)} Evolution Stones required (minimum {EVO_MIN_STONES}){_skip_hint(d)}.\nCurrent: {_current(cur)}",
+    min_s = 0 if (recipe or {}).get("weapon_code") else EVO_MIN_STONES
+    await _reply(msg, f"{_xl(d, 9, 11)} Evolution Stones required (minimum {min_s}){_skip_hint(d)}.\nCurrent: {_current(cur)}",
                  reply_markup=_skip_markup() if recipe else None)
 
 
@@ -1976,8 +2038,9 @@ async def editevo_stones(update, context):
         d["eevo_stones"] = int(recipe["stones"])
     else:
         n = _parse_int(msg.text)
-        if n is None or n < EVO_MIN_STONES:
-            await _reply(msg, f"❌ Evolution Stones must be a number of at least {EVO_MIN_STONES}.")
+        min_s = 0 if (recipe or {}).get("weapon_code") else EVO_MIN_STONES
+        if n is None or n < min_s:
+            await _reply(msg, f"❌ Evolution Stones must be a number of at least {min_s}.")
             return X_STONES
         if n > EVO_MAX_STONES:
             await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
@@ -2587,3 +2650,1460 @@ def _register_dailytask(app):
     app.add_handler(CommandHandler("dailytask", dailytask_command))
     app.add_handler(CallbackQueryHandler(dailytask_claim_callback, pattern=r"^dtask:claim:\d+(:\d{4}-\d{2}-\d{2})?$"))
     app.add_handler(CallbackQueryHandler(dailytask_back_callback, pattern=r"^dailytask:back:\d+$"))
+
+
+# ==========================================================================
+# WEAPONS: weapon items, weapon shop, group drops, and the weapon slot of an evolution recipe
+# ==========================================================================
+# Storage: weapons (catalog, _id = the 4-digit weapon code), user_weapons (_id = "<user_id>:<code>", qty), weapon_settings (_id = "drops"),
+# weapon_drops (one doc per drop). Berries = users.coins. A recipe may carry weapon_code: /evolve then also uses up 1 weapon.
+# Commands: public /weapons /weaponshop | Owner+Executive /addweapon /editweapon /weaponlist /evoweapon |
+#           Owner /delweapon /giveweapon /weapondrops /dropgroups /dropconfig /dropnow
+import re
+import secrets
+
+WEAPONS_COL = "weapons"
+USER_WEAPONS_COL = "user_weapons"
+SETTINGS_COL = "weapon_settings"
+DROPS_COL = "weapon_drops"
+
+BERRY = "⦵"
+MAX_PRICE = 1_000_000_000
+MAX_QTY = 99
+MAX_STOCK = 1000
+TICK_SECONDS = 15
+
+WEAPON_PUBLIC_COMMANDS = {"weapons", "weaponshop"}
+WEAPON_STAFF_COMMANDS = {"addweapon", "editweapon", "weaponlist", "evoweapon"}        # Owner + Executive
+WEAPON_OWNER_COMMANDS = {"delweapon", "giveweapon", "weapondrops", "dropgroups", "dropconfig", "dropnow"}
+WEAPON_COMMAND_DESCRIPTIONS = {
+    "weapons": "View your weapons",
+    "weaponshop": "Open the weapon shop",
+    "addweapon": "Owner/Executive: add a weapon (PM)",
+    "editweapon": "Owner/Executive: edit a weapon",
+    "weaponlist": "Owner/Executive: list every weapon",
+    "evoweapon": "Owner/Executive: set the weapon an evolution needs",
+    "delweapon": "Owner: delete a weapon",
+    "giveweapon": "Owner: give a weapon to a user",
+    "weapondrops": "Owner: manage weapon drops",
+    "dropgroups": "Owner: choose the groups that get weapon drops",
+    "dropconfig": "Owner: drop timing, stock and prices",
+    "dropnow": "Owner: start a weapon drop now",
+}
+
+
+# ---------------------------------------------------------------- small helpers
+def _col(name):
+    return mongo_db.col(name)
+
+
+def _utcnow():
+    return datetime.now(timezone.utc)
+
+
+def _aware(dt):
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _is_owner(uid):
+    return bool(_deps["is_owner"](uid))
+
+
+def _is_staff(uid):
+    return bool(_deps["is_owner"](uid) or _deps["is_executive"](uid))
+
+
+def _rarity_text(rarity):
+    fn = _deps.get("rarity_text")
+    if fn:
+        return fn(rarity)
+    return f"{_deps['symbols'].get(rarity, '⭐')} {rarity}"
+
+
+def _rarities():
+    return [r for r in _deps["symbols"] if r != "Special"]
+
+
+def norm_code(text):
+    """A weapon code is a unique 4-digit code like characters and evolutions (0001-9999); None when it is not one."""
+    t = str(text or "").strip()
+    return t if _valid_code(t) else None
+
+
+async def _notify(context, text, user):
+    try:
+        if _deps.get("notify"):
+            await _deps["notify"](context, text, actor_id=user.id)
+    except Exception as e:
+        logger.info("weapon notification skipped: %s", e)
+
+
+def _success(update):
+    try:
+        if _deps.get("mark_success"):
+            _deps["mark_success"](update)
+    except Exception:
+        pass
+
+
+def _weapon_label(w):
+    return f"{w['name']} [{w['_id']}]"
+
+
+# ---------------------------------------------------------------- weapon catalog + inventory (sync)
+def get_weapon(code):
+    return _col(WEAPONS_COL).find_one({"_id": code}) if code else None
+
+
+def all_weapons():
+    return sorted(_col(WEAPONS_COL).find({}), key=lambda w: w["_id"])
+
+
+def find_weapon(query):
+    """A weapon by code or by name (exact, then a unique partial match). Returns (weapon|None, error|None)."""
+    code = norm_code(query)
+    if code:
+        w = get_weapon(code)
+        return (w, None) if w else (None, "❌ That weapon code does not exist.")
+    q = str(query or "").strip().casefold()
+    if not q:
+        return None, "❌ Send a weapon code or name."
+    items = all_weapons()
+    exact = [w for w in items if w["name"].casefold() == q]
+    part = exact or [w for w in items if q in w["name"].casefold()]
+    if len(part) == 1:
+        return part[0], None
+    if not part:
+        return None, "❌ Weapon not found."
+    return None, "❓ Several weapons match that name. Please use the weapon code."
+
+
+def _inv_id(user_id, code):
+    return f"{int(user_id)}:{code}"
+
+
+def count_user_weapon(user_id, code, session=None):
+    doc = _col(USER_WEAPONS_COL).find_one({"_id": _inv_id(user_id, code)}, session=session)
+    return int((doc or {}).get("qty") or 0)
+
+
+def add_user_weapon(user_id, code, qty=1, session=None):
+    _col(USER_WEAPONS_COL).update_one(
+        {"_id": _inv_id(user_id, code)},
+        {"$inc": {"qty": int(qty)}, "$setOnInsert": {"user_id": int(user_id), "weapon_code": code}},
+        upsert=True, session=session)
+
+
+def take_user_weapon(user_id, code, qty=1, session=None):
+    """Removes `qty` weapons only if the user really has them. True when taken."""
+    col = _col(USER_WEAPONS_COL)
+    res = col.update_one({"_id": _inv_id(user_id, code), "qty": {"$gte": int(qty)}}, {"$inc": {"qty": -int(qty)}},
+                         session=session)
+    if res.modified_count != 1:
+        return False
+    col.delete_one({"_id": _inv_id(user_id, code), "qty": {"$lte": 0}}, session=session)
+    return True
+
+
+def user_weapons_sync(user_id):
+    """[(weapon, qty), ...] sorted by code, only weapons that still exist."""
+    rows = list(_col(USER_WEAPONS_COL).find({"user_id": int(user_id), "qty": {"$gt": 0}}))
+    out = []
+    for r in sorted(rows, key=lambda x: str(x.get("weapon_code"))):
+        w = get_weapon(r.get("weapon_code"))
+        if w:
+            out.append((w, int(r["qty"])))
+    return out
+
+
+def _user_exists(user_id):
+    return _col(USERS_COL).find_one({"_id": int(user_id)}, {"_id": 1}) is not None
+
+
+def _balance(user_id):
+    doc = _col(USERS_COL).find_one({"_id": int(user_id)}, {"coins": 1}) or {}
+    return int(doc.get("coins") or 0)
+
+
+def _charge(user_id, amount):
+    """Takes Berries only if the user has enough (one conditional update). True when charged."""
+    amount = int(amount)
+    if amount <= 0:
+        return True
+    res = _col(USERS_COL).update_one({"_id": int(user_id), "coins": {"$gte": amount}}, {"$inc": {"coins": -amount}})
+    return res.modified_count == 1
+
+
+def _refund(user_id, amount):
+    if int(amount) > 0:
+        _col(USERS_COL).update_one({"_id": int(user_id)}, {"$inc": {"coins": int(amount)}})
+
+
+def _receipt_take(key):
+    """One-click guard: False when this confirmation was already processed."""
+    if not key:
+        return True
+    try:
+        _col(mongo_db.OP_RECEIPTS).insert_one({"_id": str(key), "result": {"weapon_shop": True}, "created_at": _utcnow()})
+        return True
+    except mongo_db.DuplicateKeyError:
+        return False
+
+
+def _receipt_free(key):
+    if key:
+        try:
+            _col(mongo_db.OP_RECEIPTS).delete_one({"_id": str(key)})
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- shop (sync)
+def shop_items_sync():
+    return [w for w in all_weapons() if w.get("shop_enabled") and int(w.get("shop_price") or 0) > 0]
+
+
+def shop_buy_sync(user_id, code, receipt_key=None):
+    w = get_weapon(code)
+    if not w or not w.get("shop_enabled") or int(w.get("shop_price") or 0) <= 0:
+        return {"status": "notforsale"}
+    price = int(w["shop_price"])
+    if not _user_exists(user_id):
+        return {"status": "nouser"}
+    if not _receipt_take(receipt_key):
+        return {"status": "dup"}
+    if not _charge(user_id, price):
+        _receipt_free(receipt_key)
+        return {"status": "noberries", "need": price, "have": _balance(user_id)}
+    try:
+        add_user_weapon(user_id, code, 1)
+    except Exception:
+        _refund(user_id, price)
+        _receipt_free(receipt_key)
+        raise
+    return {"status": "ok", "weapon": w, "price": price, "owned": count_user_weapon(user_id, code),
+            "balance": _balance(user_id)}
+
+
+# ---------------------------------------------------------------- shop (UI)
+def _shop_caption(w, idx, total, owned):
+    return (
+        "⚔️ WEAPON SHOP\n\n"
+        f"⚔️ {w['name']} [{w['_id']}]\n"
+        f"📺 Anime: {w.get('anime') or '-'}\n"
+        f"{_rarity_text(w.get('rarity'))}\n"
+        f"🪙 Price: {int(w['shop_price']):,} {BERRY}\n"
+        f"🎒 You own: {owned}\n\n"
+        f"📦 Weapon {idx + 1}/{total}\n"
+        "ℹ️ Weapons are used in /evolve."
+    )
+
+
+def _shop_keyboard(uid, idx, total, w):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    rows = []
+    if total > 1:
+        rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"wshop:page:{uid}:{(idx - 1) % total}"),
+                     InlineKeyboardButton("▶️ NEXT", callback_data=f"wshop:page:{uid}:{(idx + 1) % total}")])
+    rows.append([InlineKeyboardButton(f"🛒 BUY FOR {int(w['shop_price']):,} {BERRY}",
+                                      callback_data=f"wshop:buy:{uid}:{w['_id']}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _shop_page_sync(uid, idx):
+    items = shop_items_sync()
+    if not items:
+        return None
+    idx = int(idx) % len(items)
+    w = items[idx]
+    owned = count_user_weapon(uid, w["_id"])
+    return {"w": w, "idx": idx, "total": len(items), "caption": _shop_caption(w, idx, len(items), owned)}
+
+
+async def _show_shop_page(q, context, uid, idx):
+    """Edit the shop message (callback) to page `idx`."""
+    page = await asyncio.to_thread(_shop_page_sync, uid, idx)
+    message = q.message
+    if page is None:
+        try:
+            await q.edit_message_caption(caption="⚔️ The weapon shop is empty right now.")
+        except Exception:
+            pass
+        return
+    kb = _shop_keyboard(uid, page["idx"], page["total"], page["w"])
+    photo = page["w"].get("photo")
+    from telegram import InputMediaPhoto
+    try:
+        if photo and message.photo:
+            await message.edit_media(media=InputMediaPhoto(media=photo, caption=page["caption"]), reply_markup=kb)
+        else:
+            await message.edit_text(text=page["caption"], reply_markup=kb)
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return
+        logger.info("weapon shop edit fallback: %s", e)
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await _send_shop_message(context.bot, message.chat_id, page, kb)
+
+
+async def _send_shop_message(bot, chat_id, page, kb):
+    photo = page["w"].get("photo")
+    if photo:
+        await bot.send_photo(chat_id=chat_id, photo=photo, caption=page["caption"], reply_markup=kb)
+    else:
+        await bot.send_message(chat_id=chat_id, text=page["caption"], reply_markup=kb)
+
+
+async def weaponshop_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None or user.is_bot:
+        return
+    page = await asyncio.to_thread(_shop_page_sync, user.id, 0)
+    if page is None:
+        await _reply(msg, "⚔️ The weapon shop is empty right now. Check back later, weapons also drop in groups!")
+        return
+    await _send_shop_message(context.bot, msg.chat_id, page, _shop_keyboard(user.id, page["idx"], page["total"], page["w"]))
+
+
+async def wshop_callback(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None or q.message is None:
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) < 4 or parts[0] != "wshop":
+        await q.answer()
+        return
+    action, owner, arg = parts[1], parts[2], parts[3]
+    try:
+        owner = int(owner)
+    except ValueError:
+        await q.answer()
+        return
+    if q.from_user.id != owner:
+        await q.answer("❌ This is not your weapon shop. Use /weaponshop.", show_alert=True)
+        return
+
+    if action == "open":                                  # button under /shop
+        page = await asyncio.to_thread(_shop_page_sync, owner, 0)
+        if page is None:
+            await q.answer("⚔️ The weapon shop is empty right now.", show_alert=True)
+            return
+        await q.answer()
+        await _send_shop_message(context.bot, q.message.chat_id, page,
+                                 _shop_keyboard(owner, page["idx"], page["total"], page["w"]))
+        return
+
+    if action == "page":
+        await q.answer()
+        await _show_shop_page(q, context, owner, arg)
+        return
+
+    if action == "show":
+        items = await asyncio.to_thread(shop_items_sync)
+        idx = next((i for i, w in enumerate(items) if w["_id"] == arg), 0)
+        await q.answer()
+        await _show_shop_page(q, context, owner, idx)
+        return
+
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    if action == "buy":                                   # confirmation card
+        w = await asyncio.to_thread(get_weapon, arg)
+        if not w or not w.get("shop_enabled") or int(w.get("shop_price") or 0) <= 0:
+            await q.answer("❌ This weapon is not for sale.", show_alert=True)
+            return
+        await q.answer()
+        text = (f"🛒 Buy {w['name']} [{w['_id']}] for {int(w['shop_price']):,} {BERRY}?\n"
+                f"💰 Your Berries: {await asyncio.to_thread(_balance, owner):,}")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ CONFIRM", callback_data=f"wshop:ok:{owner}:{w['_id']}"),
+                                    InlineKeyboardButton("✖️ CANCEL", callback_data=f"wshop:show:{owner}:{w['_id']}")]])
+        try:
+            if q.message.photo:
+                await q.message.edit_caption(caption=text, reply_markup=kb)
+            else:
+                await q.message.edit_text(text=text, reply_markup=kb)
+        except Exception as e:
+            logger.info("weapon shop confirm edit skipped: %s", e)
+        return
+
+    if action == "ok":                                    # confirmed purchase
+        key = f"wshop:{q.message.chat_id}:{q.message.message_id}:{arg}"
+        try:
+            res = await asyncio.to_thread(shop_buy_sync, owner, arg, key)
+        except Exception as e:
+            logger.error("weapon shop buy failed: %s", e)
+            await q.answer("❌ Purchase failed. Nothing was charged. Please try again.", show_alert=True)
+            return
+        s = res["status"]
+        if s == "noberries":
+            await q.answer(f"❌ Not enough Berries: need {res['need']:,}, you have {res['have']:,}.", show_alert=True)
+            return
+        if s == "nouser":
+            await q.answer("❌ Please use /start first.", show_alert=True)
+            return
+        if s == "notforsale":
+            await q.answer("❌ This weapon is not for sale.", show_alert=True)
+            return
+        if s == "dup":
+            await q.answer("⚠️ This purchase was already processed.", show_alert=True)
+            return
+        w = res["weapon"]
+        await q.answer("Purchase complete!")
+        text = (f"✅ Purchased {w['name']} [{w['_id']}]\n"
+                f"🪙 Paid: {res['price']:,} {BERRY}\n"
+                f"🎒 You now own: {res['owned']}\n"
+                f"💰 Berries left: {res['balance']:,}\n\n"
+                "Use it with /evolve.")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ BACK TO SHOP", callback_data=f"wshop:show:{owner}:{w['_id']}")]])
+        try:
+            if q.message.photo:
+                await q.message.edit_caption(caption=text, reply_markup=kb)
+            else:
+                await q.message.edit_text(text=text, reply_markup=kb)
+        except Exception as e:
+            logger.info("weapon shop result edit skipped: %s", e)
+        return
+    await q.answer()
+
+
+# ---------------------------------------------------------------- /weapons /weaponlist
+def _chunk_lines(head, lines, limit=3800):
+    pages, cur = [], head
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > limit and cur != head:
+            pages.append(cur.rstrip())
+            cur = head
+        cur += ln + "\n"
+    pages.append(cur.rstrip())
+    return pages
+
+
+async def weapons_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None or user.is_bot:
+        return
+    rows = await asyncio.to_thread(user_weapons_sync, user.id)
+    if not rows:
+        await _reply(msg, "⚔️ You don't own any weapons yet.\nBuy them in /weaponshop or catch them when they drop in groups.")
+        return
+    lines = [f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] ×{qty}" for w, qty in rows]
+    pages = _chunk_lines("⚔️ Your Weapons\n\n", lines)
+    pages[-1] += "\n\nWeapons are used in /evolve."
+    for p in pages:
+        await _reply(msg, p)
+
+
+def _weaponlist_lines():
+    lines = []
+    for w in all_weapons():
+        shop = f"🛒 {int(w['shop_price']):,}" if w.get("shop_enabled") and int(w.get("shop_price") or 0) > 0 else "🛒 off"
+        drop = (f"🎁 {'on' if w.get('drop_enabled') else 'off'} (stock {int(w.get('drop_stock') or 0)}, "
+                f"{int(w.get('drop_price') or 0):,})")
+        lines.append(f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] • {w.get('anime') or '-'}\n   {shop} • {drop}")
+    return lines
+
+
+async def weaponlist_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_staff(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    lines = await asyncio.to_thread(_weaponlist_lines)
+    if not lines:
+        await _reply(msg, "No weapons yet. Add one with /addweapon.")
+        return
+    for p in _chunk_lines("⚔️ All Weapons\n\n", lines):
+        await _reply(msg, p)
+
+
+# ---------------------------------------------------------------- /addweapon (PM, Owner + Executive)
+# Same flow as /addcharacter and /addevo: numbered steps, photo last, a success card and a staff-log notification.
+(W_NAME, W_ANIME, W_RARITY, W_PRICE, W_CODE, W_PHOTO) = range(230, 236)
+_WKEYS = ("wpn_name", "wpn_anime", "wpn_rarity", "wpn_price", "wpn_code")
+
+
+def _clear_w(context):
+    for k in _WKEYS:
+        context.user_data.pop(k, None)
+
+
+async def addweapon_start(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return -1
+    if update.effective_chat.type != "private":
+        await _reply(msg, "⚠️ /addweapon can only be used in the bot's PM (private chat).")
+        return -1
+    if not _is_staff(user.id):                  # Owner + Executive only
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return -1
+    _clear_w(context)
+    await _reply(msg, f"{_EMOJI[1]} Send weapon name:")
+    return W_NAME
+
+
+async def addweapon_name(update, context):
+    msg = update.effective_message
+    name = (msg.text or "").strip()
+    if not name:
+        await _reply(msg, "❌ Weapon name is required. Please send a valid name.")
+        return W_NAME
+    if len(name) > 60:
+        await _reply(msg, "❌ The name is too long (60 characters at most).")
+        return W_NAME
+    if any(w["name"].casefold() == name.casefold() for w in await asyncio.to_thread(all_weapons)):
+        await _reply(msg, "❌ A weapon with that name already exists. Send a different name.")
+        return W_NAME
+    context.user_data["wpn_name"] = name
+    await _reply(msg, f"{_EMOJI[2]} Anime Name:")
+    return W_ANIME
+
+
+async def addweapon_anime(update, context):
+    msg = update.effective_message
+    anime = (msg.text or "").strip()
+    if not anime:
+        await _reply(msg, "❌ The anime name cannot be empty.")
+        return W_ANIME
+    context.user_data["wpn_anime"] = anime
+    await _reply(msg, f"{_EMOJI[3]} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial / Heavenly")
+    return W_RARITY
+
+
+async def addweapon_rarity(update, context):
+    msg = update.effective_message
+    rarity = (msg.text or "").strip().title()
+    if rarity not in _rarities():
+        await _reply(msg, "❌ Invalid rarity.")
+        return W_RARITY
+    context.user_data["wpn_rarity"] = rarity
+    await _reply(msg, f"{_EMOJI[4]} Shop Price in Berries (send 0 to keep it out of the shop):")
+    return W_PRICE
+
+
+async def addweapon_price(update, context):
+    msg = update.effective_message
+    n = _parse_int(msg.text)
+    if n is None or n > MAX_PRICE:
+        await _reply(msg, "❌ Price must be a whole number (0 or more).")
+        return W_PRICE
+    context.user_data["wpn_price"] = n
+    await _reply(msg, f"{_EMOJI[5]} Weapon Code (unique 4-digit code):")
+    return W_CODE
+
+
+async def addweapon_code(update, context):
+    msg = update.effective_message
+    code = (msg.text or "").strip()
+    if not _valid_code(code):
+        await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
+        return W_CODE
+    if await asyncio.to_thread(get_weapon, code):
+        await _reply(msg, "❌ Code already exists.")
+        return W_CODE
+    context.user_data["wpn_code"] = code
+    await _reply(msg, f"{_EMOJI[6]} Weapon Photo - send the photo:")
+    return W_PHOTO
+
+
+async def addweapon_photo(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if not getattr(msg, "photo", None):
+        await _reply(msg, "❌ Please send a photo (the photo is required).")
+        return W_PHOTO
+    d = dict(context.user_data)
+    if not all(k in d for k in _WKEYS):
+        _clear_w(context)
+        await _reply(msg, "❌ The setup expired. Start again with /addweapon.")
+        return -1
+    if not _is_staff(user.id):                  # re-check: the role could have been removed mid-flow
+        _clear_w(context)
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return -1
+    price = int(d["wpn_price"])
+    doc = {"_id": d["wpn_code"], "code": d["wpn_code"], "name": d["wpn_name"], "anime": d["wpn_anime"],
+           "rarity": d["wpn_rarity"], "photo": msg.photo[-1].file_id,
+           "shop_enabled": price > 0, "shop_price": price,
+           "drop_enabled": False, "drop_stock": 3, "drop_price": price,
+           "created_by": int(user.id), "created_at": _stamp()}
+    _clear_w(context)
+    try:
+        await asyncio.to_thread(_col(WEAPONS_COL).insert_one, doc)
+    except mongo_db.DuplicateKeyError:
+        await _reply(msg, "❌ Code already exists.")
+        return -1
+    except Exception as e:
+        logger.error("addweapon failed: %s", e)
+        await _reply(msg, "❌ Could not add the weapon. Please try again.")
+        return -1
+    await _reply(msg, "✅ Weapon added successfully!\n"
+                      f"⚔️ {doc['name']}\n"
+                      f"🏷 {_rarity_text(doc['rarity'])}\n"
+                      f"💰 {price}\n"
+                      f"🔢 {doc['code']}")
+    await _notify(context, f"⚔️ NEW WEAPON ADDED\n"
+                           f"⚔️ {doc['name']} [{doc['code']}]\n"
+                           f"📺 Anime: {doc['anime'] or 'Not set'}\n"
+                           f"🏷 {_rarity_text(doc['rarity'])}\n"
+                           f"💰 Shop Price: {price}\n"
+                           f"📷 Photo: Added\n"
+                           f"👤 By: {_by(user)}", user)
+    _success(update)
+    return -1
+
+
+async def addweapon_cancel(update, context):
+    _clear_w(context)
+    if _deps.get("cancel_all"):                 # the bot's universal /cancel: stops EVERYTHING in progress
+        await _deps["cancel_all"](update, context)
+        return -1
+    if update.effective_message is not None:
+        await _reply(update.effective_message, "❌ Weapon setup cancelled.")
+    return -1
+
+
+# ---------------------------------------------------------------- /editweapon /delweapon /giveweapon
+EDIT_USAGE = ("Usage:\n/editweapon <code> name <new name>\n/editweapon <code> anime <anime>\n"
+              "/editweapon <code> rarity <rarity>\n/editweapon <code> price <berries>  (0 = remove from shop)\n"
+              "/editweapon <code> photo  (reply to a photo)")
+
+
+async def editweapon_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_staff(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    code = norm_code(args[0]) if args else None
+    if not code or len(args) < 2:
+        await _reply(msg, EDIT_USAGE)
+        return
+    w = await asyncio.to_thread(get_weapon, code)
+    if not w:
+        await _reply(msg, "❌ That weapon code does not exist.")
+        return
+    field, value = args[1].lower(), " ".join(args[2:]).strip()
+    upd = {}
+    if field == "name":
+        if not value or len(value) > 60:
+            await _reply(msg, "❌ Send a name (1-60 characters).")
+            return
+        if any(x["name"].casefold() == value.casefold() and x["_id"] != code for x in await asyncio.to_thread(all_weapons)):
+            await _reply(msg, "❌ A weapon with that name already exists.")
+            return
+        upd["name"] = value
+    elif field == "anime":
+        if not value:
+            await _reply(msg, "❌ The anime name cannot be empty.")
+            return
+        upd["anime"] = value
+    elif field == "rarity":
+        r = value.title()
+        if r not in _rarities():
+            await _reply(msg, "❌ Invalid rarity: " + " / ".join(_rarities()))
+            return
+        upd["rarity"] = r
+    elif field == "price":
+        n = _parse_int(value)
+        if n is None or n > MAX_PRICE:
+            await _reply(msg, "❌ Price must be a whole number (0 or more).")
+            return
+        upd.update({"shop_price": n, "shop_enabled": n > 0})
+    elif field == "photo":
+        reply = msg.reply_to_message
+        if not reply or not getattr(reply, "photo", None):
+            await _reply(msg, "❌ Reply to a photo with /editweapon <code> photo.")
+            return
+        upd["photo"] = reply.photo[-1].file_id
+    else:
+        await _reply(msg, EDIT_USAGE)
+        return
+    await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": upd})
+    w = await asyncio.to_thread(get_weapon, code)
+    await _reply(msg, f"✅ Weapon updated: {_weapon_label(w)} ({field})")
+    await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {field}\n👤 By: {_by(user)}", user)
+    _success(update)
+
+
+def _recipes_using_weapon(code):
+    try:
+        return list(_col(mongo_db.FUSION_EVOLUTION_RECIPES).find({"weapon_code": code}))
+    except Exception:
+        return []
+
+
+async def delweapon_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    code = norm_code(args[0]) if args else None
+    if not code:
+        await _reply(msg, "Usage: /delweapon <code> [confirm]")
+        return
+    w = await asyncio.to_thread(get_weapon, code)
+    if not w:
+        await _reply(msg, "❌ That weapon code does not exist.")
+        return
+    used = await asyncio.to_thread(_recipes_using_weapon, code)
+    if used:
+        await _reply(msg, f"❌ {_weapon_label(w)} is needed by {len(used)} evolution recipe(s). "
+                          f"Remove it first with /evoweapon <evolution code> off.")
+        return
+    owners = await asyncio.to_thread(_col(USER_WEAPONS_COL).count_documents, {"weapon_code": code, "qty": {"$gt": 0}})
+    if (len(args) < 2 or args[1].lower() != "confirm"):
+        await _reply(msg, f"⚠️ This deletes {_weapon_label(w)} and removes it from {owners} player(s).\n"
+                          f"Send /delweapon {code} confirm to continue.")
+        return
+    await asyncio.to_thread(_col(USER_WEAPONS_COL).delete_many, {"weapon_code": code})
+    await asyncio.to_thread(_col(WEAPONS_COL).delete_one, {"_id": code})
+    await _reply(msg, f"🗑 Weapon {_weapon_label(w)} deleted.")
+    await _notify(context, f"🗑 WEAPON DELETED\n⚔️ {_weapon_label(w)}\n👥 Removed from {owners} player(s)\n👤 By: {_by(user)}", user)
+    _success(update)
+
+
+async def giveweapon_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    target_id = None
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        target_id = msg.reply_to_message.from_user.id
+    elif args and args[0].isdigit():
+        target_id = int(args.pop(0))
+    code = norm_code(args[0]) if args else None
+    qty = _parse_int(args[1]) if len(args) > 1 else 1
+    if target_id is None or not code or qty is None or not (1 <= qty <= MAX_QTY):
+        await _reply(msg, f"Usage: reply to a user with /giveweapon <code> [qty]\nor /giveweapon <user_id> <code> [qty] (qty 1-{MAX_QTY})")
+        return
+    w = await asyncio.to_thread(get_weapon, code)
+    if not w:
+        await _reply(msg, "❌ That weapon code does not exist.")
+        return
+    if not await asyncio.to_thread(_user_exists, target_id):
+        await _reply(msg, "❌ That user has not started the bot yet.")
+        return
+    await asyncio.to_thread(add_user_weapon, target_id, code, qty)
+    await _reply(msg, f"✅ Gave {qty}× {_weapon_label(w)} to user {target_id}.")
+    try:
+        await context.bot.send_message(chat_id=target_id, text=f"🎁 You received {qty}× {w['name']} [{code}]! Use it in /evolve.")
+    except Exception:
+        pass
+    await _notify(context, f"🎁 WEAPON GIVEN\n⚔️ {qty}× {_weapon_label(w)}\n🎯 To: {target_id}\n👤 By: {_by(user)}", user)
+    _success(update)
+
+
+# ---------------------------------------------------------------- /evoweapon (the evolution weapon slot)
+async def evoweapon_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_staff(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    usage = ("Usage:\n/evoweapon <evolution code> <weapon code> [stones]\n   the evolution then needs 1 of that weapon "
+             "(stones can be 0 or more; if you leave it out the current stones stay)\n"
+             "/evoweapon <evolution code> off [stones]\n   removes the weapon requirement (stones go back to at least 10)")
+    if len(args) < 2:
+        await _reply(msg, usage)
+        return
+    evo_code = args[0].strip()
+    stones = _parse_int(args[2]) if len(args) > 2 else None
+    if len(args) > 2 and stones is None:
+        await _reply(msg, "❌ Stones must be a whole number (0 or more).")
+        return
+    if args[1].lower() == "off":
+        weapon = None
+    else:
+        weapon = norm_code(args[1])
+        if not weapon:
+            await _reply(msg, usage)
+            return
+    res = await asyncio.to_thread(set_recipe_weapon_sync, evo_code, weapon, stones)
+    if not res["ok"]:
+        await _reply(msg, res["error"])
+        return
+    evo = await asyncio.to_thread(_row, evo_code)
+    label = evo[1] if evo else evo_code
+    if weapon:
+        w = await asyncio.to_thread(get_weapon, weapon)
+        await _reply(msg, f"✅ {label} [{evo_code}] now needs 1× {_weapon_label(w)}.\n💎 Stones: {res['stones']}")
+        what = f"⚔️ Weapon: {_weapon_label(w)}"
+    else:
+        await _reply(msg, f"✅ {label} [{evo_code}] no longer needs a weapon.\n💎 Stones: {res['stones']}")
+        what = "⚔️ Weapon: removed"
+    await _notify(context, f"⚔️ EVOLUTION WEAPON CHANGED\n🎭 {label} [{evo_code}]\n{what}\n💎 Stones: {res['stones']}\n"
+                           f"👤 By: {_by(user)}", user)
+    _success(update)
+
+
+# ==========================================================================
+# GROUP DROPS: a weapon appears in the groups the Owner enabled; first come, first served, limited stock + time
+# ==========================================================================
+DEFAULT_SETTINGS = {"enabled": False, "mode": "random", "min_hours": 3, "max_hours": 8, "fixed_times": [],
+                    "duration_min": 10, "groups": [], "next_at": None, "last_fixed": None, "active_drop": None}
+
+
+def _ensure_settings():
+    _col(SETTINGS_COL).update_one({"_id": "drops"}, {"$setOnInsert": dict(DEFAULT_SETTINGS)}, upsert=True)
+
+
+def get_settings():
+    _ensure_settings()
+    doc = _col(SETTINGS_COL).find_one({"_id": "drops"}) or {}
+    return {**DEFAULT_SETTINGS, **doc}
+
+
+def set_settings(**fields):
+    _ensure_settings()
+    _col(SETTINGS_COL).update_one({"_id": "drops"}, {"$set": fields})
+
+
+def _approved_groups():
+    try:
+        return {int(c) for c in mongo_db.load_approved_groups()}
+    except Exception as e:
+        logger.warning("approved groups unavailable: %s", e)
+        return set()
+
+
+def _drop_target_groups(settings):
+    """Enabled groups that are still approved and have the bot switched on."""
+    approved = _approved_groups()
+    out = []
+    for cid in settings.get("groups") or []:
+        try:
+            cid = int(cid)
+            if cid in approved and mongo_db.is_bot_enabled(cid):
+                out.append(cid)
+        except Exception:
+            continue
+    return out
+
+
+def _pool_sync():
+    return [w for w in all_weapons() if w.get("drop_enabled") and int(w.get("drop_stock") or 0) > 0
+            and int(w.get("drop_price") or 0) > 0]
+
+
+def _drops():
+    return _col(DROPS_COL)
+
+
+def _fmt_ist(dt):
+    return _aware(dt).astimezone(IST).strftime("%I:%M %p").lstrip("0") + " IST"
+
+
+def _drop_caption(drop, w, state="active"):
+    head = {"active": "⚔️ WEAPON DROP!", "soldout": "⚔️ WEAPON DROP: SOLD OUT", "expired": "⚔️ WEAPON DROP: ENDED"}[state]
+    lines = [head, "",
+             f"⚔️ {w['name']} [{w['_id']}]",
+             f"📺 Anime: {w.get('anime') or '-'}",
+             _rarity_text(w.get("rarity")),
+             f"🪙 Price: {int(drop['price']):,} {BERRY}",
+             f"📦 Stock: {max(int(drop['stock_left']), 0)}/{int(drop['stock_total'])}"]
+    if state == "active":
+        lines += [f"⏳ Ends at {_fmt_ist(drop['ends_at'])}", "", "One per player. First come, first served!"]
+    elif state == "soldout":
+        lines += ["", "Every weapon was bought. Watch for the next drop!"]
+    else:
+        lines += ["", "This drop is over. Watch for the next one!"]
+    return "\n".join(lines)
+
+
+def _drop_keyboard(drop):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🛒 BUY FOR {int(drop['price']):,} {BERRY}",
+                                                       callback_data=f"wdrop:buy:{drop['_id']}")]])
+
+
+def _create_drop_sync(w, duration_min):
+    """Inserts the drop and claims the single 'active drop' slot. Returns the drop doc or None when one is running."""
+    _ensure_settings()
+    now = _utcnow()
+    drop = {"_id": secrets.token_hex(4), "weapon_code": w["_id"], "price": int(w["drop_price"]),
+            "stock_total": int(w["drop_stock"]), "stock_left": int(w["drop_stock"]), "buyers": [],
+            "created_at": now, "ends_at": now + timedelta(minutes=int(duration_min)),
+            "status": "active", "dirty": False, "messages": []}
+    _drops().insert_one(drop)
+    claimed = _col(SETTINGS_COL).find_one_and_update({"_id": "drops", "active_drop": None},
+                                                     {"$set": {"active_drop": drop["_id"]}})
+    if claimed is None:
+        _drops().delete_one({"_id": drop["_id"]})
+        return None
+    return drop
+
+
+async def start_drop(bot, w, source="auto"):
+    """Starts a drop of weapon `w` in every enabled group. Returns (ok, text)."""
+    settings = await asyncio.to_thread(get_settings)
+    groups = await asyncio.to_thread(_drop_target_groups, settings)
+    if not groups:
+        return False, "❌ No group is enabled for weapon drops. Use /dropgroups."
+    if int(w.get("drop_price") or 0) <= 0 or int(w.get("drop_stock") or 0) <= 0:
+        return False, "❌ That weapon needs a drop price and stock first (/dropconfig price|stock)."
+    drop = await asyncio.to_thread(_create_drop_sync, w, settings["duration_min"])
+    if drop is None:
+        return False, "❌ A weapon drop is already running."
+    sent = 0
+    for cid in groups:
+        try:
+            caption, kb = _drop_caption(drop, w), _drop_keyboard(drop)
+            if w.get("photo"):
+                m = await bot.send_photo(chat_id=cid, photo=w["photo"], caption=caption, reply_markup=kb)
+            else:
+                m = await bot.send_message(chat_id=cid, text=caption, reply_markup=kb)
+            await asyncio.to_thread(_drops().update_one, {"_id": drop["_id"]},
+                                    {"$push": {"messages": {"chat_id": cid, "message_id": m.message_id}}})
+            sent += 1
+        except Exception as e:
+            logger.info("drop message to %s failed: %s", cid, e)
+        await asyncio.sleep(0.05)
+    if sent == 0:                                   # nobody could receive it: do not keep a dead drop alive
+        await asyncio.to_thread(_finish_drop_sync, drop["_id"], "ended")
+        return False, "❌ The drop could not be sent to any group (is the bot still in them?)."
+    return True, f"✅ Weapon drop started: {w['name']} in {sent} group(s)."
+
+
+def _finish_drop_sync(drop_id, status):
+    """Marks an active drop finished exactly once. Returns the final drop doc, or None if someone else finished it."""
+    doc = _drops().find_one_and_update({"_id": drop_id, "status": "active"}, {"$set": {"status": status}},
+                                       return_document=True)
+    _col(SETTINGS_COL).update_one({"_id": "drops", "active_drop": drop_id}, {"$set": {"active_drop": None}})
+    return doc
+
+
+async def _edit_drop_messages(bot, drop, w, state):
+    text = _drop_caption(drop, w, state)
+    kb = _drop_keyboard(drop) if state == "active" else None
+    for m in drop.get("messages") or []:
+        try:
+            if w.get("photo"):
+                await bot.edit_message_caption(chat_id=m["chat_id"], message_id=m["message_id"], caption=text, reply_markup=kb)
+            else:
+                await bot.edit_message_text(chat_id=m["chat_id"], message_id=m["message_id"], text=text, reply_markup=kb)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                logger.info("drop message edit skipped: %s", e)
+        await asyncio.sleep(0.1)
+
+
+def _drop_buy_sync(user_id, drop_id):
+    """One purchase. The stock slot is claimed with ONE conditional update, so the last weapon can never be sold twice."""
+    now = _utcnow()
+    drop = _drops().find_one_and_update(
+        {"_id": drop_id, "status": "active", "ends_at": {"$gt": now}, "stock_left": {"$gt": 0},
+         "buyers": {"$ne": int(user_id)}},
+        {"$inc": {"stock_left": -1}, "$push": {"buyers": int(user_id)}, "$set": {"dirty": True}},
+        return_document=True)
+    if drop is None:
+        cur = _drops().find_one({"_id": drop_id})
+        if cur is None or cur.get("status") != "active" or _aware(cur["ends_at"]) <= now:
+            return {"status": "over"}
+        if int(user_id) in (cur.get("buyers") or []):
+            return {"status": "already"}
+        return {"status": "soldout"}
+
+    def _release():
+        _drops().update_one({"_id": drop_id}, {"$inc": {"stock_left": 1}, "$pull": {"buyers": int(user_id)}, "$set": {"dirty": True}})
+
+    w = get_weapon(drop["weapon_code"])
+    if w is None:
+        _release()
+        return {"status": "over"}
+    if not _user_exists(user_id):
+        _release()
+        return {"status": "nouser"}
+    price = int(drop["price"])
+    if not _charge(user_id, price):
+        _release()
+        return {"status": "noberries", "need": price, "have": _balance(user_id)}
+    try:
+        add_user_weapon(user_id, w["_id"], 1)
+    except Exception:
+        _refund(user_id, price)
+        _release()
+        raise
+    return {"status": "ok", "drop": drop, "weapon": w, "price": price, "owned": count_user_weapon(user_id, w["_id"]),
+            "balance": _balance(user_id)}
+
+
+async def wdrop_callback(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    parts = (q.data or "").split(":")
+    if len(parts) != 3 or parts[0] != "wdrop" or parts[1] != "buy":
+        await q.answer()
+        return
+    try:
+        res = await asyncio.to_thread(_drop_buy_sync, q.from_user.id, parts[2])
+    except Exception as e:
+        logger.error("weapon drop buy failed: %s", e)
+        await q.answer("❌ Purchase failed. Nothing was charged. Please try again.", show_alert=True)
+        return
+    s = res["status"]
+    if s == "over":
+        await q.answer("⌛ This drop is over.", show_alert=True)
+    elif s == "soldout":
+        await q.answer("❌ Sold out!", show_alert=True)
+    elif s == "already":
+        await q.answer("⚠️ You already bought this weapon from this drop.", show_alert=True)
+    elif s == "nouser":
+        await q.answer("❌ Please use /start in the bot's PM first.", show_alert=True)
+    elif s == "noberries":
+        await q.answer(f"❌ Not enough Berries: need {res['need']:,}, you have {res['have']:,}.", show_alert=True)
+    elif s == "ok":
+        w, drop = res["weapon"], res["drop"]
+        await q.answer(f"✅ You bought {w['name']}! It is in /weapons.", show_alert=True)
+        try:
+            await context.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=(f"🎉 {q.from_user.mention_html()} bought {w['name']}! "
+                      f"({max(int(drop['stock_left']), 0)}/{int(drop['stock_total'])} left)"),
+                parse_mode="HTML")
+        except Exception:
+            pass
+        if int(drop["stock_left"]) <= 0:
+            final = await asyncio.to_thread(_finish_drop_sync, drop["_id"], "soldout")
+            if final:
+                final["stock_left"] = 0
+                await _edit_drop_messages(context.bot, final, w, "soldout")
+        else:
+            try:
+                await q.edit_message_caption(caption=_drop_caption(drop, w), reply_markup=_drop_keyboard(drop)) \
+                    if q.message.photo else await q.edit_message_text(text=_drop_caption(drop, w), reply_markup=_drop_keyboard(drop))
+            except Exception as e:
+                if "not modified" not in str(e).lower():
+                    logger.info("drop caption refresh skipped: %s", e)
+
+
+# ---------------------------------------------------------------- background tick (JobQueue or asyncio fallback)
+def _next_random_at(settings):
+    lo, hi = int(settings["min_hours"]), int(settings["max_hours"])
+    return _utcnow() + timedelta(minutes=random.randint(lo * 60, max(lo, hi) * 60))
+
+
+def _due_fixed_key(settings):
+    """'YYYY-MM-DD HH:MM' of a fixed time that became due in the last 5 minutes and was not used yet, else None."""
+    now_ist = datetime.now(IST)
+    for hhmm in settings.get("fixed_times") or []:
+        try:
+            h, m = (int(x) for x in hhmm.split(":"))
+        except ValueError:
+            continue
+        slot = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+        if timedelta(0) <= now_ist - slot < timedelta(minutes=5):
+            key = slot.strftime("%Y-%m-%d %H:%M")
+            if key != settings.get("last_fixed"):
+                return key
+    return None
+
+
+async def tick(bot):
+    """Runs every few seconds: finishes expired drops, refreshes stock text, starts scheduled drops."""
+    try:
+        settings = await asyncio.to_thread(get_settings)
+        active_id = settings.get("active_drop")
+        if active_id:
+            drop = await asyncio.to_thread(_drops().find_one, {"_id": active_id})
+            if drop is None or drop.get("status") != "active":
+                await asyncio.to_thread(_col(SETTINGS_COL).update_one, {"_id": "drops", "active_drop": active_id},
+                                        {"$set": {"active_drop": None}})
+            else:
+                w = await asyncio.to_thread(get_weapon, drop["weapon_code"])
+                if w is None or _aware(drop["ends_at"]) <= _utcnow() or int(drop["stock_left"]) <= 0:
+                    state = "soldout" if int(drop["stock_left"]) <= 0 else "expired"
+                    final = await asyncio.to_thread(_finish_drop_sync, active_id, "soldout" if state == "soldout" else "ended")
+                    if final and w:
+                        await _edit_drop_messages(bot, final, w, state)
+                elif drop.get("dirty"):
+                    claimed = await asyncio.to_thread(_drops().find_one_and_update, {"_id": active_id, "dirty": True},
+                                                      {"$set": {"dirty": False}}, return_document=True)
+                    if claimed:
+                        await _edit_drop_messages(bot, claimed, w, "active")
+            return
+        if not settings.get("enabled"):
+            return
+        pool = await asyncio.to_thread(_pool_sync)
+        if not pool:
+            return
+        if settings.get("mode") == "fixed":
+            key = await asyncio.to_thread(_due_fixed_key, settings)
+            if not key:
+                return
+            await asyncio.to_thread(set_settings, last_fixed=key)
+        else:
+            nxt = _aware(settings.get("next_at"))
+            if nxt is None:
+                await asyncio.to_thread(set_settings, next_at=_next_random_at(settings))
+                return
+            if _utcnow() < nxt:
+                return
+            await asyncio.to_thread(set_settings, next_at=_next_random_at(settings))
+        ok, text = await start_drop(bot, random.choice(pool))
+        logger.info("scheduled weapon drop: %s", text)
+    except Exception as e:
+        logger.error("weapon drop tick failed: %s", e)
+
+
+async def _tick_job(context):
+    await tick(context.bot)
+
+
+async def _fallback_loop(app):
+    while True:
+        await asyncio.sleep(TICK_SECONDS)
+        await tick(app.bot)
+
+
+
+
+
+# ---------------------------------------------------------------- /dropgroups
+GROUPS_PER_PAGE = 8
+
+
+async def _group_title(bot, cid):
+    try:
+        chat = await bot.get_chat(cid)
+        return (chat.title or str(cid))[:28]
+    except Exception:
+        return f"Group {cid}"
+
+
+async def _dropgroups_view(bot, page):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    settings = await asyncio.to_thread(get_settings)
+    approved = sorted(await asyncio.to_thread(_approved_groups))
+    enabled = {int(c) for c in settings.get("groups") or []}
+    pages = max(1, (len(approved) + GROUPS_PER_PAGE - 1) // GROUPS_PER_PAGE)
+    page = max(0, min(int(page), pages - 1))
+    chunk = approved[page * GROUPS_PER_PAGE:(page + 1) * GROUPS_PER_PAGE]
+    rows = []
+    for cid in chunk:
+        title = await _group_title(bot, cid)
+        rows.append([InlineKeyboardButton(("✅ " if cid in enabled else "⬜ ") + title, callback_data=f"wdg:t:{cid}:{page}")])
+    if pages > 1:
+        rows.append([InlineKeyboardButton("◀️", callback_data=f"wdg:p:0:{(page - 1) % pages}"),
+                     InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"wdg:p:0:{page}"),
+                     InlineKeyboardButton("▶️", callback_data=f"wdg:p:0:{(page + 1) % pages}")])
+    rows.append([InlineKeyboardButton("✅ Enable all", callback_data=f"wdg:all:1:{page}"),
+                 InlineKeyboardButton("⬜ Disable all", callback_data=f"wdg:all:0:{page}")])
+    text = (f"⚔️ Drop Groups\n\nWeapon drops appear only in ✅ groups.\n"
+            f"Enabled: {len(enabled & set(approved))} of {len(approved)} approved group(s).")
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def dropgroups_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    text, kb = await _dropgroups_view(context.bot, 0)
+    await _reply(msg, text, reply_markup=kb)
+
+
+async def dropgroups_callback(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    if not _is_owner(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return
+    try:
+        _w, action, arg, page = q.data.split(":")
+        arg, page = int(arg), int(page)
+    except ValueError:
+        await q.answer()
+        return
+    if action == "t":
+        await asyncio.to_thread(_ensure_settings)
+        cur = {int(c) for c in (await asyncio.to_thread(get_settings)).get("groups") or []}
+        op = "$pull" if arg in cur else "$addToSet"
+        await asyncio.to_thread(_col(SETTINGS_COL).update_one, {"_id": "drops"}, {op: {"groups": arg}})
+    elif action == "all":
+        groups = sorted(await asyncio.to_thread(_approved_groups)) if arg == 1 else []
+        await asyncio.to_thread(set_settings, groups=groups)
+    await q.answer()
+    text, kb = await _dropgroups_view(context.bot, page)
+    try:
+        await q.edit_message_text(text=text, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.info("dropgroups edit skipped: %s", e)
+
+
+# ---------------------------------------------------------------- /weapondrops panel, /dropconfig, /dropnow
+POOL_PER_PAGE = 8
+
+
+def _timing_text(s):
+    if s["mode"] == "fixed":
+        times = ", ".join(s.get("fixed_times") or []) or "no times set"
+        return f"Fixed times (IST): {times}"
+    return f"Random: every {int(s['min_hours'])}-{int(s['max_hours'])} hours"
+
+
+def _panel_sync(page):
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    s = get_settings()
+    weapons = all_weapons()
+    pages = max(1, (len(weapons) + POOL_PER_PAGE - 1) // POOL_PER_PAGE)
+    page = max(0, min(int(page), pages - 1))
+    chunk = weapons[page * POOL_PER_PAGE:(page + 1) * POOL_PER_PAGE]
+    nxt = ""
+    if s["enabled"] and s["mode"] == "random" and s.get("next_at"):
+        nxt = f"\n⏭ Next drop: about {_fmt_ist(s['next_at'])}"
+    active = f"\n🔥 A drop is running now." if s.get("active_drop") else ""
+    lines = [f"⚔️ WEAPON DROPS\n",
+             f"Status: {'🟢 ON' if s['enabled'] else '🔴 OFF'}",
+             f"⏱ {_timing_text(s)}",
+             f"⌛ Each drop lasts {int(s['duration_min'])} min",
+             f"👥 Groups enabled: {len(s.get('groups') or [])} (/dropgroups)" + nxt + active, "",
+             "🎁 Weapon pool (tap to turn a weapon on/off):"]
+    rows = [[InlineKeyboardButton("🔴 Turn OFF" if s["enabled"] else "🟢 Turn ON", callback_data=f"wdp:master:0:{page}"),
+             InlineKeyboardButton("🎁 Drop now", callback_data=f"wdp:now:0:{page}")]]
+    if not weapons:
+        lines.append("No weapons yet. Add one with /addweapon.")
+    for w in chunk:
+        on = bool(w.get("drop_enabled"))
+        info = f"stock {int(w.get('drop_stock') or 0)} • {int(w.get('drop_price') or 0):,} {BERRY}"
+        lines.append(f"{'✅' if on else '⬜'} {_weapon_label(w)} — {info}")
+        rows.append([InlineKeyboardButton(("✅ " if on else "⬜ ") + w["name"][:30], callback_data=f"wdp:t:{w['_id']}:{page}")])
+    if pages > 1:
+        rows.append([InlineKeyboardButton("◀️", callback_data=f"wdp:p:0:{(page - 1) % pages}"),
+                     InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"wdp:p:0:{page}"),
+                     InlineKeyboardButton("▶️", callback_data=f"wdp:p:0:{(page + 1) % pages}")])
+    lines += ["", "Numbers: /dropconfig random|fixed|duration|stock|price"]
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def weapondrops_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    text, kb = await asyncio.to_thread(_panel_sync, 0)
+    await _reply(msg, text, reply_markup=kb)
+
+
+async def wdp_callback(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    if not _is_owner(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return
+    try:
+        _w, action, arg, page = q.data.split(":")
+        page = int(page)
+    except ValueError:
+        await q.answer()
+        return
+    note = None
+    if action == "master":
+        s = await asyncio.to_thread(get_settings)
+        await asyncio.to_thread(set_settings, enabled=not s["enabled"], next_at=None)
+    elif action == "t":
+        w = await asyncio.to_thread(get_weapon, arg)
+        if w:
+            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": arg}, {"$set": {"drop_enabled": not w.get("drop_enabled")}})
+            if not w.get("drop_enabled") and int(w.get("drop_price") or 0) <= 0:
+                note = "⚠️ Set a drop price first: /dropconfig price " + arg + " <berries>"
+    elif action == "now":
+        pool = await asyncio.to_thread(_pool_sync)
+        if not pool:
+            await q.answer("❌ No weapon in the pool has stock and a drop price.", show_alert=True)
+            return
+        ok, text = await start_drop(context.bot, random.choice(pool), "owner")
+        await q.answer(text[:190], show_alert=True)
+        return
+    await q.answer(note[:190] if note else None, show_alert=bool(note))
+    text, kb = await asyncio.to_thread(_panel_sync, page)
+    try:
+        await q.edit_message_text(text=text, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.info("weapondrops edit skipped: %s", e)
+
+
+CONFIG_USAGE = ("Usage:\n/dropconfig random <min_hours> <max_hours>\n/dropconfig fixed 18:00 22:00 (IST, up to 6 times)\n"
+                "/dropconfig duration <minutes>\n/dropconfig stock <weapon code> <number>\n"
+                "/dropconfig price <weapon code> <berries>")
+
+
+async def dropconfig_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = [a.strip() for a in (getattr(context, "args", None) or [])]
+    if not args:
+        await _reply(msg, CONFIG_USAGE)
+        return
+    cmd = args[0].lower()
+    if cmd == "random" and len(args) == 3 and args[1].isdigit() and args[2].isdigit():
+        lo, hi = int(args[1]), int(args[2])
+        if not (1 <= lo <= hi <= 168):
+            await _reply(msg, "❌ Hours must be 1-168 and min must not be above max.")
+            return
+        await asyncio.to_thread(set_settings, mode="random", min_hours=lo, max_hours=hi, next_at=None)
+        await _reply(msg, f"✅ Random drops: every {lo}-{hi} hours.")
+    elif cmd == "fixed" and 2 <= len(args) <= 7:
+        times = []
+        for t in args[1:]:
+            m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                await _reply(msg, f"❌ '{t}' is not a valid time. Use HH:MM (24-hour, IST).")
+                return
+            times.append(f"{int(m.group(1)):02d}:{m.group(2)}")
+        await asyncio.to_thread(set_settings, mode="fixed", fixed_times=sorted(set(times)), last_fixed=None)
+        await _reply(msg, "✅ Fixed drops at " + ", ".join(sorted(set(times))) + " IST.")
+    elif cmd == "duration" and len(args) == 2 and args[1].isdigit() and 1 <= int(args[1]) <= 1440:
+        await asyncio.to_thread(set_settings, duration_min=int(args[1]))
+        await _reply(msg, f"✅ Each drop lasts {int(args[1])} minute(s).")
+    elif cmd in ("stock", "price") and len(args) == 3:
+        code, n = norm_code(args[1]), _parse_int(args[2])
+        w = await asyncio.to_thread(get_weapon, code) if code else None
+        limit = MAX_STOCK if cmd == "stock" else MAX_PRICE
+        if not w or n is None or n < 1 or n > limit:
+            await _reply(msg, "❌ Check the weapon code and send a whole number (1 or more).")
+            return
+        field = "drop_stock" if cmd == "stock" else "drop_price"
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {field: n}})
+        await _reply(msg, f"✅ {_weapon_label(w)}: drop {cmd} = {n:,}")
+    else:
+        await _reply(msg, CONFIG_USAGE)
+        return
+    _success(update)
+
+
+async def dropnow_command(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    if args:
+        w, err = await asyncio.to_thread(find_weapon, " ".join(args))
+        if err:
+            await _reply(msg, err)
+            return
+    else:
+        pool = await asyncio.to_thread(_pool_sync)
+        if not pool:
+            await _reply(msg, "❌ No weapon in the drop pool has stock and a drop price. Use /weapondrops.")
+            return
+        w = random.choice(pool)
+    ok, text = await start_drop(context.bot, w, "owner")
+    await _reply(msg, text)
+    if ok:
+        _success(update)
+
+
+# ---------------------------------------------------------------- registration
+def weapon_help_module():
+    """(key, button label, page text) for the Owner /help menu, next to Invites and Security (see bot.py HELP_MODULES)."""
+    entries = [
+        ("/addweapon", "Add a weapon (guided, PM only)"),
+        ("/editweapon <code> <name|anime|rarity|price|photo>", "Edit a weapon"),
+        ("/weaponlist", "List all weapons"),
+        ("/evoweapon <evolution code> <weapon code|off> [stones]", "Set the weapon an evolution needs"),
+        ("/giveweapon <user_id> <code> [qty]", "Give a weapon (or reply to a user)"),
+        ("/delweapon <code> [confirm]", "Delete a weapon"),
+        ("/weapondrops", "Drop panel: ON/OFF, drop now, weapon pool"),
+        ("/dropgroups", "Choose the groups that get drops"),
+        ("/dropconfig <random|fixed|duration|stock|price> ...", "Drop timing, length, stock and price"),
+        ("/dropnow [weapon]", "Start a drop now"),
+    ]
+    lines = ["⚔️ Weapons (Owner only)", "", "📌 Overview",
+             "Weapons are used in /evolve. Players buy them in /weaponshop or catch them in group drops.",
+             "", "⌨️ Commands & usage"]
+    lines += [f"{i}. {syntax} - {desc}" for i, (syntax, desc) in enumerate(entries, 1)]
+    lines += ["", "Players use /weapons (their weapons) and /weaponshop."]
+    return ("weapons", "⚔️ Weapons", "\n".join(lines))
+
+
+def ensure_weapon_collections():
+    """Idempotent, best effort: create the weapon collections (visible in Atlas right after start-up) and their indexes."""
+    try:
+        db = mongo_db.get_db()
+        existing = set(db.list_collection_names())
+        for name in (WEAPONS_COL, USER_WEAPONS_COL, SETTINGS_COL, DROPS_COL):
+            if name not in existing:
+                try:
+                    db.create_collection(name)
+                except Exception:                  # created by a concurrent start-up: fine
+                    pass
+        _col(USER_WEAPONS_COL).create_index([("user_id", 1)], name="user_id")
+        _col(USER_WEAPONS_COL).create_index([("weapon_code", 1)], name="weapon_code")
+        _col(DROPS_COL).create_index([("status", 1)], name="status")
+    except Exception as e:
+        logger.warning("weapon collections could not be prepared: %s", e)
+
+
+def _register_weapons(app):
+    """Attach every weapon handler (called by register(app) below the stone and evolution handlers)."""
+    ensure_weapon_collections()
+    from telegram.ext import (CallbackQueryHandler, CommandHandler, ConversationHandler, MessageHandler, filters)
+    text = filters.TEXT & ~filters.COMMAND
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("addweapon", addweapon_start)],
+        states={
+            W_NAME: [MessageHandler(text, addweapon_name)],
+            W_ANIME: [MessageHandler(text, addweapon_anime)],
+            W_RARITY: [MessageHandler(text, addweapon_rarity)],
+            W_PRICE: [MessageHandler(text, addweapon_price)],
+            W_CODE: [MessageHandler(text, addweapon_code)],
+            W_PHOTO: [MessageHandler(filters.PHOTO, addweapon_photo), MessageHandler(text, addweapon_photo)],
+        },
+        fallbacks=[CommandHandler("cancel", addweapon_cancel)],
+        allow_reentry=True,
+        conversation_timeout=_deps["conv_timeout"],
+    ))
+    for name, fn in (("weapons", weapons_command), ("weaponshop", weaponshop_command),
+                     ("weaponlist", weaponlist_command), ("editweapon", editweapon_command),
+                     ("delweapon", delweapon_command), ("giveweapon", giveweapon_command),
+                     ("evoweapon", evoweapon_command), ("dropgroups", dropgroups_command),
+                     ("weapondrops", weapondrops_command), ("dropconfig", dropconfig_command),
+                     ("dropnow", dropnow_command)):
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(wshop_callback, pattern=r"^wshop:"))
+    app.add_handler(CallbackQueryHandler(wdrop_callback, pattern=r"^wdrop:buy:[0-9a-f]{8}$"))
+    app.add_handler(CallbackQueryHandler(dropgroups_callback, pattern=r"^wdg:"))
+    app.add_handler(CallbackQueryHandler(wdp_callback, pattern=r"^wdp:"))
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(_tick_job, interval=TICK_SECONDS, first=20, name="weapon-drop-tick")
+    else:                                         # no JobQueue: start the ticker with the bot's own startup hook
+        previous = getattr(app, "post_init", None)
+
+        async def _start_ticker(application):
+            if previous:
+                await previous(application)
+            application.bot_data["weapon_tick_task"] = asyncio.create_task(_fallback_loop(application), name="weapon-drop-tick")
+        app.post_init = _start_ticker

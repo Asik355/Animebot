@@ -2202,6 +2202,9 @@ def _build_help_text_raw():
         "🌟💫 Evolution\n"
         "/evolution — See all evolution recipes\n"
         "/evolve [code/name] — Evolve a character into a stronger one\n\n"
+        "⚔️ Weapons\n"
+        "/weapons — See your weapons\n"
+        "/weaponshop — Buy weapons (some evolutions need one)\n\n"
         "💎 Stones & Items\n"
         "/stonetask — Do daily tasks to earn stones\n"
         "/claimstone — Collect stones from finished tasks\n"
@@ -2241,21 +2244,15 @@ def _addedit_page(role):
     staff_evo = role in ("owner", "executive")
     entries = [
         ("/addcharacter", "Add a character (guided)"),
-        ("/editphoto <name/code>", "Edit a normal character's photo" + (" (Evolution photos: use /editevo)" if staff_evo else "")),
-        ("/editcharacter <code/name>",
-         "Edit a normal character: name, anime, rank/rarity, worth, 4-digit code, recruitment/search names (short form: /edit)"
-         + (". Evolution characters can't be edited here - use /editevo" if staff_evo else "")),
+        ("/editphoto <name/code>", "Edit a character's photo"),
+        ("/editcharacter <code/name>", "Edit a character (short: /edit)"),
     ]
     if staff_evo:
-        entries.append(("/editcode <code/name> <new code>",
-                        "Change a normal character's 4-digit code directly (PM only). Same checks as /edit, including the anime's code range"))
-        entries.append(("/addevo", "Add an Evolution (guided, PM only): choose 🌟 Same Card (copies of one card) or 💫 Different Card (two different cards), then the cards, quantities, name, anime, rarity, worth, "
-                                   "Evolution Stones (min 10), Berrys cost, code, photo"))
-        entries.append(("/editevo <code/name>", "Edit an Evolution character AND its recipe (guided, PM only): name, anime, rarity, "
-                                                "worth, photo, code, base character, quantity, Evolution Stones, Berrys cost. "
-                                                "Normal characters use /edit"))
+        entries.append(("/editcode <code/name> <new code>", "Change a character's 4-digit code (PM only)"))
+        entries.append(("/addevo", "Add an Evolution (guided, PM only)"))
+        entries.append(("/editevo <code/name>", "Edit an Evolution and its recipe (guided, PM only)"))
     if role == "owner":
-        entries.append(("/delevo <code>", "Delete an Evolution recipe (Owner only). Evolution characters users already own are kept"))
+        entries.append(("/delevo <code>", "Delete an Evolution recipe (Owner only)"))
     return _help_page(
         "🎴 Add & Edit Characters (Owner, Executive & Scout)",
         "Add and maintain characters. The editor also changes recruitment/search names.",
@@ -2493,6 +2490,7 @@ def invites_commands_text():
     return "\n".join(lines)
 HELP_MODULES["owner"].append(("invites", "🎁 Invites", INVITES_HELP_TEXT))                  # Owner only: page with 📦 Boxes (opens the manager) and 📋 Commands
 HELP_MODULES["owner"].append(security.help_module())                                        # 🛡 Security (Owner only), right after Invites
+HELP_MODULES["owner"].append(fusion.weapon_help_module())                                   # ⚔️ Weapons (Owner only), right after Security
 HELP_STALE_TEXT = "⚠️ This menu is outdated. Please run /help to open your own menu."
 HELP_PM_START_TEXT = ("📩 I couldn't message you privately. Open a private chat with me, press Start, "
                       "then run /help again.")
@@ -6763,6 +6761,7 @@ def shop_keyboard(user_id, page, price, bought=False, total=len(SHOP_RARITIES), 
         ],
         [InlineKeyboardButton(refresh_label, callback_data=f"shop:refresh:{user_id}:0")],
         [InlineKeyboardButton(buy_label, callback_data=f"shop:{buy_action}:{user_id}:{page}")],
+        [InlineKeyboardButton("⚔️ WEAPON SHOP", callback_data=f"wshop:open:{user_id}:0")],      # fusion.py
     ])
 
 def build_shop_caption(row, page, total=len(SHOP_RARITIES), free_credits=0):
@@ -15224,9 +15223,10 @@ COMMANDS = {
 }
 COMMANDS.update(badge_banner.COMMAND_DESCRIPTIONS)
 COMMANDS.update(rewards.COMMAND_DESCRIPTIONS)
+COMMANDS.update(fusion.WEAPON_COMMAND_DESCRIPTIONS)
 COMMANDS.update(security.COMMAND_DESCRIPTIONS)
 
-PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | rewards.PUBLIC_COMMANDS | {
+PUBLIC_COMMANDS = badge_banner.PUBLIC_COMMANDS | rewards.PUBLIC_COMMANDS | fusion.WEAPON_PUBLIC_COMMANDS | {
     "executives", "scouts", "scout",
     "start", "help", "spawn", "add", "mycollection", "see", "myfav", "mystats", "addlist",
     "daily", "characters", "view", "check", "sell", "rem", "transfer", "issue", "idea",
@@ -16042,7 +16042,7 @@ EXECUTIVE_COMMANDS = {
     "setrange", "delrange", "range", "ranges", "freecode", "freecodes", "nextcode",      # anime code ranges (Owner + Executive)
     "editcode",                                                                          # change a character's code directly
     "fillranges", "undocodes",                                                           # move characters into their ranges / undo that
-} | badge_banner.STAFF_COMMANDS
+} | badge_banner.STAFF_COMMANDS | fusion.WEAPON_STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
 }
@@ -16127,7 +16127,7 @@ OWNER_COMMANDS = {
     "setrules", "resetrules", "setlog", "unsetlog", "logchannel", "log", "nolog", "logcategories",
     "addcategory", "removecategory", "logmap", "unlogmap", "logmappings",
     "logroute", "unlogroute", "logroutes", "logdefault", "exportdb", "importdb",
-} | rewards.OWNER_COMMANDS | security.OWNER_COMMANDS       # security.py: /bangroup /unbangroup ...  # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
+} | rewards.OWNER_COMMANDS | security.OWNER_COMMANDS | fusion.WEAPON_OWNER_COMMANDS       # security.py: /bangroup /unbangroup ...  # /addfestival /festivals /editfestival /delfestival /addquest /editquest /delquest
 OWNER_COMMANDS = OWNER_COMMANDS | EXECUTIVE_COMMANDS | SCOUT_COMMANDS      # Owner section lists everything (gating unchanged)
 
 def register_owner_commands(app):
