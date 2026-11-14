@@ -2924,7 +2924,8 @@ def _shop_caption(w, idx, total, owned):
         "⚔️ WEAPON SHOP\n\n"
         f"⚔️ {w['name']} [{w['_id']}]\n"
         f"📺 Anime: {w.get('anime') or '-'}\n"
-        f"{_rarity_text(w.get('rarity'))}\n"
+        + (f"🗡 Type: {w['type']}\n" if w.get("type") else "")
+        + f"{_rarity_text(w.get('rarity'))}\n"
         f"{_shop_price_lines(w)}\n"
         f"🎒 You own: {owned}\n\n"
         f"📦 Weapon {idx + 1}/{total}\n"
@@ -3495,7 +3496,7 @@ async def evoweapon_command(update, context):
 #   typed steps (a new message asks, /cancel stops):  new  evo  e:<code>:<field>  dx|dcr:<code>:<page>  dp:<code>:<lo>-<hi>:<page>
 # ==========================================================================
 WM_INPUT = 250
-WM_NEW_STEPS = ("name", "anime", "rarity", "price", "code", "photo")
+WM_NEW_STEPS = ("name", "anime", "type", "rarity", "price", "code", "photo")
 WM_DISC_MAX = 90                 # biggest discount in %
 WM_DISC_MAX_MIN = 43200          # longest sale: 30 days (in minutes)
 _WM_TEXT_KEYS = ("wm_edit", "wm_draft")
@@ -3552,7 +3553,8 @@ def _wm_minutes(text):
 
 def _wm_weapon_text(w):
     price = int(w.get("shop_price") or 0)
-    lines = [f"⚔️ {_weapon_label(w)}", "", f"📺 Anime: {w.get('anime') or 'Not set'}", _rarity_text(w.get("rarity")),
+    lines = [f"⚔️ {_weapon_label(w)}", "", f"📺 Anime: {w.get('anime') or 'Not set'}", f"🗡 Type: {w.get('type') or 'Not set'}",
+             _rarity_text(w.get("rarity")),
              "🛒 Shop price: " + (f"{price:,} {BERRY}" if price and w.get("shop_enabled") else "not in the shop")]
     pct, until = _discount_of(w)
     if pct and price:
@@ -3588,8 +3590,9 @@ def _wm_weapon_view(code, page):
         return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:list:{page}")]])
     e = f"wm:e:{code}:"
     return _wm_weapon_text(w), _kb([[("✏️ Name", e + "name"), ("✏️ Anime", e + "anime")],
-                                   [("✏️ Rarity", e + "rarity"), ("✏️ Shop price", e + "price")],
-                                   [("🖼 Photo", e + "photo"), ("🗑 Delete", f"wm:dl:{code}:{page}")],
+                                   [("✏️ Type", e + "type"), ("✏️ Rarity", e + "rarity")],
+                                   [("✏️ Shop price", e + "price"), ("🖼 Photo", e + "photo")],
+                                   [("🗑 Delete", f"wm:dl:{code}:{page}")],
                                    [("⬅️ Back", f"wm:list:{page}")]])
 
 
@@ -3711,7 +3714,7 @@ async def wm_callback(update, context):
                 await q.answer("This preview has expired.", show_alert=True)
                 return
             price = int(draft["price"])
-            doc = {"_id": draft["code"], "code": draft["code"], "name": draft["name"], "anime": draft["anime"], "rarity": draft["rarity"],
+            doc = {"_id": draft["code"], "code": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"], "rarity": draft["rarity"],
                    "photo": draft["photo"], "shop_enabled": price > 0, "shop_price": price,
                    "drop_enabled": False, "drop_stock": 3, "drop_price": price,
                    "created_by": int(uid), "created_at": _stamp()}
@@ -3724,7 +3727,7 @@ async def wm_callback(update, context):
             await q.answer("Saved.")
             await q.edit_message_caption(caption="✅ Weapon added successfully!\n" + _wm_weapon_text(doc),
                                          reply_markup=_kb([[("⚔️ Open Weapon", f"wm:w:{doc['_id']}:0")]]))
-            await _notify(context, f"⚔️ NEW WEAPON ADDED\n⚔️ {doc['name']} [{doc['code']}]\n📺 Anime: {doc['anime']}\n"
+            await _notify(context, f"⚔️ NEW WEAPON ADDED\n⚔️ {doc['name']} [{doc['code']}]\n📺 Anime: {doc['anime']}\n🗡 Type: {doc['type'] or 'Not set'}\n"
                                    f"{_rarity_text(doc['rarity'])}\n💰 Shop Price: {price}\n📷 Photo: Added\n👤 By: {_by(q.from_user)}", q.from_user)
             return
         if action == "dy":                                               # confirmed delete
@@ -3769,6 +3772,9 @@ def _wm_prompt(field, w=None):
     if field == "anime":
         return ("📺 Anime. Send the anime the weapon is from, for example Bleach." if new else
                 f"✏️ New anime{name}. Send the anime name, for example Bleach.")
+    if field == "type":
+        return ("🗡 Type. Send what kind of weapon it is, for example Sword, Knife, Blade or Box. Write it any way you like. Send skip to leave it empty." if new else
+                f"✏️ New type{name}. Send the kind of weapon, for example Sword, Knife, Blade or Box, or 0 to clear it.")
     if field == "rarity":
         return (("🏷 Rarity. " if new else f"✏️ New rarity{name}. ") + "Send one of: " + ", ".join(_rarities())
                 + ". It shows on the weapon card and in the shop.")
@@ -3797,6 +3803,12 @@ async def _wm_value(field, msg, code=None):
     if field == "anime":
         if not text or len(text) > 80:
             return None, "❌ Send the anime name (up to 80 characters), for example Bleach."
+        return text, None
+    if field == "type":
+        if text.lower() in ("skip", "/skip", "0", "none", "no", "-"):
+            return "", None                                 # no type
+        if len(text) > 30:
+            return None, "❌ Send a type of 1 to 30 characters, for example Sword, or skip for none."
         return text, None
     if field == "rarity":
         hit = next((r for r in _rarities() if r.casefold() == text.casefold()), None)
@@ -3895,7 +3907,7 @@ async def wm_input(update, context):
             return WM_INPUT
         context.user_data.pop("wm_edit", None)
         context.user_data["wm_draft"] = draft
-        caption = "🔎 Preview\n\n" + _wm_weapon_text({"_id": draft["code"], "name": draft["name"], "anime": draft["anime"], "rarity": draft["rarity"],
+        caption = "🔎 Preview\n\n" + _wm_weapon_text({"_id": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"], "rarity": draft["rarity"],
                                                     "shop_price": draft["price"], "shop_enabled": draft["price"] > 0, "photo": draft["photo"]})
         await msg.reply_photo(photo=draft["photo"], caption=caption, reply_markup=_kb([[("✅ Save", "wm:sv"), ("❌ Cancel", "wm:cx")]]))
         return -1
@@ -4125,6 +4137,7 @@ def _drop_caption(drop, w, state="active"):
     lines = [head, "",
              f"⚔️ {w['name']} [{w['_id']}]",
              f"📺 Anime: {w.get('anime') or '-'}",
+             *([f"🗡 Type: {w['type']}"] if w.get("type") else []),
              _rarity_text(w.get("rarity")),
              f"🪙 Price: {int(drop['price']):,} {BERRY}",
              f"📦 Stock: {max(int(drop['stock_left']), 0)}/{int(drop['stock_total'])}"]
@@ -5158,7 +5171,7 @@ def _register_weapons(app):
         conversation_timeout=_deps["conv_timeout"],
     ))
     app.add_handler(ConversationHandler(            # ⚔️ Weapon Manager typed steps (create, edit, discount, evolution weapon; /cancel stops)
-        entry_points=[CallbackQueryHandler(wm_entry, pattern=r"^wm:(new|evo|e:\d{4}:(name|anime|rarity|price|photo)|dx:\d{4}:\d+|dcr:\d{4}:\d+|dp:\d{4}:\d{1,2}-\d{1,2}:\d+)$")],
+        entry_points=[CallbackQueryHandler(wm_entry, pattern=r"^wm:(new|evo|e:\d{4}:(name|anime|type|rarity|price|photo)|dx:\d{4}:\d+|dcr:\d{4}:\d+|dp:\d{4}:\d{1,2}-\d{1,2}:\d+)$")],
         states={WM_INPUT: [MessageHandler(text | filters.PHOTO, wm_input)]},
         fallbacks=[CommandHandler("cancel", wm_cancel)],
         allow_reentry=True,
