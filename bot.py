@@ -1814,6 +1814,7 @@ SYMBOL = {
     "Epic": "🟣",
     "Legendary": "💎",
     "Mythical": "🔮",
+    "Ethereal": "🌠",
     "Celestial": "💠",
     "Heavenly": "🧿",   # fusion-only tier: never spawns, only /addevo and /editevo may use it
 }
@@ -1824,25 +1825,29 @@ WORTH = {
     "Epic": 250,
     "Legendary": 500,
     "Mythical": 750,
+    "Ethereal": 875,
     "Celestial": 1000,
 }
 
 CHANCES = [
-    ("Common", 43),
+    ("Common", 42.5),
     ("Rare", 27),
     ("Epic", 23),
     ("Legendary", 5),
     ("Mythical", 1.8),
+    ("Ethereal", 0.5),
     ("Celestial", 0.2),
 ]
 
 # High-rank characters keep strict daily limits; spacing restrictions are fixed at 20/20/50.
 LEGENDARY_DAILY_LIMIT = 6
 MYTHICAL_DAILY_LIMIT = 2
+ETHEREAL_DAILY_LIMIT = 2
 CELESTIAL_DAILY_LIMIT = 1
 HIGH_RARITY_GAP_MIN = 20
 HIGH_RARITY_GAP_MAX = 20
 CELESTIAL_GAP_TARGET = 50
+ETHEREAL_GAP_TARGET = 35      # spawns between two Ethereal characters (the shared high-rank gap of 20 applies too)
 
 MAX_CHARACTER_SUCCESSFUL_ADDS_GLOBAL = 2  # per character, per India-time day
 
@@ -1934,9 +1939,13 @@ def setup_database():
     _mc("spawn_limits_global_v1").update_one(
         {"_id": 1},
         {"$setOnInsert": {"id": 1, "day_key": today_key, "legendary_count": 0, "mythical_count": 0,
-                          "celestial_count": 0, "legendary_pending": 0, "mythical_pending": 0,
-                          "celestial_pending": 0}},
+                          "celestial_count": 0, "ethereal_count": 0, "legendary_pending": 0,
+                          "mythical_pending": 0, "celestial_pending": 0, "ethereal_pending": 0}},
         upsert=True,
+    )
+    _mc("spawn_limits_global_v1").update_one(       # existing document from before the Ethereal tier
+        {"_id": 1, "ethereal_count": {"$exists": False}},
+        {"$set": {"ethereal_count": 0, "ethereal_pending": 0}},
     )
 
     # Built-in characters: insert any that are missing (never overwrites existing rows/photos).
@@ -2080,7 +2089,7 @@ def is_skip_text(text):
 # ---------------------------------------------------------------------------------------------------
 DEFAULT_WORTH_COLLECTION = "default_worth_v1"
 DEFAULT_WORTH_MAX = 10000000
-CW_RARITIES = ("Common", "Rare", "Epic", "Legendary", "Mythical", "Celestial")
+CW_RARITIES = ("Common", "Rare", "Epic", "Legendary", "Mythical", "Ethereal", "Celestial")
 CW_INPUT_TIMEOUT = 300                # seconds the bot waits for the new worth number
 _cw_waiting = {}                      # user id -> (rarity, role, expiry time.monotonic)
 _worth_defaults_cache = None          # {rarity: worth} saved by Owner/Executive; None = not loaded yet
@@ -2204,6 +2213,7 @@ def _build_help_text_raw():
         "/evolve [code/name] — Evolve a character into a stronger one\n\n"
         "⚔️ Weapons\n"
         "/weapons — See your weapons\n"
+        "/weaponlist — See every weapon\n"
         "/weaponshop — Buy weapons (some evolutions need one)\n\n"
         "💎 Stones & Items\n"
         "/stonetask — Do daily tasks to earn stones\n"
@@ -2824,8 +2834,8 @@ def get_high_rank_today_key():
 
 def _successful_global_quota_counts(cursor=None, today_key=None):
     today_key = today_key or get_high_rank_today_key()
-    counts = {"Legendary": 0, "Mythical": 0, "Celestial": 0}
-    for rarity, spawned_at in mongo_db.sh_rarity_rows(_day_floor(today_key), ("Legendary", "Mythical", "Celestial")):
+    counts = {"Legendary": 0, "Mythical": 0, "Ethereal": 0, "Celestial": 0}
+    for rarity, spawned_at in mongo_db.sh_rarity_rows(_day_floor(today_key), ("Legendary", "Mythical", "Ethereal", "Celestial")):
         try:
             dt = datetime.fromisoformat(str(spawned_at))
             if dt.tzinfo is None:
@@ -2839,8 +2849,8 @@ def _successful_global_quota_counts(cursor=None, today_key=None):
 
 def _sync_global_quota_consumed(cursor, today_key):
     gl = _mc("spawn_limits_global_v1")
-    zero = {"legendary_count": 0, "mythical_count": 0, "celestial_count": 0,
-            "legendary_pending": 0, "mythical_pending": 0, "celestial_pending": 0}
+    zero = {"legendary_count": 0, "mythical_count": 0, "celestial_count": 0, "ethereal_count": 0,
+            "legendary_pending": 0, "mythical_pending": 0, "celestial_pending": 0, "ethereal_pending": 0}
     doc = gl.find_one({"_id": 1})
     if not doc:
         try:
@@ -2852,18 +2862,18 @@ def _sync_global_quota_consumed(cursor, today_key):
     counts = _successful_global_quota_counts(None, today_key)
     gl.update_one({"_id": 1, "day_key": today_key},
                   {"$set": {"legendary_count": counts["Legendary"], "mythical_count": counts["Mythical"],
-                            "celestial_count": counts["Celestial"]}})
+                            "ethereal_count": counts["Ethereal"], "celestial_count": counts["Celestial"]}})
     return counts
 
 def reserve_rarity(chat_id, rarity):
-    limits = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
+    limits = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Ethereal": ETHEREAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
     if rarity in ("Common", "Rare", "Epic"):
         return True, ""
     if rarity not in limits:
         return False, "❌ Invalid rarity."
     today_key = get_high_rank_today_key()
-    count_col = {"Legendary": "legendary_count", "Mythical": "mythical_count", "Celestial": "celestial_count"}[rarity]
-    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Celestial": "celestial_pending"}[rarity]
+    count_col = {"Legendary": "legendary_count", "Mythical": "mythical_count", "Ethereal": "ethereal_count", "Celestial": "celestial_count"}[rarity]
+    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Ethereal": "ethereal_pending", "Celestial": "celestial_pending"}[rarity]
     _sync_global_quota_consumed(None, today_key)
     # atomic: only increments pending while (count + pending) is still under the daily limit
     res = _mc("spawn_limits_global_v1").update_one(
@@ -2878,11 +2888,11 @@ def reserve_rarity(chat_id, rarity):
 def finalize_rarity_success(rarity):
     if rarity in ("Common", "Rare", "Epic"):
         return True
-    limits = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
+    limits = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Ethereal": ETHEREAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
     if rarity not in limits:
         return False
     today_key = get_high_rank_today_key()
-    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Celestial": "celestial_pending"}[rarity]
+    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Ethereal": "ethereal_pending", "Celestial": "celestial_pending"}[rarity]
     gl = _mc("spawn_limits_global_v1")
     _sync_global_quota_consumed(None, today_key)
     res = gl.update_one({"_id": 1, "day_key": today_key, pending_col: {"$gt": 0}}, {"$inc": {pending_col: -1}})
@@ -2894,13 +2904,13 @@ def finalize_rarity_success(rarity):
         return False
     gl.update_one({"_id": 1, "day_key": today_key},
                   {"$set": {"legendary_count": counts["Legendary"], "mythical_count": counts["Mythical"],
-                            "celestial_count": counts["Celestial"]}})
+                            "ethereal_count": counts["Ethereal"], "celestial_count": counts["Celestial"]}})
     return True
 
 def rollback_rarity_reservation(chat_id, rarity):
     if rarity in ("Common", "Rare", "Epic"):
         return
-    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Celestial": "celestial_pending"}.get(rarity)
+    pending_col = {"Legendary": "legendary_pending", "Mythical": "mythical_pending", "Ethereal": "ethereal_pending", "Celestial": "celestial_pending"}.get(rarity)
     if not pending_col:
         return
     _sync_global_quota_consumed(None, get_high_rank_today_key())
@@ -2934,7 +2944,7 @@ def _get_random_spawn_high_rarity_gaps(app=None):
     try:
         # The spacing restriction resets at 12:00 AM IST every day.
         today_start = datetime.now(INDIA_TZ).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
-        high_row = mongo_db.sh_last_spawn(("Legendary", "Mythical", "Celestial"), today_start)
+        high_row = mongo_db.sh_last_spawn(("Legendary", "Mythical", "Ethereal", "Celestial"), today_start)
         celestial_row = mongo_db.sh_last_spawn(("Celestial",), today_start)
 
         def count_spawns_after(row):
@@ -2956,12 +2966,29 @@ def _get_random_spawn_high_rarity_gaps(app=None):
         print("High-rarity spacing lookup error:", e)
     return high_gap, celestial_gap
 
+def _get_ethereal_gap(app=None):
+    """Random/manual spawns since the last Ethereal spawn today (since today's first spawn when there is none); None if unreadable."""
+    try:
+        today_start = datetime.now(INDIA_TZ).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        row = mongo_db.sh_last_spawn(("Ethereal",), today_start)
+        if not row:
+            return mongo_db.sh_count_random_since(today_start)
+        history_id, spawned_at = row
+        try:
+            datetime.fromisoformat(str(spawned_at))
+        except (TypeError, ValueError):
+            return 0
+        return mongo_db.sh_count_random_after(today_start, str(spawned_at), history_id)
+    except Exception as e:
+        print("Ethereal spacing lookup error:", e)
+        return None
+
 def reserve_high_rarity_spacing(app, rarity):
-    if rarity in ("Legendary", "Mythical", "Celestial"):
+    if rarity in ("Legendary", "Mythical", "Ethereal", "Celestial"):
         app.bot_data["high_rarity_spacing_reservation"] = app.bot_data.get("high_rarity_spacing_reservation", 0) + 1
 
 def release_high_rarity_spacing(app, rarity):
-    if rarity in ("Legendary", "Mythical", "Celestial"):
+    if rarity in ("Legendary", "Mythical", "Ethereal", "Celestial"):
         key = "high_rarity_spacing_reservation"
         count = app.bot_data.get(key, 0) - 1
         if count > 0:
@@ -3057,11 +3084,11 @@ def clear_photo_restriction(code):
 #   * Cooldown: after a Common/Rare/Epic character spawns in a group it cannot spawn again in THAT group for a
 #     random 36-48 hours (1.5-2 days). When the time is over it is simply back in the normal random pool, with no
 #     priority. If every character of a rarity is cooling down in a group, the one that finishes soonest is used,
-#     so spawning never stops. Legendary / Mythical / Celestial are exempt: their rules are unchanged.
+#     so spawning never stops. Legendary / Mythical / Ethereal / Celestial are exempt: their rules are unchanged.
 #     Stored in MongoDB (group_spawn_cooldown_v1), so restarts keep it.
 # ---------------------------------------------------------------------------------------------------------------
 _GROUP_COOLDOWN_COLL = "group_spawn_cooldown_v1"
-_HIGH_RARITIES = ("Legendary", "Mythical", "Celestial")
+_HIGH_RARITIES = ("Legendary", "Mythical", "Ethereal", "Celestial")
 _COOLDOWN_MIN_HOURS = 36
 _COOLDOWN_MAX_HOURS = 48
 
@@ -3158,6 +3185,9 @@ def choose_character(chat_id, excluded_codes=None, app=None, respect_daily_limit
             available = [(r, w) for r, w in available if r in ("Common", "Rare", "Epic")]
         elif celestial_gap is not None and celestial_gap < celestial_target:
             available = [(r, w) for r, w in available if r != "Celestial"]
+        ethereal_gap = _get_ethereal_gap(app)
+        if ethereal_gap is not None and ethereal_gap < ETHEREAL_GAP_TARGET:
+            available = [(r, w) for r, w in available if r != "Ethereal"]
 
         if available:
             rarity = random.choices([r for r, _ in available], weights=[w for _, w in available], k=1)[0]
@@ -3266,8 +3296,8 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
             return False, "❌ A character is already spawned in this chat."
 
         # Owner /callcharacter cannot exceed the daily high-rank limit (the gap is not checked; it resets after the call).
-        if spawned_by == "owner_callchar" and character is not None and character[3] in ("Legendary", "Mythical", "Celestial"):
-            _lims = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
+        if spawned_by == "owner_callchar" and character is not None and character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial"):
+            _lims = {"Legendary": LEGENDARY_DAILY_LIMIT, "Mythical": MYTHICAL_DAILY_LIMIT, "Ethereal": ETHEREAL_DAILY_LIMIT, "Celestial": CELESTIAL_DAILY_LIMIT}
             _counts = await asyncio.to_thread(_successful_global_quota_counts, None, get_high_rank_today_key())
             if _counts.get(character[3], 0) >= _lims[character[3]]:
                 return False, (f"❌ Today's global {character[3]} limit ({_lims[character[3]]}) has been reached.\n"
@@ -3305,10 +3335,13 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
                 celestial_blocked = (
                     celestial_gap is not None and celestial_gap < celestial_target
                 )
+                _eth_gap = (await asyncio.to_thread(_get_ethereal_gap, app))
+                ethereal_blocked = _eth_gap is not None and _eth_gap < ETHEREAL_GAP_TARGET
                 recent_codes = (await asyncio.to_thread(get_recent_global_spawn_codes, chat_id))
                 if (str(character[0]) in recent_codes or
-                    (high_blocked and character[3] in ("Legendary", "Mythical", "Celestial")) or
-                    (celestial_blocked and character[3] == "Celestial")):
+                    (high_blocked and character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial")) or
+                    (celestial_blocked and character[3] == "Celestial") or
+                    (ethereal_blocked and character[3] == "Ethereal")):
                     character = (await asyncio.to_thread(choose_character,
                         chat_id,
                         excluded_codes=excluded_for_random | {str(character[0])},
@@ -3376,7 +3409,7 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
                     if not rarity_ok:
                         (await asyncio.to_thread(release_daily_character_spawn, chat_id, character_code))
                         return False, rarity_reason
-                rarity_reserved = character[3] in ("Legendary", "Mythical", "Celestial")
+                rarity_reserved = character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial")
 
             reserve_random_spawn(app, chat_id, character_code)
             reserve_high_rarity_spacing(app, character[3])
@@ -3414,13 +3447,13 @@ async def spawn_reserved(chat_id, context, character, spawned_by="manual"):
         raise
 
     if random_spawn:
-        if character[3] in ("Legendary", "Mythical", "Celestial") and rarity_reserved:
+        if character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial") and rarity_reserved:
             (await asyncio.to_thread(finalize_rarity_success, character[3]))
-        if character[3] in ("Legendary", "Mythical", "Celestial"):
+        if character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial"):
             (await asyncio.to_thread(_set_high_rarity_spacing_target, character[3]))
         release_high_rarity_spacing(app, character[3])
         release_random_spawn_reservation(app, chat_id, character_code)
-    elif spawned_by == "owner_callchar" and character[3] in ("Legendary", "Mythical", "Celestial"):
+    elif spawned_by == "owner_callchar" and character[3] in ("Legendary", "Mythical", "Ethereal", "Celestial"):
         # Owner-called high-rank spawns count in daily totals (via history) and reset the gap like a normal one.
         try:
             (await asyncio.to_thread(_set_high_rarity_spacing_target, character[3]))
@@ -6130,7 +6163,7 @@ async def add(update, context):
                                 if not caught_spawn.get("forced_reuse"):
                                     if not (await asyncio.to_thread(finalize_daily_character_spawn, chat_id, caught_spawn.get("code"))):
                                         print("Group character catch quota finalization warning:", chat_id, caught_spawn.get("code"))
-                                    if caught_spawn.get("rarity") in ("Legendary", "Mythical", "Celestial"):
+                                    if caught_spawn.get("rarity") in ("Legendary", "Mythical", "Ethereal", "Celestial"):
                                         if not (await asyncio.to_thread(finalize_rarity_success, caught_spawn.get("rarity"))):
                                             print("High-rank daily limit finalization warning:", chat_id, caught_spawn.get("rarity"))
 
@@ -6179,11 +6212,12 @@ async def get_collection_rows(user_id, sort_mode="tier", rarity=None):
         "Special": -1,          # festival special characters: their own tier at the top of the collection
         "Heavenly": 0,
         "Celestial": 1,
-        "Mythical": 2,
-        "Legendary": 3,
-        "Epic": 4,
-        "Rare": 5,
-        "Common": 6,
+        "Ethereal": 2,
+        "Mythical": 3,
+        "Legendary": 4,
+        "Epic": 5,
+        "Rare": 6,
+        "Common": 7,
     }
 
     if sort_mode == "time":
@@ -6208,7 +6242,7 @@ def clear_favorite(user_id):
     mongo_db.clear_favorite(user_id)
 
 # Tier menu (🔹 Tier button): highest tier first. Callback mode format: <sort>[~<Rarity>], e.g. "name~Epic".
-COLLECTION_TIERS = ("Special", "Heavenly", "Celestial", "Mythical", "Legendary", "Epic", "Rare", "Common")
+COLLECTION_TIERS = ("Special", "Heavenly", "Celestial", "Ethereal", "Mythical", "Legendary", "Epic", "Rare", "Common")
 COLLECTION_SORTS = {"tier", "time", "name", "qty"}
 
 
@@ -9611,7 +9645,7 @@ async def addcharacter_anime(update, context):
     context.user_data["anime"] = "" if is_skip_text(text) else text
     await safe_reply_text(update.message,
         "3️⃣ Send rarity:\n"
-        "Common / Rare / Epic / Legendary / Mythical / Celestial"
+        "Common / Rare / Epic / Legendary / Mythical / Ethereal / Celestial"
     )
     return ADD_RARITY
 
@@ -9927,7 +9961,7 @@ async def edit_anime(update, context):
         context.user_data["edit_anime"] = context.user_data["edit_character"][2]
     else:
         context.user_data["edit_anime"] = update.message.text.strip()
-    await safe_reply_text(update.message, "3️⃣ Send rarity (Common/Rare/Epic/Legendary/Mythical/Celestial), or tap ⏭ Skip.", reply_markup=skip_keyboard())
+    await safe_reply_text(update.message, "3️⃣ Send rarity (Common/Rare/Epic/Legendary/Mythical/Ethereal/Celestial), or tap ⏭ Skip.", reply_markup=skip_keyboard())
     return EDIT_RARITY
 
 async def edit_rarity(update, context):
@@ -12352,7 +12386,7 @@ def get_today_group_spawn_tracking():
             key = str(chat_id)
             bucket = tracking.setdefault(key, {
                 "Common": 0, "Rare": 0, "Epic": 0,
-                "Legendary": 0, "Mythical": 0, "Celestial": 0,
+                "Legendary": 0, "Mythical": 0, "Ethereal": 0, "Celestial": 0,
                 "total": 0,
             })
             rarity = str(rarity)
@@ -12383,17 +12417,19 @@ async def build_status_lines(app):
     high_counts = (await asyncio.to_thread(_successful_global_quota_counts, None, get_high_rank_today_key()))
     high_gap, celestial_gap = (await asyncio.to_thread(_get_random_spawn_high_rarity_gaps, app))
     high_target, celestial_target = (await asyncio.to_thread(_get_high_rarity_spacing_targets))
+    ethereal_gap = (await asyncio.to_thread(_get_ethereal_gap, app))
     lines += [
         "💎 High-Rank Spawn Tracking:",
         f"💎 Legendary: {high_counts['Legendary']}/{LEGENDARY_DAILY_LIMIT} spawned today | Gap: {(high_gap or 0)}/{high_target}",
         f"🔮 Mythical: {high_counts['Mythical']}/{MYTHICAL_DAILY_LIMIT} spawned today | Gap: {(high_gap or 0)}/{high_target}",
+        f"{SYMBOL['Ethereal']} Ethereal: {high_counts['Ethereal']}/{ETHEREAL_DAILY_LIMIT} spawned today | Gap: {(ethereal_gap or 0)}/{ETHEREAL_GAP_TARGET}",
         f"💠 Celestial: {high_counts['Celestial']}/{CELESTIAL_DAILY_LIMIT} spawned today | Gap: {(celestial_gap or 0)}/{celestial_target}",
         "",
     ]
 
     # Live ALL-GROUPS rarity totals for today's random/manual spawns.
     today_key = get_spawn_tracking_today_key()
-    rarity_totals = {"Common": 0, "Rare": 0, "Epic": 0, "Legendary": 0, "Mythical": 0, "Celestial": 0}
+    rarity_totals = {"Common": 0, "Rare": 0, "Epic": 0, "Legendary": 0, "Mythical": 0, "Ethereal": 0, "Celestial": 0}
     for rarity, count in (await asyncio.to_thread(mongo_db.sh_day_rarity_counts, today_key)).items():
         if rarity in rarity_totals:
             rarity_totals[rarity] = int(count)
@@ -12406,6 +12442,7 @@ async def build_status_lines(app):
         f"🟣 Epic: {rarity_totals['Epic']}",
         f"💎 Legendary: {rarity_totals['Legendary']}/{LEGENDARY_DAILY_LIMIT}",
         f"🔮 Mythical: {rarity_totals['Mythical']}/{MYTHICAL_DAILY_LIMIT}",
+        f"{SYMBOL['Ethereal']} Ethereal: {rarity_totals['Ethereal']}/{ETHEREAL_DAILY_LIMIT}",
         f"💠 Celestial: {rarity_totals['Celestial']}/{CELESTIAL_DAILY_LIMIT}",
         "",
         f"🕐 Current Time: {ist_now.strftime('%d %b %Y, %I:%M:%S %p')} IST",
@@ -12423,14 +12460,15 @@ async def build_status_lines(app):
             title = info.get("title") or info.get("username") or f"Group {chat_id}"
             bucket = tracking.get(str(chat_id), {
                 "Common": 0, "Rare": 0, "Epic": 0,
-                "Legendary": 0, "Mythical": 0, "Celestial": 0, "total": 0,
+                "Legendary": 0, "Mythical": 0, "Ethereal": 0, "Celestial": 0, "total": 0,
             })
             lines.append(
                 f"• {title} ({chat_id}) — Total: {bucket['total']}"
             )
             lines.append(
                 f"  ⚪ {bucket['Common']} | 🔵 {bucket['Rare']} | 🟣 {bucket['Epic']} | "
-                f"💎 {bucket['Legendary']} | 💠 {bucket['Mythical']} | 🧠 {bucket['Celestial']}"
+                f"{SYMBOL['Legendary']} {bucket['Legendary']} | {SYMBOL['Mythical']} {bucket['Mythical']} | "
+                f"{SYMBOL['Ethereal']} {bucket['Ethereal']} | {SYMBOL['Celestial']} {bucket['Celestial']}"
             )
     else:
         lines += ["", "📍 Today's Spawn Tracking — No group spawn recorded yet."]

@@ -63,7 +63,7 @@ TASKS_COL = mongo_db.FUSION_STONE_TASKS
 DAILY_COL = mongo_db.FUSION_STONE_DAILY
 USERS_COL = "users"
 
-# Rarities the daily /add target may be picked from. Celestial/Mythical/Legendary are excluded
+# Rarities the daily /add target may be picked from. Celestial/Ethereal/Mythical/Legendary are excluded
 # on purpose: they have daily spawn limits, so a target could be impossible to catch.
 ADD_TASK_RARITIES = ("Common", "Rare", "Epic")
 
@@ -97,7 +97,7 @@ NEEDED["add"] = 1
 # rarity (lower-case) -> progress key for the rarity-specific catch tasks
 _RARITY_KEYS = {"epic": "epic", "legendary": "legendary", "mythical": "mythical", "celestial": "celestial"}
 
-RARITY_SYMBOLS = {"Common": "⚪", "Rare": "🔵", "Epic": "🟣", "Legendary": "🟡", "Mythical": "🔴", "Celestial": "🌟"}
+RARITY_SYMBOLS = {"Common": "⚪", "Rare": "🔵", "Epic": "🟣", "Legendary": "🟡", "Mythical": "🔴", "Ethereal": "🌠", "Celestial": "🌟"}
 
 
 # --------------------------------------------------------------------------
@@ -651,17 +651,17 @@ def _name_taken(name):
 
 
 HEAVENLY_RARITY = "Heavenly"                          # fusion-only top tier (symbol 🧿 lives in bot.SYMBOL)
-HEAVENLY_INGREDIENT_RARITIES = ("Celestial", "Mythical")
+HEAVENLY_INGREDIENT_RARITIES = ("Celestial", "Ethereal", "Mythical")
 
 
 def heavenly_error(rarity, codes):
-    """A Heavenly evolution may only be made from Celestial or Mythical characters. Returns an error text or None."""
+    """A Heavenly evolution may only be made from Celestial, Ethereal or Mythical characters. Returns an error text or None."""
     if str(rarity or "").title() != HEAVENLY_RARITY:
         return None
     for code in codes:
         row = _row(str(code))
         if row is None or str(row[3]) not in HEAVENLY_INGREDIENT_RARITIES:
-            return "❌ Heavenly evolutions can only use Celestial or Mythical characters."
+            return "❌ Heavenly evolutions can only use Celestial, Ethereal or Mythical characters."
     return None
 
 
@@ -1246,7 +1246,7 @@ async def addevo_anime(update, context):
         await _reply(msg, "❌ The anime name cannot be empty.")
         return E_ANIME
     context.user_data["evo_anime"] = anime
-    await _reply(msg, f"{_stepno(context, 5)} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial / Heavenly")
+    await _reply(msg, f"{_stepno(context, 5)} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Ethereal / Celestial / Heavenly")
     return E_RARITY
 
 
@@ -1596,7 +1596,7 @@ async def editevo_anime(update, context):
             await _reply(msg, "❌ The anime name cannot be empty.")
             return X_ANIME
         d["eevo_anime"] = anime
-    await _reply(msg, f"3️⃣ Rarity (Common / Rare / Epic / Legendary / Mythical / Celestial / Heavenly), or ⏭ Skip.\n"
+    await _reply(msg, f"3️⃣ Rarity (Common / Rare / Epic / Legendary / Mythical / Ethereal / Celestial / Heavenly), or ⏭ Skip.\n"
                       f"Current: {d['eevo_row'][3]}", reply_markup=_skip_markup())
     return X_RARITY
 
@@ -2673,15 +2673,15 @@ MAX_QTY = 99
 MAX_STOCK = 1000
 TICK_SECONDS = 15
 
-WEAPON_PUBLIC_COMMANDS = {"weapons", "weaponshop"}
-WEAPON_STAFF_COMMANDS = {"addweapon", "editweapon", "weaponlist", "evoweapon"}        # Owner + Executive
+WEAPON_PUBLIC_COMMANDS = {"weapons", "weaponshop", "weaponlist"}
+WEAPON_STAFF_COMMANDS = {"addweapon", "editweapon", "evoweapon"}        # Owner + Executive
 WEAPON_OWNER_COMMANDS = {"delweapon", "giveweapon", "weapondrops", "dropgroups", "dropconfig", "dropnow"}
 WEAPON_COMMAND_DESCRIPTIONS = {
     "weapons": "View your weapons",
     "weaponshop": "Open the weapon shop",
     "addweapon": "Owner/Executive: add a weapon (PM)",
     "editweapon": "Owner/Executive: edit a weapon",
-    "weaponlist": "Owner/Executive: list every weapon",
+    "weaponlist": "See every weapon",
     "evoweapon": "Owner/Executive: set the weapon an evolution needs",
     "delweapon": "Owner: delete a weapon",
     "giveweapon": "Owner: give a weapon to a user",
@@ -3097,26 +3097,29 @@ async def weapons_command(update, context):
         await _reply(msg, p)
 
 
-def _weaponlist_lines():
+def _weaponlist_lines(staff=False):
+    """Everyone sees name, code, anime, rarity and the shop price; Owner/Executive also see the drop settings."""
     lines = []
     for w in all_weapons():
-        shop = f"🛒 {int(w['shop_price']):,}" if w.get("shop_enabled") and int(w.get("shop_price") or 0) > 0 else "🛒 off"
-        drop = (f"🎁 {'on' if w.get('drop_enabled') else 'off'} (stock {int(w.get('drop_stock') or 0)}, "
-                f"{int(w.get('drop_price') or 0):,})")
-        lines.append(f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] • {w.get('anime') or '-'}\n   {shop} • {drop}")
+        in_shop = w.get("shop_enabled") and int(w.get("shop_price") or 0) > 0
+        shop = f"🛒 {int(w['shop_price']):,} {BERRY}" if in_shop else "🛒 Not in the shop"
+        line = (f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] • {w.get('anime') or '-'}\n"
+                f"   {shop}")
+        if staff:
+            line += (f" • 🎁 {'on' if w.get('drop_enabled') else 'off'} (stock {int(w.get('drop_stock') or 0)}, "
+                     f"{int(w.get('drop_price') or 0):,})")
+        lines.append(line)
     return lines
 
 
 async def weaponlist_command(update, context):
     user, msg = update.effective_user, update.effective_message
-    if user is None or msg is None:
+    if user is None or msg is None or user.is_bot:
         return
-    if not _is_staff(user.id):
-        await _reply(msg, NOT_ALLOWED_TEXT)
-        return
-    lines = await asyncio.to_thread(_weaponlist_lines)
+    staff = _is_staff(user.id)
+    lines = await asyncio.to_thread(_weaponlist_lines, staff)
     if not lines:
-        await _reply(msg, "No weapons yet. Add one with /addweapon.")
+        await _reply(msg, "No weapons yet. Add one with /addweapon." if staff else "⚔️ No weapons yet. Check back later!")
         return
     for p in _chunk_lines("⚔️ All Weapons\n\n", lines):
         await _reply(msg, p)
@@ -3172,7 +3175,7 @@ async def addweapon_anime(update, context):
         await _reply(msg, "❌ The anime name cannot be empty.")
         return W_ANIME
     context.user_data["wpn_anime"] = anime
-    await _reply(msg, f"{_EMOJI[3]} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Celestial / Heavenly")
+    await _reply(msg, f"{_EMOJI[3]} Rarity:\nCommon / Rare / Epic / Legendary / Mythical / Ethereal / Celestial / Heavenly")
     return W_RARITY
 
 
@@ -3456,7 +3459,7 @@ async def evoweapon_command(update, context):
 # ==========================================================================
 # GROUP DROPS: a weapon appears in the groups the Owner enabled; first come, first served, limited stock + time
 # ==========================================================================
-DEFAULT_SETTINGS = {"enabled": False, "mode": "random", "min_hours": 3, "max_hours": 8, "fixed_times": [],
+DEFAULT_SETTINGS = {"enabled": False, "mode": "random", "min_hours": 3, "max_hours": 8, "min_minutes": None, "max_minutes": None, "fixed_times": [],
                     "duration_min": 10, "groups": [], "next_at": None, "last_fixed": None, "active_drop": None}
 
 
@@ -3696,8 +3699,8 @@ async def wdrop_callback(update, context):
 
 # ---------------------------------------------------------------- background tick (JobQueue or asyncio fallback)
 def _next_random_at(settings):
-    lo, hi = int(settings["min_hours"]), int(settings["max_hours"])
-    return _utcnow() + timedelta(minutes=random.randint(lo * 60, max(lo, hi) * 60))
+    lo, hi = _rand_range(settings)                 # minutes (older settings only hold hours)
+    return _utcnow() + timedelta(minutes=random.randint(lo, max(lo, hi)))
 
 
 def _due_fixed_key(settings):
@@ -3806,6 +3809,7 @@ async def _dropgroups_view(bot, page):
                      InlineKeyboardButton("▶️", callback_data=f"wdg:p:0:{(page + 1) % pages}")])
     rows.append([InlineKeyboardButton("✅ Enable all", callback_data=f"wdg:all:1:{page}"),
                  InlineKeyboardButton("⬜ Disable all", callback_data=f"wdg:all:0:{page}")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="wdp:main:0:0")])
     text = (f"⚔️ Drop Groups\n\nWeapon drops appear only in ✅ groups.\n"
             f"Enabled: {len(enabled & set(approved))} of {len(approved)} approved group(s).")
     return text, InlineKeyboardMarkup(rows)
@@ -3852,49 +3856,298 @@ async def dropgroups_callback(update, context):
             logger.info("dropgroups edit skipped: %s", e)
 
 
-# ---------------------------------------------------------------- /weapondrops panel, /dropconfig, /dropnow
+# ---------------------------------------------------------------- /weapondrops panel (buttons), /dropconfig, /dropnow
 POOL_PER_PAGE = 8
+MAX_FIXED_TIMES = 6
+DUR_MIN, DUR_MAX = 1, 1440                    # drop length, minutes
+RAND_MIN, RAND_MAX = 5, 168 * 60              # random gap, minutes
+DUR_PRESETS = ((15, "15 min"), (30, "30 min"), (60, "1 hour"), (120, "2 hours"))
+RAND_PRESETS = ((60, 180, "1-3 h"), (180, 480, "3-8 h"), (360, 720, "6-12 h"))
+
+# ---- time input: minutes and hours ("70m", "2h", "1h 10", "1h10m", plain number = default unit)
+_DUR_RE = re.compile(r"^(\d+)\s*(hours|hour|hrs|hr|h|minutes|minute|mins|min|m)?"
+                     r"(?:\s*(\d+)\s*(minutes|minute|mins|min|m)?)?$")
+
+
+def parse_duration(text, default_unit="m"):
+    """Minutes from '70m', '45 min', '2h', '1h 10', '1h10m' or a plain number (default_unit 'm' or 'h'). None if invalid."""
+    t = str(text or "").strip().lower().replace(",", "")
+    m = _DUR_RE.match(t)
+    if not m:
+        return None
+    a, u1, b, _u2 = m.groups()
+    a = int(a)
+    if b is not None:                          # "1h 10" / "1h 10m": the first part must be hours
+        if not u1 or u1[0] != "h":
+            return None
+        b = int(b)
+        return a * 60 + b if b <= 59 else None
+    unit = u1 or default_unit
+    return a * 60 if unit[0] == "h" else a
+
+
+def parse_range(text, default_unit="h"):
+    """(min_minutes, max_minutes) from '30m-2h', '1h to 3h', '30m 2h' or '1 3'. None if invalid."""
+    t = str(text or "").strip().lower()
+    parts = re.split(r"\s*(?:-|–|—|,|\bto\b)\s*", t)
+    if len(parts) == 1:
+        parts = t.split()
+    if len(parts) != 2:
+        return None
+    lo, hi = parse_duration(parts[0], default_unit), parse_duration(parts[1], default_unit)
+    if lo is None or hi is None:
+        return None
+    return lo, hi
+
+
+def fmt_minutes(total):
+    """70 -> '1h 10m', 120 -> '2h', 45 -> '45m'."""
+    h, m = divmod(int(total), 60)
+    if h and m:
+        return f"{h}h {m}m"
+    return f"{h}h" if h else f"{m}m"
+
+
+def _parse_hhmm(text):
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(text or "").strip())
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def _rand_range(s):
+    """(min, max) random gap in minutes; older settings only have min_hours/max_hours."""
+    lo, hi = s.get("min_minutes"), s.get("max_minutes")
+    if lo is None or hi is None:
+        lo, hi = int(s["min_hours"]) * 60, int(s["max_hours"]) * 60
+    return int(lo), int(hi)
 
 
 def _timing_text(s):
     if s["mode"] == "fixed":
         times = ", ".join(s.get("fixed_times") or []) or "no times set"
         return f"Fixed times (IST): {times}"
-    return f"Random: every {int(s['min_hours'])}-{int(s['max_hours'])} hours"
+    lo, hi = _rand_range(s)
+    return f"Random: every {fmt_minutes(lo)}-{fmt_minutes(hi)}"
 
 
-def _panel_sync(page):
+# ---- guides (📜 Commands, 🔘 Buttons)
+_CMD_GUIDE = (
+    "📜 WEAPON COMMANDS (1/3): EVERYONE\n\n"
+    "/weapons\nShows the weapons you own and how many of each. A weapon is used up in /evolve when an evolution needs it.\n\n"
+    "/weaponshop\nOpens the weapon shop. Use ◀️ BACK and ▶️ NEXT to look through the weapons and 🛒 BUY to buy one. "
+    "The price is taken from your Berries.\n\n"
+    "/weaponlist\nLists every weapon with its code, anime, rarity and shop price. Owner and Executive also see "
+    "if the weapon is in the drop pool, its drop stock and its drop price.",
+
+    "📜 WEAPON COMMANDS (2/3): OWNER + EXECUTIVE\n\n"
+    "/addweapon\nPM only. Guided steps: name, anime, rarity, shop price, 4-digit code, photo. Send /cancel to stop.\n\n"
+    "/editweapon <code> <field> <value>\nChanges one thing of a weapon:\n"
+    "• name <new name>\n• anime <anime>\n• rarity <rarity>\n"
+    "• price <berries> (shop price, 0 removes it from the shop)\n• photo (reply to a photo with /editweapon <code> photo)\n\n"
+    "/evoweapon <evolution code> <weapon code> [stones]\nMakes an evolution need 1 of that weapon. "
+    "Stones is optional (0 or more); leave it out to keep the current stones.\n\n"
+    "/evoweapon <evolution code> off [stones]\nRemoves the weapon requirement. The stones go back to at least 10.",
+
+    "📜 WEAPON COMMANDS (3/3): OWNER ONLY\n\n"
+    "/weapondrops\nThis panel: ON/OFF, drop now, timing, duration, groups, weapons and the guides.\n\n"
+    "/dropnow [weapon]\nStarts a drop right now in every enabled group. Send a weapon code or name, or nothing for a random "
+    "weapon from the pool. Only one drop can run at a time.\n\n"
+    "/dropgroups\nChoose which groups get weapon drops.\n\n"
+    "/dropconfig\nShortcuts for the panel:\n"
+    "• random <min> <max> (e.g. 30m-2h; plain numbers are hours)\n"
+    "• fixed 18:00 22:00 (IST, up to 6 times)\n"
+    "• duration <time> (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
+    "• stock <code> <number> (1-1000)\n• price <code> <berries>\n\n"
+    "/giveweapon <user_id> <code> [qty]\nGives a weapon (qty 1-99), or reply to a user with /giveweapon <code> [qty]. "
+    "The user must have started the bot.\n\n"
+    "/delweapon <code> [confirm]\nDeletes a weapon and removes it from every player. The first send shows a warning; "
+    "send it again with confirm. Blocked while an evolution still needs the weapon.\n\n"
+    "/cancel\nStops any typing step (✏️ buttons, /addweapon).",
+)
+
+_BTN_GUIDE = (
+    "🔘 BUTTONS (1/3): MAIN PANEL\n\n"
+    "🟢 Turn ON / 🔴 Turn OFF\nStarts or stops the automatic drops. 🎁 Drop now and /dropnow still work while OFF.\n\n"
+    "🎁 Drop now\nStarts a drop right away with a random weapon from the pool, in every enabled group.\n\n"
+    "⏱ Timing\nWhen drops start: random gaps or fixed IST times.\n\n"
+    "⌛ Duration\nHow long each drop stays open.\n\n"
+    "👥 Groups\nWhich groups get drops.\n\n"
+    "⚔️ Weapons\nStock, drop price and pool of each weapon.\n\n"
+    "📜 Commands / 🔘 Buttons\nThese two guides.\n\n"
+    "⬅️ Back\nGoes back to the screen before.\n◀️ ▶️\nTurn pages.\n✅\nMarks the current choice.",
+
+    "🔘 BUTTONS (2/3): TIMING AND DURATION\n\n"
+    "🎲 Random\nA drop starts after a random wait between a minimum and a maximum.\n"
+    "1-3 h, 3-8 h, 6-12 h: quick ranges.\n"
+    "✏️ Custom: type your own, like 30m-2h or 1h-3h (5 minutes to 168 hours).\n\n"
+    "🕒 Fixed times\nDrops start at the same IST times every day, up to 6.\n"
+    "18:00 ❌: removes that time.\n"
+    "➕ Add time: type a time like 18:30 (IST, 24-hour).\n\n"
+    "15 min, 30 min, 1 hour, 2 hours\nQuick drop lengths.\n"
+    "✏️ Custom: type 70m, 2h or 1h 10 (1 minute to 24 hours).\n\n"
+    "Time format: 70m = 70 minutes, 2h = 2 hours, 1h 10 = 1 hour 10 minutes.",
+
+    "🔘 BUTTONS (3/3): WEAPONS, GROUPS, DROP MESSAGE\n\n"
+    "⚔️ Weapons list\nTap a weapon to open it. ✅ = in the drop pool, ⬜ = not in the pool. Each line shows stock and drop price.\n\n"
+    "Weapon page\n"
+    "➖ ➕: change the stock by 1 (1-1000).\n"
+    "✏️ Stock: type the stock.\n"
+    "✏️ Price: type the drop price in Berries.\n"
+    "✅ In pool / ⬜ Not in pool: a weapon drops only when it is in the pool, has stock and has a drop price.\n\n"
+    "👥 Groups\nTap a group to turn it ✅ or ⬜. ✅ Enable all and ⬜ Disable all change every group. "
+    "Drops appear only in enabled, approved groups where the bot is ON.\n\n"
+    "In the group\n🛒 BUY FOR <price>: first come, first served, one per player, until the stock is gone or the time is over.\n\n"
+    "Typing steps\nAfter a ✏️ button the bot waits for your next message. Send /cancel to stop.",
+)
+
+
+def _kb(rows):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+BACK_ROW = [("⬅️ Back", "wdp:main:0:0")]
+
+
+def _view_main():
     s = get_settings()
-    weapons = all_weapons()
-    pages = max(1, (len(weapons) + POOL_PER_PAGE - 1) // POOL_PER_PAGE)
-    page = max(0, min(int(page), pages - 1))
-    chunk = weapons[page * POOL_PER_PAGE:(page + 1) * POOL_PER_PAGE]
     nxt = ""
     if s["enabled"] and s["mode"] == "random" and s.get("next_at"):
         nxt = f"\n⏭ Next drop: about {_fmt_ist(s['next_at'])}"
-    active = f"\n🔥 A drop is running now." if s.get("active_drop") else ""
-    lines = [f"⚔️ WEAPON DROPS\n",
-             f"Status: {'🟢 ON' if s['enabled'] else '🔴 OFF'}",
-             f"⏱ {_timing_text(s)}",
-             f"⌛ Each drop lasts {int(s['duration_min'])} min",
-             f"👥 Groups enabled: {len(s.get('groups') or [])} (/dropgroups)" + nxt + active, "",
-             "🎁 Weapon pool (tap to turn a weapon on/off):"]
-    rows = [[InlineKeyboardButton("🔴 Turn OFF" if s["enabled"] else "🟢 Turn ON", callback_data=f"wdp:master:0:{page}"),
-             InlineKeyboardButton("🎁 Drop now", callback_data=f"wdp:now:0:{page}")]]
+    active = "\n🔥 A drop is running now." if s.get("active_drop") else ""
+    text = "\n".join(["⚔️ WEAPON DROPS", "",
+                      f"Status: {'🟢 ON' if s['enabled'] else '🔴 OFF'}",
+                      f"⏱ {_timing_text(s)}",
+                      f"⌛ Each drop lasts {fmt_minutes(s['duration_min'])}",
+                      f"👥 Groups enabled: {len(s.get('groups') or [])}"]) + nxt + active
+    rows = [[("🔴 Turn OFF" if s["enabled"] else "🟢 Turn ON", "wdp:master:0:0"), ("🎁 Drop now", "wdp:now:0:0")],
+            [("⏱ Timing", "wdp:tim:0:0"), ("⌛ Duration", "wdp:dur:0:0")],
+            [("👥 Groups", "wdp:grp:0:0"), ("⚔️ Weapons", "wdp:wlist:0:0")],
+            [("📜 Commands", "wdp:cmds:0:0"), ("🔘 Buttons", "wdp:btns:0:0")]]
+    return text, _kb(rows)
+
+
+def _view_timing():
+    s = get_settings()
+    fixed = s["mode"] == "fixed"
+    hint = ("Drops start at these IST times every day (up to 6)." if fixed
+            else "A drop starts after a random wait between the minimum and the maximum.")
+    text = f"⏱ DROP TIMING\n\n{_timing_text(s)}\n{hint}"
+    rows = [[("🎲 Random" + ("" if fixed else " ✅"), "wdp:tmode:r:0"),
+             ("🕒 Fixed times" + (" ✅" if fixed else ""), "wdp:tmode:f:0")]]
+    if fixed:
+        times = sorted(set(s.get("fixed_times") or []))
+        for i in range(0, len(times), 3):
+            rows.append([(f"{t} ❌", f"wdp:tdel:{t.replace(':', '')}:0") for t in times[i:i + 3]])
+        if len(times) < MAX_FIXED_TIMES:
+            rows.append([("➕ Add time", "wdi:time:0:0")])
+    else:
+        cur = _rand_range(s)
+        rows.append([(("✅ " if cur == (lo, hi) else "") + label, f"wdp:trand:{lo}-{hi}:0") for lo, hi, label in RAND_PRESETS])
+        rows.append([("✏️ Custom", "wdi:rand:0:0")])
+    rows.append(BACK_ROW)
+    return text, _kb(rows)
+
+
+def _view_duration():
+    s = get_settings()
+    cur = int(s["duration_min"])
+    text = f"⌛ DROP DURATION\n\nNow: {fmt_minutes(cur)}\nHow long each drop stays open."
+    rows = [[(("✅ " if cur == m else "") + label, f"wdp:dset:{m}:0") for m, label in DUR_PRESETS],
+            [("✏️ Custom", "wdi:dur:0:0")], BACK_ROW]
+    return text, _kb(rows)
+
+
+def _view_wlist(page):
+    weapons = all_weapons()
+    pages = max(1, (len(weapons) + POOL_PER_PAGE - 1) // POOL_PER_PAGE)
+    page = max(0, min(int(page), pages - 1))
+    lines = ["⚔️ DROP WEAPONS", "", "Tap a weapon to set its stock, drop price and pool.", "✅ in the pool   ⬜ not in the pool"]
+    rows = []
     if not weapons:
-        lines.append("No weapons yet. Add one with /addweapon.")
-    for w in chunk:
-        on = bool(w.get("drop_enabled"))
-        info = f"stock {int(w.get('drop_stock') or 0)} • {int(w.get('drop_price') or 0):,} {BERRY}"
-        lines.append(f"{'✅' if on else '⬜'} {_weapon_label(w)} — {info}")
-        rows.append([InlineKeyboardButton(("✅ " if on else "⬜ ") + w["name"][:30], callback_data=f"wdp:t:{w['_id']}:{page}")])
+        lines += ["", "No weapons yet. Add one with /addweapon."]
+    for w in weapons[page * POOL_PER_PAGE:(page + 1) * POOL_PER_PAGE]:
+        price = int(w.get("drop_price") or 0)
+        info = f"{int(w.get('drop_stock') or 0)} • " + (f"{price:,}" if price else "no price")
+        rows.append([(f"{'✅' if w.get('drop_enabled') else '⬜'} {w['name'][:18]} • {info}", f"wdp:wpage:{w['_id']}:{page}")])
     if pages > 1:
-        rows.append([InlineKeyboardButton("◀️", callback_data=f"wdp:p:0:{(page - 1) % pages}"),
-                     InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"wdp:p:0:{page}"),
-                     InlineKeyboardButton("▶️", callback_data=f"wdp:p:0:{(page + 1) % pages}")])
-    lines += ["", "Numbers: /dropconfig random|fixed|duration|stock|price"]
-    return "\n".join(lines), InlineKeyboardMarkup(rows)
+        rows.append([("◀️", f"wdp:wlist:0:{(page - 1) % pages}"), (f"{page + 1}/{pages}", f"wdp:wlist:0:{page}"),
+                     ("▶️", f"wdp:wlist:0:{(page + 1) % pages}")])
+    rows.append(BACK_ROW)
+    return "\n".join(lines), _kb(rows)
+
+
+def _view_wpage(code, page):
+    w = get_weapon(code)
+    if not w:
+        return _view_wlist(page)
+    stock, price, on = int(w.get("drop_stock") or 0), int(w.get("drop_price") or 0), bool(w.get("drop_enabled"))
+    lines = [f"⚔️ {_weapon_label(w)}", "",
+             f"📦 Stock: {stock}",
+             f"🪙 Drop price: " + (f"{price:,} {BERRY}" if price else "not set"),
+             f"🎁 Pool: {'✅ In pool' if on else '⬜ Not in pool'}"]
+    if on and (stock <= 0 or price <= 0):
+        lines += ["", "⚠️ It will not drop until it has stock and a drop price."]
+    rows = [[("➖", f"wdp:wminus:{code}:{page}"), ("➕", f"wdp:wplus:{code}:{page}")],
+            [("✏️ Stock", f"wdi:stock:{code}:{page}"), ("✏️ Price", f"wdi:price:{code}:{page}")],
+            [("✅ In pool" if on else "⬜ Not in pool", f"wdp:wpool:{code}:{page}")],
+            [("⬅️ Weapons", f"wdp:wlist:0:{page}")]]
+    return "\n".join(lines), _kb(rows)
+
+
+def _view_guide(action, page):
+    pages = _CMD_GUIDE if action == "cmds" else _BTN_GUIDE
+    page = max(0, min(int(page), len(pages) - 1))
+    rows = [[("◀️", f"wdp:{action}:0:{(page - 1) % len(pages)}"), (f"{page + 1}/{len(pages)}", f"wdp:{action}:0:{page}"),
+             ("▶️", f"wdp:{action}:0:{(page + 1) % len(pages)}")], BACK_ROW]
+    return pages[page], _kb(rows)
+
+
+def _view_sync(view, arg="0", page=0):
+    """(text, markup) of one /weapondrops screen."""
+    if view == "tim":
+        return _view_timing()
+    if view == "dur":
+        return _view_duration()
+    if view == "wlist":
+        return _view_wlist(page)
+    if view == "wpage":
+        return _view_wpage(arg, page)
+    if view in ("cmds", "btns"):
+        return _view_guide(view, page)
+    return _view_main()
+
+
+def _adjust_stock_sync(code, delta):
+    """+1 / -1 drop stock, kept within 1-MAX_STOCK. Returns the new stock, or None when nothing changed."""
+    w = get_weapon(code)
+    if not w:
+        return None
+    cur = int(w.get("drop_stock") or 0)
+    new = min(cur + 1, MAX_STOCK) if delta > 0 else (cur - 1 if cur > 1 else cur)
+    if new == cur or new < 1:
+        return None
+    _col(WEAPONS_COL).update_one({"_id": code}, {"$set": {"drop_stock": new}})
+    return new
+
+
+def _add_fixed_time_sync(hhmm):
+    times = sorted(set(get_settings().get("fixed_times") or []))
+    if hhmm in times:
+        return "dup"
+    if len(times) >= MAX_FIXED_TIMES:
+        return "full"
+    set_settings(fixed_times=sorted(times + [hhmm]), last_fixed=None)
+    return "ok"
+
+
+async def _show(q, text, kb):
+    try:
+        await q.edit_message_text(text=text, reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.info("weapondrops edit skipped: %s", e)
 
 
 async def weapondrops_command(update, context):
@@ -3904,53 +4157,226 @@ async def weapondrops_command(update, context):
     if not _is_owner(user.id):
         await _reply(msg, NOT_ALLOWED_TEXT)
         return
-    text, kb = await asyncio.to_thread(_panel_sync, 0)
+    text, kb = await asyncio.to_thread(_view_sync, "main")
     await _reply(msg, text, reply_markup=kb)
 
 
 async def wdp_callback(update, context):
+    """Every button of the /weapondrops panel: wdp:<action>:<arg>:<page>."""
     q = update.callback_query
     if q is None or q.from_user is None:
         return
     if not _is_owner(q.from_user.id):
         await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
         return
-    try:
-        _w, action, arg, page = q.data.split(":")
-        page = int(page)
-    except ValueError:
+    parts = (q.data or "").split(":")
+    if len(parts) != 4:
         await q.answer()
         return
-    note = None
-    if action == "master":
+    _w, action, arg, page = parts
+    try:
+        page = int(page)
+    except ValueError:
+        page = 0
+    context.user_data.pop("wdi", None)             # pressing any panel button drops a pending ✏️ input
+    note, view = None, action
+    if action == "main":
+        view = "main"
+    elif action == "master":
         s = await asyncio.to_thread(get_settings)
         await asyncio.to_thread(set_settings, enabled=not s["enabled"], next_at=None)
-    elif action == "t":
-        w = await asyncio.to_thread(get_weapon, arg)
-        if w:
-            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": arg}, {"$set": {"drop_enabled": not w.get("drop_enabled")}})
-            if not w.get("drop_enabled") and int(w.get("drop_price") or 0) <= 0:
-                note = "⚠️ Set a drop price first: /dropconfig price " + arg + " <berries>"
+        view = "main"
     elif action == "now":
         pool = await asyncio.to_thread(_pool_sync)
         if not pool:
             await q.answer("❌ No weapon in the pool has stock and a drop price.", show_alert=True)
             return
-        ok, text = await start_drop(context.bot, random.choice(pool), "owner")
+        _ok, text = await start_drop(context.bot, random.choice(pool), "owner")
         await q.answer(text[:190], show_alert=True)
         return
-    await q.answer(note[:190] if note else None, show_alert=bool(note))
-    text, kb = await asyncio.to_thread(_panel_sync, page)
+    elif action == "grp":
+        await q.answer()
+        text, kb = await _dropgroups_view(context.bot, 0)
+        await _show(q, text, kb)
+        return
+    elif action == "tmode":
+        if arg == "f":
+            s = await asyncio.to_thread(get_settings)
+            await asyncio.to_thread(set_settings, mode="fixed", last_fixed=None)
+            if not s.get("fixed_times"):
+                note = "Fixed mode is on. Tap ➕ Add time to add a time."
+        else:
+            await asyncio.to_thread(set_settings, mode="random", next_at=None)
+        view = "tim"
+    elif action == "trand":
+        try:
+            lo, hi = (int(x) for x in arg.split("-"))
+        except ValueError:
+            await q.answer()
+            return
+        await asyncio.to_thread(set_settings, mode="random", min_minutes=lo, max_minutes=hi, next_at=None)
+        view = "tim"
+    elif action == "tdel":
+        hhmm = _parse_hhmm(f"{arg[:2]}:{arg[2:]}")
+        if hhmm:
+            await asyncio.to_thread(_col(SETTINGS_COL).update_one, {"_id": "drops"}, {"$pull": {"fixed_times": hhmm}})
+        view = "tim"
+    elif action == "dset":
+        minutes = _parse_int(arg)
+        if minutes is not None and DUR_MIN <= minutes <= DUR_MAX:
+            await asyncio.to_thread(set_settings, duration_min=minutes)
+        view = "dur"
+    elif action in ("wplus", "wminus"):
+        new = await asyncio.to_thread(_adjust_stock_sync, arg, 1 if action == "wplus" else -1)
+        if new is None:
+            note = f"Stock must stay between 1 and {MAX_STOCK}."
+        view = "wpage"
+    elif action == "wpool":
+        w = await asyncio.to_thread(get_weapon, arg)
+        if w:
+            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": arg}, {"$set": {"drop_enabled": not w.get("drop_enabled")}})
+            if not w.get("drop_enabled") and (int(w.get("drop_price") or 0) <= 0 or int(w.get("drop_stock") or 0) <= 0):
+                note = "⚠️ It needs stock and a drop price before it can drop."
+        view = "wpage"
+    elif action not in ("tim", "dur", "wlist", "wpage", "cmds", "btns"):
+        await q.answer()
+        return
+    await q.answer(note[:190] if note else None, show_alert=bool(note and note.startswith("⚠️")))
+    text, kb = await asyncio.to_thread(_view_sync, view, arg, page)
+    await _show(q, text, kb)
+
+
+# ---- typed input after a ✏️ button: wdi:<kind>:<arg>:<page>
+(WD_INPUT,) = range(240, 241)
+_WDI_PROMPTS = {
+    "dur": "⌛ Send the duration, for example 45m, 2h or 1h 10 (1m-24h). A plain number is minutes.",
+    "rand": "🎲 Send the minimum and maximum wait, for example 30m-2h or 1h-3h (5m-168h). Plain numbers are hours.",
+    "time": "🕒 Send the time in IST, 24-hour, for example 18:30:",
+}
+
+
+async def wdi_start(update, context):
+    q = update.callback_query
+    if q is None or q.from_user is None or q.message is None:
+        return -1
+    if not _is_owner(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return -1
+    parts = (q.data or "").split(":")
+    if len(parts) != 4:
+        await q.answer()
+        return -1
+    _w, kind, arg, page = parts
     try:
-        await q.edit_message_text(text=text, reply_markup=kb)
+        page = int(page)
+    except ValueError:
+        page = 0
+    if kind in ("stock", "price"):
+        w = await asyncio.to_thread(get_weapon, arg)
+        if not w:
+            await q.answer("❌ That weapon no longer exists.", show_alert=True)
+            return -1
+        prompt = (f"📦 Send the stock for {w['name']} (1-{MAX_STOCK}):" if kind == "stock"
+                  else f"🪙 Send the drop price in Berries for {w['name']}:")
+    elif kind in _WDI_PROMPTS:
+        prompt = _WDI_PROMPTS[kind]
+    else:
+        await q.answer()
+        return -1
+    context.user_data["wdi"] = {"kind": kind, "arg": arg, "page": page,
+                                "chat_id": q.message.chat_id, "message_id": q.message.message_id}
+    await q.answer()
+    await _reply(q.message, prompt + "\nSend /cancel to stop.")
+    return WD_INPUT
+
+
+async def _wdi_refresh(bot, pend):
+    """Redraw the panel message the ✏️ button was pressed on."""
+    kind = pend["kind"]
+    view = {"dur": "dur", "rand": "tim", "time": "tim"}.get(kind, "wpage")
+    try:
+        text, kb = await asyncio.to_thread(_view_sync, view, pend["arg"], pend["page"])
+        await bot.edit_message_text(chat_id=pend["chat_id"], message_id=pend["message_id"], text=text, reply_markup=kb)
     except Exception as e:
         if "not modified" not in str(e).lower():
-            logger.info("weapondrops edit skipped: %s", e)
+            logger.info("weapondrops refresh skipped: %s", e)
 
 
-CONFIG_USAGE = ("Usage:\n/dropconfig random <min_hours> <max_hours>\n/dropconfig fixed 18:00 22:00 (IST, up to 6 times)\n"
-                "/dropconfig duration <minutes>\n/dropconfig stock <weapon code> <number>\n"
-                "/dropconfig price <weapon code> <berries>")
+async def wdi_text(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return -1
+    if not _is_owner(user.id):
+        return -1
+    pend = context.user_data.get("wdi")
+    if not pend:
+        await _reply(msg, "⌛ That input expired. Open /weapondrops again.")
+        return -1
+    kind, text = pend["kind"], (msg.text or "").strip()
+    if kind == "dur":
+        minutes = parse_duration(text, "m")
+        if minutes is None or not (DUR_MIN <= minutes <= DUR_MAX):
+            await _reply(msg, "❌ Send a duration from 1m to 24h, like 45m, 2h or 1h 10.")
+            return WD_INPUT
+        await asyncio.to_thread(set_settings, duration_min=minutes)
+        done = f"✅ Each drop now lasts {fmt_minutes(minutes)}."
+    elif kind == "rand":
+        rng = parse_range(text, "h")
+        if rng is None or not (RAND_MIN <= rng[0] <= rng[1] <= RAND_MAX):
+            await _reply(msg, "❌ Send the minimum and maximum like 30m-2h or 1h-3h (5m to 168h, minimum not above maximum).")
+            return WD_INPUT
+        await asyncio.to_thread(set_settings, mode="random", min_minutes=rng[0], max_minutes=rng[1], next_at=None)
+        done = f"✅ Random drops: every {fmt_minutes(rng[0])}-{fmt_minutes(rng[1])}."
+    elif kind == "time":
+        hhmm = _parse_hhmm(text)
+        if hhmm is None:
+            await _reply(msg, "❌ Send the time like 18:30 (IST, 24-hour).")
+            return WD_INPUT
+        res = await asyncio.to_thread(_add_fixed_time_sync, hhmm)
+        if res == "dup":
+            await _reply(msg, f"❌ {hhmm} is already in the list. Send another time or /cancel.")
+            return WD_INPUT
+        if res == "full":
+            await _reply(msg, f"❌ You can set up to {MAX_FIXED_TIMES} times. Remove one first.")
+            context.user_data.pop("wdi", None)
+            return -1
+        done = f"✅ Added {hhmm} IST."
+    else:                                          # stock / price of one weapon
+        code, n = pend["arg"], _parse_int(text)
+        limit = MAX_STOCK if kind == "stock" else MAX_PRICE
+        w = await asyncio.to_thread(get_weapon, code)
+        if w is None:
+            await _reply(msg, "❌ That weapon no longer exists.")
+            context.user_data.pop("wdi", None)
+            return -1
+        if n is None or not (1 <= n <= limit):
+            await _reply(msg, f"❌ Send a whole number from 1 to {limit:,}.")
+            return WD_INPUT
+        field = "drop_stock" if kind == "stock" else "drop_price"
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {field: n}})
+        done = f"✅ {w['name']}: drop {kind} = {n:,}"
+    context.user_data.pop("wdi", None)
+    await _reply(msg, done)
+    await _wdi_refresh(context.bot, pend)
+    _success(update)
+    return -1
+
+
+async def wdi_cancel(update, context):
+    context.user_data.pop("wdi", None)
+    if _deps.get("cancel_all"):                  # the bot's universal /cancel: stops EVERYTHING in progress
+        await _deps["cancel_all"](update, context)
+        return -1
+    if update.effective_message is not None:
+        await _reply(update.effective_message, "❌ Cancelled.")
+    return -1
+
+
+CONFIG_USAGE = ("Usage:\n/dropconfig random <min> <max>  (e.g. 30m-2h or 1h-3h; plain numbers are hours)\n"
+                "/dropconfig fixed 18:00 22:00 (IST, up to 6 times)\n"
+                "/dropconfig duration <time>  (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
+                "/dropconfig stock <weapon code> <number>\n"
+                "/dropconfig price <weapon code> <berries>\n\nTip: /weapondrops has buttons for all of this.")
 
 
 async def dropconfig_command(update, context):
@@ -3965,26 +4391,30 @@ async def dropconfig_command(update, context):
         await _reply(msg, CONFIG_USAGE)
         return
     cmd = args[0].lower()
-    if cmd == "random" and len(args) == 3 and args[1].isdigit() and args[2].isdigit():
-        lo, hi = int(args[1]), int(args[2])
-        if not (1 <= lo <= hi <= 168):
-            await _reply(msg, "❌ Hours must be 1-168 and min must not be above max.")
+    if cmd == "random" and len(args) >= 2:
+        rng = parse_range(" ".join(args[1:]), "h")
+        if rng is None or not (RAND_MIN <= rng[0] <= rng[1] <= RAND_MAX):
+            await _reply(msg, "❌ Send the minimum and maximum like 30m-2h or 1h-3h (5m to 168h, minimum not above maximum).")
             return
-        await asyncio.to_thread(set_settings, mode="random", min_hours=lo, max_hours=hi, next_at=None)
-        await _reply(msg, f"✅ Random drops: every {lo}-{hi} hours.")
-    elif cmd == "fixed" and 2 <= len(args) <= 7:
+        await asyncio.to_thread(set_settings, mode="random", min_minutes=rng[0], max_minutes=rng[1], next_at=None)
+        await _reply(msg, f"✅ Random drops: every {fmt_minutes(rng[0])}-{fmt_minutes(rng[1])}.")
+    elif cmd == "fixed" and 2 <= len(args) <= MAX_FIXED_TIMES + 1:
         times = []
         for t in args[1:]:
-            m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
-            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+            hhmm = _parse_hhmm(t)
+            if hhmm is None:
                 await _reply(msg, f"❌ '{t}' is not a valid time. Use HH:MM (24-hour, IST).")
                 return
-            times.append(f"{int(m.group(1)):02d}:{m.group(2)}")
+            times.append(hhmm)
         await asyncio.to_thread(set_settings, mode="fixed", fixed_times=sorted(set(times)), last_fixed=None)
         await _reply(msg, "✅ Fixed drops at " + ", ".join(sorted(set(times))) + " IST.")
-    elif cmd == "duration" and len(args) == 2 and args[1].isdigit() and 1 <= int(args[1]) <= 1440:
-        await asyncio.to_thread(set_settings, duration_min=int(args[1]))
-        await _reply(msg, f"✅ Each drop lasts {int(args[1])} minute(s).")
+    elif cmd == "duration" and len(args) >= 2:
+        minutes = parse_duration(" ".join(args[1:]), "m")
+        if minutes is None or not (DUR_MIN <= minutes <= DUR_MAX):
+            await _reply(msg, "❌ Send a duration from 1m to 24h, like 45m, 2h or 1h 10.")
+            return
+        await asyncio.to_thread(set_settings, duration_min=minutes)
+        await _reply(msg, f"✅ Each drop lasts {fmt_minutes(minutes)}.")
     elif cmd in ("stock", "price") and len(args) == 3:
         code, n = norm_code(args[1]), _parse_int(args[2])
         w = await asyncio.to_thread(get_weapon, code) if code else None
@@ -4036,16 +4466,17 @@ def weapon_help_module():
         ("/evoweapon <evolution code> <weapon code|off> [stones]", "Set the weapon an evolution needs"),
         ("/giveweapon <user_id> <code> [qty]", "Give a weapon (or reply to a user)"),
         ("/delweapon <code> [confirm]", "Delete a weapon"),
-        ("/weapondrops", "Drop panel: ON/OFF, drop now, weapon pool"),
+        ("/weapondrops", "Drop panel: ON/OFF, drop now, timing, duration, groups, weapons, command and button guides"),
         ("/dropgroups", "Choose the groups that get drops"),
-        ("/dropconfig <random|fixed|duration|stock|price> ...", "Drop timing, length, stock and price"),
+        ("/dropconfig <random|fixed|duration|stock|price> ...", "Shortcuts for the panel (times like 30m, 2h, 1h 10)"),
         ("/dropnow [weapon]", "Start a drop now"),
     ]
     lines = ["⚔️ Weapons (Owner only)", "", "📌 Overview",
              "Weapons are used in /evolve. Players buy them in /weaponshop or catch them in group drops.",
              "", "⌨️ Commands & usage"]
     lines += [f"{i}. {syntax} - {desc}" for i, (syntax, desc) in enumerate(entries, 1)]
-    lines += ["", "Players use /weapons (their weapons) and /weaponshop."]
+    lines += ["", "Players use /weapons (their weapons) and /weaponshop.",
+              "Open /weapondrops and tap 📜 Commands or 🔘 Buttons for the full guide."]
     return ("weapons", "⚔️ Weapons", "\n".join(lines))
 
 
@@ -4083,6 +4514,13 @@ def _register_weapons(app):
             W_PHOTO: [MessageHandler(filters.PHOTO, addweapon_photo), MessageHandler(text, addweapon_photo)],
         },
         fallbacks=[CommandHandler("cancel", addweapon_cancel)],
+        allow_reentry=True,
+        conversation_timeout=_deps["conv_timeout"],
+    ))
+    app.add_handler(ConversationHandler(            # ✏️ buttons of the /weapondrops panel (typed value, /cancel stops)
+        entry_points=[CallbackQueryHandler(wdi_start, pattern=r"^wdi:")],
+        states={WD_INPUT: [MessageHandler(text, wdi_text)]},
+        fallbacks=[CommandHandler("cancel", wdi_cancel)],
         allow_reentry=True,
         conversation_timeout=_deps["conv_timeout"],
     ))
