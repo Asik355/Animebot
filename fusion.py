@@ -573,6 +573,37 @@ def _valid_code(code):
     return code.isdigit() and len(code) == 4 and 1 <= int(code) <= 9999
 
 
+# ---- range values for drop stock / drop price ("3-10", "5", "0" = not set), same rules as the Invite Manager (rewards._parse_range)
+def _wd_parse(text, cap):
+    """'100-1000' / '300' / '0' -> (lo, hi), or None when invalid. (0, 0) means not set. A range starts at 1 or more."""
+    rng = rewards._parse_range(str(text or "").replace(",", ""), cap)
+    if rng is None or (rng[1] > 0 and rng[0] < 1):
+        return None
+    return rng
+
+
+def _wd_bounds(w, kind):
+    """(min, max) of a weapon's drop 'stock' or 'price'. drop_<kind> holds the maximum; a weapon saved before ranges counts as min = max."""
+    hi = int(w.get(f"drop_{kind}") or 0)
+    if hi <= 0:
+        return 0, 0
+    lo = int(w.get(f"drop_{kind}_min") or 0)
+    return (lo if 1 <= lo <= hi else hi), hi
+
+
+def _wd_text(w, kind, commas=False):
+    """'3-10', '5' or None (not set)."""
+    lo, hi = _wd_bounds(w, kind)
+    if hi <= 0:
+        return None
+    f = (lambda n: f"{n:,}") if commas else str
+    return f(hi) if lo == hi else f"{f(lo)}-{f(hi)}"
+
+
+def _wd_fields(kind, rng):
+    return {f"drop_{kind}": rng[1], f"drop_{kind}_min": rng[0]}
+
+
 # ---------------------------------------------------------------- recipe queries
 def get_recipe_sync(evo_code):
     return _recipes().find_one({"_id": str(evo_code)})
@@ -3106,8 +3137,8 @@ def _weaponlist_lines(staff=False):
         line = (f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] • {w.get('anime') or '-'}\n"
                 f"   {shop}")
         if staff:
-            line += (f" • 🎁 {'on' if w.get('drop_enabled') else 'off'} (stock {int(w.get('drop_stock') or 0)}, "
-                     f"{int(w.get('drop_price') or 0):,})")
+            line += (f" • 🎁 {'on' if w.get('drop_enabled') else 'off'} (stock {_wd_text(w, 'stock') or 0}, "
+                     f"{_wd_text(w, 'price', True) or 0})")
         lines.append(line)
     return lines
 
@@ -3540,8 +3571,11 @@ def _create_drop_sync(w, duration_min):
     """Inserts the drop and claims the single 'active drop' slot. Returns the drop doc or None when one is running."""
     _ensure_settings()
     now = _utcnow()
-    drop = {"_id": secrets.token_hex(4), "weapon_code": w["_id"], "price": int(w["drop_price"]),
-            "stock_total": int(w["drop_stock"]), "stock_left": int(w["drop_stock"]), "buyers": [],
+    s_lo, s_hi = _wd_bounds(w, "stock")                    # a range is rolled once per drop (a single number always gives itself)
+    p_lo, p_hi = _wd_bounds(w, "price")
+    stock, price = random.randint(s_lo, s_hi), random.randint(p_lo, p_hi)
+    drop = {"_id": secrets.token_hex(4), "weapon_code": w["_id"], "price": price,
+            "stock_total": stock, "stock_left": stock, "buyers": [],
             "created_at": now, "ends_at": now + timedelta(minutes=int(duration_min)),
             "status": "active", "dirty": False, "messages": []}
     _drops().insert_one(drop)
@@ -3958,7 +3992,8 @@ _CMD_GUIDE = (
     "• random <min> <max> (e.g. 30m-2h; plain numbers are hours)\n"
     "• fixed 18:00 22:00 (IST, up to 6 times)\n"
     "• duration <time> (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
-    "• stock <code> <number> (1-1000)\n• price <code> <berries>\n\n"
+    "• stock <code> <number or range> (1-1000, like 3-10; 0 = none)\n"
+    "• price <code> <berries or range> (like 5000-20000; 0 = none)\n\n"
     "/giveweapon <user_id> <code> [qty]\nGives a weapon (qty 1-99), or reply to a user with /giveweapon <code> [qty]. "
     "The user must have started the bot.\n\n"
     "/delweapon <code> [confirm]\nDeletes a weapon and removes it from every player. The first send shows a warning; "
@@ -3991,9 +4026,9 @@ _BTN_GUIDE = (
     "🔘 BUTTONS (3/3): WEAPONS, GROUPS, DROP MESSAGE\n\n"
     "⚔️ Weapons list\nTap a weapon to open it. ✅ = in the drop pool, ⬜ = not in the pool. Each line shows stock and drop price.\n\n"
     "Weapon page\n"
-    "➖ ➕: change the stock by 1 (1-1000).\n"
-    "✏️ Stock: type the stock.\n"
-    "✏️ Price: type the drop price in Berries.\n"
+    "➖ ➕: change the stock by 1 (both ends of a range, 1-1000).\n"
+    "✏️ Stock: type the stock: a range like 3-10 (a random amount each drop), one number, or 0 for none.\n"
+    "✏️ Price: type the drop price in Berries the same way, like 5000-20000.\n"
     "✅ In pool / ⬜ Not in pool: a weapon drops only when it is in the pool, has stock and has a drop price.\n\n"
     "👥 Groups\nTap a group to turn it ✅ or ⬜. ✅ Enable all and ⬜ Disable all change every group. "
     "Drops appear only in enabled, approved groups where the bot is ON.\n\n"
@@ -4068,8 +4103,7 @@ def _view_wlist(page):
     if not weapons:
         lines += ["", "No weapons yet. Add one with /addweapon."]
     for w in weapons[page * POOL_PER_PAGE:(page + 1) * POOL_PER_PAGE]:
-        price = int(w.get("drop_price") or 0)
-        info = f"{int(w.get('drop_stock') or 0)} • " + (f"{price:,}" if price else "no price")
+        info = f"{_wd_text(w, 'stock') or 0} • " + (_wd_text(w, 'price', True) or "no price")
         rows.append([(f"{'✅' if w.get('drop_enabled') else '⬜'} {w['name'][:18]} • {info}", f"wdp:wpage:{w['_id']}:{page}")])
     if pages > 1:
         rows.append([("◀️", f"wdp:wlist:0:{(page - 1) % pages}"), (f"{page + 1}/{pages}", f"wdp:wlist:0:{page}"),
@@ -4084,8 +4118,9 @@ def _view_wpage(code, page):
         return _view_wlist(page)
     stock, price, on = int(w.get("drop_stock") or 0), int(w.get("drop_price") or 0), bool(w.get("drop_enabled"))
     lines = [f"⚔️ {_weapon_label(w)}", "",
-             f"📦 Stock: {stock}",
-             f"🪙 Drop price: " + (f"{price:,} {BERRY}" if price else "not set"),
+             "📦 Stock: " + (_wd_text(w, "stock") or "not set") + (" (random each drop)" if _wd_bounds(w, "stock")[0] != stock else ""),
+             "🪙 Drop price: " + (f"{_wd_text(w, 'price', True)} {BERRY}" if price else "not set")
+             + (" (random each drop)" if _wd_bounds(w, "price")[0] != price else ""),
              f"🎁 Pool: {'✅ In pool' if on else '⬜ Not in pool'}"]
     if on and (stock <= 0 or price <= 0):
         lines += ["", "⚠️ It will not drop until it has stock and a drop price."]
@@ -4096,15 +4131,18 @@ def _view_wpage(code, page):
     return "\n".join(lines), _kb(rows)
 
 
-def _view_guide(action, page):
+def _view_guide(action, page, from_help=False, uid=0):
+    """Guide pages. Opened from /weapondrops (arg 0) ⬅️ Back returns to the drop panel; opened from /help (arg h) it returns to the Weapons help page."""
     pages = _CMD_GUIDE if action == "cmds" else _BTN_GUIDE
     page = max(0, min(int(page), len(pages) - 1))
-    rows = [[("◀️", f"wdp:{action}:0:{(page - 1) % len(pages)}"), (f"{page + 1}/{len(pages)}", f"wdp:{action}:0:{page}"),
-             ("▶️", f"wdp:{action}:0:{(page + 1) % len(pages)}")], BACK_ROW]
+    flag = "h" if from_help and uid else "0"
+    back = [("⬅️ Back", f"help:{uid}:owner:weapons")] if flag == "h" else BACK_ROW
+    rows = [[("◀️", f"wdp:{action}:{flag}:{(page - 1) % len(pages)}"), (f"{page + 1}/{len(pages)}", f"wdp:{action}:{flag}:{page}"),
+             ("▶️", f"wdp:{action}:{flag}:{(page + 1) % len(pages)}")], back]
     return pages[page], _kb(rows)
 
 
-def _view_sync(view, arg="0", page=0):
+def _view_sync(view, arg="0", page=0, uid=0):
     """(text, markup) of one /weapondrops screen."""
     if view == "tim":
         return _view_timing()
@@ -4115,21 +4153,26 @@ def _view_sync(view, arg="0", page=0):
     if view == "wpage":
         return _view_wpage(arg, page)
     if view in ("cmds", "btns"):
-        return _view_guide(view, page)
+        return _view_guide(view, page, arg == "h", uid)
     return _view_main()
 
 
 def _adjust_stock_sync(code, delta):
-    """+1 / -1 drop stock, kept within 1-MAX_STOCK. Returns the new stock, or None when nothing changed."""
+    """+1 / -1 drop stock (both ends of a range), kept within 1-MAX_STOCK. Returns the new maximum, or None when nothing changed."""
     w = get_weapon(code)
     if not w:
         return None
-    cur = int(w.get("drop_stock") or 0)
-    new = min(cur + 1, MAX_STOCK) if delta > 0 else (cur - 1 if cur > 1 else cur)
-    if new == cur or new < 1:
-        return None
-    _col(WEAPONS_COL).update_one({"_id": code}, {"$set": {"drop_stock": new}})
-    return new
+    lo, hi = _wd_bounds(w, "stock")                       # a range moves as a whole (both ends)
+    if delta > 0:
+        if hi >= MAX_STOCK:
+            return None
+        lo, hi = (1, 1) if hi == 0 else (lo + 1, hi + 1)
+    else:
+        if lo <= 1:
+            return None
+        lo, hi = lo - 1, hi - 1
+    _col(WEAPONS_COL).update_one({"_id": code}, {"$set": _wd_fields("stock", (lo, hi))})
+    return hi
 
 
 def _add_fixed_time_sync(hhmm):
@@ -4242,7 +4285,7 @@ async def wdp_callback(update, context):
         await q.answer()
         return
     await q.answer(note[:190] if note else None, show_alert=bool(note and note.startswith("⚠️")))
-    text, kb = await asyncio.to_thread(_view_sync, view, arg, page)
+    text, kb = await asyncio.to_thread(_view_sync, view, arg, page, q.from_user.id)
     await _show(q, text, kb)
 
 
@@ -4276,8 +4319,10 @@ async def wdi_start(update, context):
         if not w:
             await q.answer("❌ That weapon no longer exists.", show_alert=True)
             return -1
-        prompt = (f"📦 Send the stock for {w['name']} (1-{MAX_STOCK}):" if kind == "stock"
-                  else f"🪙 Send the drop price in Berries for {w['name']}:")
+        prompt = (f"📦 Stock for {w['name']}. Send a range from 1 to {MAX_STOCK}, like 3-10 (a random amount each drop), "
+                  "one number like 5, or 0 for none." if kind == "stock"
+                  else f"🪙 Drop price in Berries for {w['name']}. Send a range from 1 to {MAX_PRICE:,}, like 5000-20000 "
+                       "(a random price each drop), one number like 5000, or 0 for none.")
     elif kind in _WDI_PROMPTS:
         prompt = _WDI_PROMPTS[kind]
     else:
@@ -4342,19 +4387,23 @@ async def wdi_text(update, context):
             return -1
         done = f"✅ Added {hhmm} IST."
     else:                                          # stock / price of one weapon
-        code, n = pend["arg"], _parse_int(text)
+        code = pend["arg"]
         limit = MAX_STOCK if kind == "stock" else MAX_PRICE
         w = await asyncio.to_thread(get_weapon, code)
         if w is None:
             await _reply(msg, "❌ That weapon no longer exists.")
             context.user_data.pop("wdi", None)
             return -1
-        if n is None or not (1 <= n <= limit):
-            await _reply(msg, f"❌ Send a whole number from 1 to {limit:,}.")
+        rng = _wd_parse(text, limit)
+        if rng is None:
+            await _reply(msg, (f"❌ Stock goes from 1 to {limit:,}. Send a range like 3-10, one number like 5, or 0 for none."
+                               if kind == "stock" else
+                               f"❌ Drop price goes from 1 to {limit:,}. Send a range like 5000-20000, one number like 5000, or 0 for none.")
+                         + "\nTry again, or send /cancel.")
             return WD_INPUT
-        field = "drop_stock" if kind == "stock" else "drop_price"
-        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {field: n}})
-        done = f"✅ {w['name']}: drop {kind} = {n:,}"
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": _wd_fields(kind, rng)})
+        w.update(_wd_fields(kind, rng))
+        done = f"✅ {w['name']}: drop {kind} = {_wd_text(w, kind, kind == 'price') or 'not set'}"
     context.user_data.pop("wdi", None)
     await _reply(msg, done)
     await _wdi_refresh(context.bot, pend)
@@ -4375,8 +4424,8 @@ async def wdi_cancel(update, context):
 CONFIG_USAGE = ("Usage:\n/dropconfig random <min> <max>  (e.g. 30m-2h or 1h-3h; plain numbers are hours)\n"
                 "/dropconfig fixed 18:00 22:00 (IST, up to 6 times)\n"
                 "/dropconfig duration <time>  (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
-                "/dropconfig stock <weapon code> <number>\n"
-                "/dropconfig price <weapon code> <berries>\n\nTip: /weapondrops has buttons for all of this.")
+                "/dropconfig stock <weapon code> <number or range like 3-10, 0 = none>\n"
+                "/dropconfig price <weapon code> <berries or range like 5000-20000, 0 = none>\n\nTip: /weapondrops has buttons for all of this.")
 
 
 async def dropconfig_command(update, context):
@@ -4415,16 +4464,22 @@ async def dropconfig_command(update, context):
             return
         await asyncio.to_thread(set_settings, duration_min=minutes)
         await _reply(msg, f"✅ Each drop lasts {fmt_minutes(minutes)}.")
-    elif cmd in ("stock", "price") and len(args) == 3:
-        code, n = norm_code(args[1]), _parse_int(args[2])
+    elif cmd in ("stock", "price") and len(args) >= 3:
+        code = norm_code(args[1])
         w = await asyncio.to_thread(get_weapon, code) if code else None
         limit = MAX_STOCK if cmd == "stock" else MAX_PRICE
-        if not w or n is None or n < 1 or n > limit:
-            await _reply(msg, "❌ Check the weapon code and send a whole number (1 or more).")
+        if not w:
+            await _reply(msg, "❌ Check the weapon code.")
             return
-        field = "drop_stock" if cmd == "stock" else "drop_price"
-        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {field: n}})
-        await _reply(msg, f"✅ {_weapon_label(w)}: drop {cmd} = {n:,}")
+        rng = _wd_parse("".join(args[2:]), limit)
+        if rng is None:
+            await _reply(msg, (f"❌ Stock goes from 1 to {limit:,}. Send a range like 3-10, one number like 5, or 0 for none."
+                               if cmd == "stock" else
+                               f"❌ Drop price goes from 1 to {limit:,}. Send a range like 5000-20000, one number like 5000, or 0 for none."))
+            return
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": _wd_fields(cmd, rng)})
+        w.update(_wd_fields(cmd, rng))
+        await _reply(msg, f"✅ {_weapon_label(w)}: drop {cmd} = {_wd_text(w, cmd, cmd == 'price') or 'not set'}")
     else:
         await _reply(msg, CONFIG_USAGE)
         return

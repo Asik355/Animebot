@@ -2569,6 +2569,11 @@ def help_detail(role, key, owner_id):
                     [_module_button("📦 Boxes", "rf:o:hub"),               # the Invite & Mystery Box manager (Owner check inside)
                      _module_button("📋 Commands", f"help:{owner_id}:{role}:invitecmds")],
                     [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
+            if k == "weapons" and role == "owner":
+                return text, InlineKeyboardMarkup([
+                    [_module_button("📜 Commands", "wdp:cmds:h:0"),         # the /weapondrops guides (fusion.py); h = opened from /help, so ⬅️ Back returns here
+                     _module_button("🔘 Buttons", "wdp:btns:h:0")],
+                    [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             if k == "addedit" and role in ("owner", "executive"):
                 return text, InlineKeyboardMarkup([
                     [_module_button("💰 Change Worth", f"cw:{owner_id}:{role}:hub")],
