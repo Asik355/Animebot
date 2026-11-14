@@ -2571,8 +2571,10 @@ def help_detail(role, key, owner_id):
                     [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             if k == "weapons" and role == "owner":
                 return text, InlineKeyboardMarkup([
-                    [_module_button("📜 Commands", "wdp:cmds:h:0"),         # the /weapondrops guides (fusion.py); h = opened from /help, so ⬅️ Back returns here
-                     _module_button("🔘 Buttons", "wdp:btns:h:0")],
+                    [_module_button("📜 Commands", "wdp:cmds:h:0"),         # weapon command guide (fusion.py); h = opened from /help, so ⬅️ Back returns here
+                     _module_button("➕ Create Weapon", "wm:new")],          # Weapon Manager (fusion.py): everything by buttons, Owner check inside
+                    [_module_button("💸 Discount", "wm:dc:0"),
+                     _module_button("🛠 Weapon Manager", "wm:list:0")],     # two rows of two, « Back alone below
                     [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             if k == "addedit" and role in ("owner", "executive"):
                 return text, InlineKeyboardMarkup([
@@ -9457,6 +9459,10 @@ async def gift(update, context):
     owner_id = update.effective_user.id
     if not is_owner(owner_id):
         await safe_reply_text(update.message, UNAUTHORIZED_TEXT)
+        return
+
+    if context.args and fusion.is_weapon_gift_arg(context.args[0]):      # /gift w0042 (weapons live in fusion.py)
+        await fusion.gift_weapon(update, context)
         return
 
     target_id = None

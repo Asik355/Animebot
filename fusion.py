@@ -2900,7 +2900,7 @@ def shop_buy_sync(user_id, code, receipt_key=None):
     w = get_weapon(code)
     if not w or not w.get("shop_enabled") or int(w.get("shop_price") or 0) <= 0:
         return {"status": "notforsale"}
-    price = int(w["shop_price"])
+    price = _shop_price(w)                      # the normal price, or the sale price while a discount runs
     if not _user_exists(user_id):
         return {"status": "nouser"}
     if not _receipt_take(receipt_key):
@@ -2925,7 +2925,7 @@ def _shop_caption(w, idx, total, owned):
         f"⚔️ {w['name']} [{w['_id']}]\n"
         f"📺 Anime: {w.get('anime') or '-'}\n"
         f"{_rarity_text(w.get('rarity'))}\n"
-        f"🪙 Price: {int(w['shop_price']):,} {BERRY}\n"
+        f"{_shop_price_lines(w)}\n"
         f"🎒 You own: {owned}\n\n"
         f"📦 Weapon {idx + 1}/{total}\n"
         "ℹ️ Weapons are used in /evolve."
@@ -2938,7 +2938,7 @@ def _shop_keyboard(uid, idx, total, w):
     if total > 1:
         rows.append([InlineKeyboardButton("◀️ BACK", callback_data=f"wshop:page:{uid}:{(idx - 1) % total}"),
                      InlineKeyboardButton("▶️ NEXT", callback_data=f"wshop:page:{uid}:{(idx + 1) % total}")])
-    rows.append([InlineKeyboardButton(f"🛒 BUY FOR {int(w['shop_price']):,} {BERRY}",
+    rows.append([InlineKeyboardButton(f"🛒 BUY FOR {_shop_price(w):,} {BERRY}",
                                       callback_data=f"wshop:buy:{uid}:{w['_id']}")])
     return InlineKeyboardMarkup(rows)
 
@@ -3048,7 +3048,7 @@ async def wshop_callback(update, context):
             await q.answer("❌ This weapon is not for sale.", show_alert=True)
             return
         await q.answer()
-        text = (f"🛒 Buy {w['name']} [{w['_id']}] for {int(w['shop_price']):,} {BERRY}?\n"
+        text = (f"🛒 Buy {w['name']} [{w['_id']}] for {_shop_price(w):,} {BERRY}?\n"
                 f"💰 Your Berries: {await asyncio.to_thread(_balance, owner):,}")
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ CONFIRM", callback_data=f"wshop:ok:{owner}:{w['_id']}"),
                                     InlineKeyboardButton("✖️ CANCEL", callback_data=f"wshop:show:{owner}:{w['_id']}")]])
@@ -3133,7 +3133,8 @@ def _weaponlist_lines(staff=False):
     lines = []
     for w in all_weapons():
         in_shop = w.get("shop_enabled") and int(w.get("shop_price") or 0) > 0
-        shop = f"🛒 {int(w['shop_price']):,} {BERRY}" if in_shop else "🛒 Not in the shop"
+        sale = _discount_of(w)[0] if in_shop else 0
+        shop = ((f"🛒 {_shop_price(w):,} {BERRY}" + (f" (-{sale}%)" if sale else "")) if in_shop else "🛒 Not in the shop")
         line = (f"{_deps['symbols'].get(w.get('rarity'), '⭐')} {w['name']} [{w['_id']}] • {w.get('anime') or '-'}\n"
                 f"   {shop}")
         if staff:
@@ -3484,6 +3485,581 @@ async def evoweapon_command(update, context):
         what = "⚔️ Weapon: removed"
     await _notify(context, f"⚔️ EVOLUTION WEAPON CHANGED\n🎭 {label} [{evo_code}]\n{what}\n💎 Stones: {res['stones']}\n"
                            f"👤 By: {_by(user)}", user)
+    _success(update)
+
+
+# ==========================================================================
+# ⚔️ WEAPON MANAGER (Owner: /help → Weapons): create, edit, delete, discount and evolution weapon, all with buttons.
+# Callback data: wm:<action>[:<arg>[:<arg2>]]  (far below 64 bytes)
+#   screens (edited in place):  list:<page>  w:<code>:<page>  dl|dy:<code>:<page>  dc:<page>  dw|dr|dd:<code>:<page>  sv  cx
+#   typed steps (a new message asks, /cancel stops):  new  evo  e:<code>:<field>  dx|dcr:<code>:<page>  dp:<code>:<lo>-<hi>:<page>
+# ==========================================================================
+WM_INPUT = 250
+WM_NEW_STEPS = ("name", "anime", "rarity", "price", "code", "photo")
+WM_DISC_MAX = 90                 # biggest discount in %
+WM_DISC_MAX_MIN = 43200          # longest sale: 30 days (in minutes)
+_WM_TEXT_KEYS = ("wm_edit", "wm_draft")
+
+
+def _wm_back(uid):
+    return f"help:{uid}:owner:weapons"
+
+
+def _discount_of(w, now=None):
+    """(percent, ends_at) of a discount that is running now, else (0, None). A discount is optional and set per weapon."""
+    pct = int(w.get("discount_pct") or 0)
+    if pct <= 0:
+        return 0, None
+    until = w.get("discount_until")
+    if until is not None and _aware(until) <= (now or _utcnow()):
+        return 0, None
+    return pct, until
+
+
+def _shop_price(w):
+    """The price the shop charges right now: the normal shop price, or the sale price while a discount runs."""
+    base = int(w.get("shop_price") or 0)
+    pct, _until = _discount_of(w)
+    return max(1, base * (100 - pct) // 100) if pct and base > 0 else base
+
+
+def _when_text(dt):
+    return _aware(dt).astimezone(IST).strftime("%d %b, %I:%M %p").lstrip("0") + " IST"
+
+
+def _shop_price_lines(w):
+    base, pct, until = int(w["shop_price"]), *_discount_of(w)
+    if not pct:
+        return f"🪙 Price: {base:,} {BERRY}"
+    return (f"🪙 Price: {_shop_price(w):,} {BERRY} (was {base:,}, -{pct}%)\n"
+            + (f"⏳ Sale ends {_when_text(until)}" if until else "🏷 Sale: no end date"))
+
+
+def _wm_minutes(text):
+    """'30m' / '2h' / '1d' / '1h 30m' -> minutes; '0' / 'none' -> 0 (no end); a plain number is minutes; None when invalid."""
+    s = str(text or "").strip().lower()
+    if s in ("0", "no", "none", "off", "never"):
+        return 0
+    if s.isdigit():
+        n = int(s)
+        return n if 1 <= n <= WM_DISC_MAX_MIN else None
+    m = re.fullmatch(r"(?:(\d+)\s*d)?\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m(?:in)?)?", s)
+    if not m or not any(m.groups()):
+        return None
+    total = int(m.group(1) or 0) * 1440 + int(m.group(2) or 0) * 60 + int(m.group(3) or 0)
+    return total if 1 <= total <= WM_DISC_MAX_MIN else None
+
+
+def _wm_weapon_text(w):
+    price = int(w.get("shop_price") or 0)
+    lines = [f"⚔️ {_weapon_label(w)}", "", f"📺 Anime: {w.get('anime') or 'Not set'}", _rarity_text(w.get("rarity")),
+             "🛒 Shop price: " + (f"{price:,} {BERRY}" if price and w.get("shop_enabled") else "not in the shop")]
+    pct, until = _discount_of(w)
+    if pct and price:
+        lines.append(f"💸 Discount: -{pct}% → {_shop_price(w):,} {BERRY}" + (f" (ends {_when_text(until)})" if until else ""))
+    lines.append("🖼 Photo: " + ("set" if w.get("photo") else "not set"))
+    return "\n".join(lines)
+
+
+def _wm_pages(items, page):
+    pages = max(1, -(-len(items) // POOL_PER_PAGE))
+    page = max(0, min(int(page), pages - 1))
+    return page, pages, items[page * POOL_PER_PAGE:(page + 1) * POOL_PER_PAGE]
+
+
+def _wm_nav(kind, page, pages):
+    return [("◀️", f"wm:{kind}:{(page - 1) % pages}"), (f"{page + 1}/{pages}", f"wm:{kind}:{page}"), ("▶️", f"wm:{kind}:{(page + 1) % pages}")]
+
+
+def _wm_list_view(page, uid):
+    page, pages, chunk = _wm_pages(all_weapons(), page)
+    text = "🛠 WEAPON MANAGER\n\n" + ("Tap a weapon to edit or delete it." if chunk else "No weapons yet. Go back and tap ➕ Create Weapon.")
+    rows = [[("🧬 Evolution Weapon", "wm:evo")]]
+    rows += [[(f"⚔️ {w['name'][:24]} [{w['_id']}]", f"wm:w:{w['_id']}:{page}")] for w in chunk]
+    if pages > 1:
+        rows.append(_wm_nav("list", page, pages))
+    rows.append([("« Back", _wm_back(uid))])
+    return text, _kb(rows)
+
+
+def _wm_weapon_view(code, page):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:list:{page}")]])
+    e = f"wm:e:{code}:"
+    return _wm_weapon_text(w), _kb([[("✏️ Name", e + "name"), ("✏️ Anime", e + "anime")],
+                                   [("✏️ Rarity", e + "rarity"), ("✏️ Shop price", e + "price")],
+                                   [("🖼 Photo", e + "photo"), ("🗑 Delete", f"wm:dl:{code}:{page}")],
+                                   [("⬅️ Back", f"wm:list:{page}")]])
+
+
+def _wm_delete_view(code, page):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:list:{page}")]])
+    back = [("⬅️ Back", f"wm:w:{code}:{page}")]
+    used = _recipes_using_weapon(code)
+    if used:
+        return (f"❌ {_weapon_label(w)} is needed by {len(used)} evolution recipe(s), so it cannot be deleted yet.\n"
+                "Tap 🧬 Evolution Weapon in the weapon list, enter that evolution's code and send off."), _kb([back])
+    owners = _col(USER_WEAPONS_COL).count_documents({"weapon_code": code, "qty": {"$gt": 0}})
+    return (f"⚠️ Delete {_weapon_label(w)}?\nIt is removed from {owners} player(s). This cannot be undone."), _kb(
+        [[("🗑 Remove", f"wm:dy:{code}:{page}"), ("↩️ Cancel", f"wm:w:{code}:{page}")]])
+
+
+def _wm_disc_list_view(page, uid):
+    page, pages, chunk = _wm_pages(shop_items_sync(), page)
+    text = ("💸 DISCOUNT\n\nA discount is optional and set for each weapon. Weapons without one sell at their normal price.\n"
+            "Tap a weapon to put it on sale." if chunk else
+            "💸 DISCOUNT\n\nNo weapon is in the shop yet. Give a weapon a shop price in 🛠 Weapon Manager first.")
+    rows = []
+    for w in chunk:
+        pct, _u = _discount_of(w)
+        rows.append([(f"⚔️ {w['name'][:20]} • {int(w['shop_price']):,}" + (f" • -{pct}%" if pct else ""), f"wm:dw:{w['_id']}:{page}")])
+    if pages > 1:
+        rows.append(_wm_nav("dc", page, pages))
+    rows.append([("« Back", _wm_back(uid))])
+    return text, _kb(rows)
+
+
+def _wm_disc_view(code, page):
+    w = get_weapon(code)
+    back = [("⬅️ Back", f"wm:dc:{page}")]
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([back])
+    base = int(w.get("shop_price") or 0)
+    pct, until = _discount_of(w)
+    lines = [f"💸 DISCOUNT · {_weapon_label(w)}", "", f"🛒 Normal price: {base:,} {BERRY}" if base > 0 else "🛒 Not in the shop (no shop price)"]
+    if pct:
+        lines += [f"🏷 Discount: -{pct}%", f"🪙 Sale price: {_shop_price(w):,} {BERRY}",
+                  "⏳ Ends: " + (_when_text(until) if until else "no end date")]
+    else:
+        lines.append("No discount now. This weapon sells at its normal price until you set one.")
+    rows = [[("🎲 Random", f"wm:dr:{code}:{page}"), ("✏️ Customise", f"wm:dx:{code}:{page}")]]
+    if pct:
+        rows.append([("🗑 Remove Discount", f"wm:dd:{code}:{page}")])
+    rows.append(back)
+    return "\n".join(lines), _kb(rows)
+
+
+def _wm_random_view(code, page):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
+    d = f"wm:dp:{code}:"
+    return (f"🎲 RANDOM DISCOUNT · {_weapon_label(w)}\n\nPick a range. The bot rolls one percent inside it (once) and then asks how long the sale lasts.\n"
+            "Or tap ✏️ Custom range to type your own, like 20-60."), _kb([
+        [("10-30%", f"{d}10-30:{page}"), ("30-50%", f"{d}30-50:{page}"), ("50-70%", f"{d}50-70:{page}")],
+        [("✏️ Custom range", f"wm:dcr:{code}:{page}")],
+        [("⬅️ Back", f"wm:dw:{code}:{page}")]])
+
+
+def _wm_view_sync(action, a1, a2, uid):
+    if action == "list":
+        return _wm_list_view(a1, uid)
+    if action == "w":
+        return _wm_weapon_view(a1, a2)
+    if action == "dl":
+        return _wm_delete_view(a1, a2)
+    if action == "dc":
+        return _wm_disc_list_view(a1, uid)
+    if action == "dw":
+        return _wm_disc_view(a1, a2)
+    return _wm_random_view(a1, a2)                         # "dr"
+
+
+def _wm_delete_sync(code):
+    """Deletes the weapon and every copy players own. Returns (weapon, owners) or (None, 0), or (weapon, -1) while an evolution needs it."""
+    w = get_weapon(code)
+    if not w:
+        return None, 0
+    if _recipes_using_weapon(code):
+        return w, -1
+    owners = _col(USER_WEAPONS_COL).count_documents({"weapon_code": code, "qty": {"$gt": 0}})
+    _col(USER_WEAPONS_COL).delete_many({"weapon_code": code})
+    _col(WEAPONS_COL).delete_one({"_id": code})
+    return w, owners
+
+
+async def _wm_show(q, text, kb):
+    if q.message is not None and getattr(q.message, "photo", None):      # a photo message cannot turn into text: send a new one
+        await q.message.reply_text(text, reply_markup=kb)
+        return
+    await _show(q, text, kb)
+
+
+async def wm_callback(update, context):
+    """Every wm: button that is not a typed step."""
+    q = update.callback_query
+    if q is None or q.from_user is None:
+        return
+    if not _is_owner(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return
+    parts = (q.data or "").split(":")
+    action, uid = parts[1] if len(parts) > 1 else "", q.from_user.id
+    a1, a2 = (parts[2] if len(parts) > 2 else "0"), (parts[3] if len(parts) > 3 else "0")
+    try:
+        if action in ("sv", "cx"):                                       # preview of a new weapon (a photo message)
+            draft = context.user_data.get("wm_draft")
+            if action == "cx":
+                context.user_data.pop("wm_draft", None)
+                await q.answer("Cancelled.")
+                await q.edit_message_caption(caption="❌ Cancelled. Nothing was added.")
+                return
+            if not draft:
+                await q.answer("This preview has expired.", show_alert=True)
+                return
+            price = int(draft["price"])
+            doc = {"_id": draft["code"], "code": draft["code"], "name": draft["name"], "anime": draft["anime"], "rarity": draft["rarity"],
+                   "photo": draft["photo"], "shop_enabled": price > 0, "shop_price": price,
+                   "drop_enabled": False, "drop_stock": 3, "drop_price": price,
+                   "created_by": int(uid), "created_at": _stamp()}
+            try:
+                await asyncio.to_thread(_col(WEAPONS_COL).insert_one, doc)
+            except mongo_db.DuplicateKeyError:
+                await q.answer("That code is already used. Create the weapon again with another code.", show_alert=True)
+                return
+            context.user_data.pop("wm_draft", None)
+            await q.answer("Saved.")
+            await q.edit_message_caption(caption="✅ Weapon added successfully!\n" + _wm_weapon_text(doc),
+                                         reply_markup=_kb([[("⚔️ Open Weapon", f"wm:w:{doc['_id']}:0")]]))
+            await _notify(context, f"⚔️ NEW WEAPON ADDED\n⚔️ {doc['name']} [{doc['code']}]\n📺 Anime: {doc['anime']}\n"
+                                   f"{_rarity_text(doc['rarity'])}\n💰 Shop Price: {price}\n📷 Photo: Added\n👤 By: {_by(q.from_user)}", q.from_user)
+            return
+        if action == "dy":                                               # confirmed delete
+            w, owners = await asyncio.to_thread(_wm_delete_sync, a1)
+            if w is None:
+                await q.answer("Already deleted.", show_alert=True)
+            elif owners < 0:
+                await q.answer("An evolution still needs this weapon.", show_alert=True)
+                return
+            else:
+                await q.answer("Deleted.")
+                await _notify(context, f"🗑 WEAPON DELETED\n⚔️ {_weapon_label(w)}\n👥 Removed from {owners} player(s)\n👤 By: {_by(q.from_user)}", q.from_user)
+            text = f"🗑 {_weapon_label(w)} deleted." if w else "ℹ️ That weapon no longer exists."
+            await _wm_show(q, text, _kb([[("« Weapon list", f"wm:list:{a2}")]]))
+            return
+        if action == "dd":                                               # remove a discount
+            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": a1}, {"$unset": {"discount_pct": "", "discount_until": ""}})
+            await q.answer("Discount removed.")
+            action = "dw"
+        elif action not in ("list", "w", "dl", "dc", "dw", "dr"):
+            await q.answer()
+            return
+        else:
+            await q.answer()
+        text, kb = await asyncio.to_thread(_wm_view_sync, action, a1, a2, uid)
+        await _wm_show(q, text, kb)
+    except Exception as e:
+        logger.error("weapon manager callback failed (%s): %s", q.data, e)
+        try:
+            await q.answer("❌ Something went wrong. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+# ---- typed steps (the prompts carry the guide: what to send, with an example)
+def _wm_prompt(field, w=None):
+    name = f" for {_weapon_label(w)}" if w else ""
+    new = w is None
+    if field == "name":
+        return ("⚔️ Name. Send the weapon's name, up to 60 characters, for example Benihime. No other weapon may have the same name." if new else
+                f"✏️ New name{name}. Send up to 60 characters, for example Benihime Bankai. It must differ from every other weapon.")
+    if field == "anime":
+        return ("📺 Anime. Send the anime the weapon is from, for example Bleach." if new else
+                f"✏️ New anime{name}. Send the anime name, for example Bleach.")
+    if field == "rarity":
+        return (("🏷 Rarity. " if new else f"✏️ New rarity{name}. ") + "Send one of: " + ", ".join(_rarities())
+                + ". It shows on the weapon card and in the shop.")
+    if field == "price":
+        return (("🪙 Shop price in Berries. " if new else f"✏️ New shop price{name}. ")
+                + "Send a whole number like 50000, or 0 to keep it out of the shop."
+                + (" Drop stock and drop price are set later in /weapondrops." if new else ""))
+    if field == "code":
+        return "🔢 Code. Send exactly 4 digits (0001-9999), for example 0042. It must not be used by another weapon. Evolutions use this code."
+    return "🖼 Photo. Send a picture of the weapon as a photo, not as a file." if new else f"🖼 Send the new photo{name} as a photo, not as a file."
+
+
+async def _wm_value(field, msg, code=None):
+    """Validate one typed value. Returns (value, None) or (None, error text)."""
+    text = (msg.text or "").strip()
+    if field == "photo":
+        if not getattr(msg, "photo", None):
+            return None, "❌ Send the picture as a photo, not as a file."
+        return msg.photo[-1].file_id, None
+    if field == "name":
+        if not text or len(text) > 60:
+            return None, "❌ Send a name of 1 to 60 characters, for example Benihime."
+        if any(x["name"].casefold() == text.casefold() and x["_id"] != code for x in await asyncio.to_thread(all_weapons)):
+            return None, "❌ A weapon with that name already exists. Send a different name."
+        return text, None
+    if field == "anime":
+        if not text or len(text) > 80:
+            return None, "❌ Send the anime name (up to 80 characters), for example Bleach."
+        return text, None
+    if field == "rarity":
+        hit = next((r for r in _rarities() if r.casefold() == text.casefold()), None)
+        if hit is None:
+            return None, "❌ Unknown rarity. Send one of: " + ", ".join(_rarities())
+        return hit, None
+    if field == "price":
+        n = _parse_int(text)
+        if n is None or n > MAX_PRICE:
+            return None, f"❌ Send a whole number from 0 to {MAX_PRICE:,}, like 50000, or 0 to keep it out of the shop."
+        return n, None
+    if not _valid_code(text):
+        return None, "❌ The code must be exactly 4 digits (0001-9999), for example 0042."
+    if await asyncio.to_thread(get_weapon, text):
+        return None, "❌ That code is already used by another weapon. Send another code."
+    return text, None
+
+
+_WM_DURATION_PROMPT = ("⏱ How long does the sale last? Send like 30m, 2h or 1d (up to 30 days), or 0 for no end date.\n"
+                       "Send /cancel to stop.")
+
+
+async def wm_entry(update, context):
+    """Start of every typed step: ➕ Create Weapon, 🧬 Evolution Weapon, ✏️ edits, 🎲 / ✏️ discounts."""
+    q = update.callback_query
+    if q is None or q.from_user is None or q.message is None:
+        return -1
+    if not _is_owner(q.from_user.id):
+        await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
+        return -1
+    parts = (q.data or "").split(":")                 # wm:new | wm:evo | wm:e:<code>:<field> | wm:dx|dcr:<code>:<page> | wm:dp:<code>:<lo>-<hi>:<page>
+    kind = parts[1]
+    context.user_data.pop("wdi", None)
+    context.user_data.pop("wm_draft", None)
+    if kind == "new":
+        st = {"kind": "new", "step": WM_NEW_STEPS[0], "draft": {}}
+        prompt = f"➕ New Weapon · step 1 of {len(WM_NEW_STEPS)}\n" + _wm_prompt("name")
+    elif kind == "evo":
+        st = {"kind": "ecode"}
+        prompt = ("🧬 Evolution Weapon · step 1 of 3\nEvolution code. Send the 4-digit code of the evolution (see /evolution), for example 0123. "
+                  "Its recipe will need 1 of a weapon.")
+    else:
+        code = parts[2]
+        w = await asyncio.to_thread(get_weapon, code)
+        if w is None:
+            await q.answer("❌ That weapon no longer exists.", show_alert=True)
+            return -1
+        if kind == "e":
+            st = {"kind": "edit", "code": code, "field": parts[3], "page": 0}
+            prompt = _wm_prompt(parts[3], w)
+        elif kind == "dx":
+            st = {"kind": "dpct", "code": code, "page": parts[3]}
+            prompt = (f"✏️ Discount for {_weapon_label(w)}. Send the percent off from 1 to {WM_DISC_MAX}, for example 30.")
+        elif kind == "dcr":
+            st = {"kind": "drange", "code": code, "page": parts[3]}
+            prompt = (f"🎲 Custom range for {_weapon_label(w)}. Send the lowest and highest percent from 1 to {WM_DISC_MAX}, for example 20-60. "
+                      "The bot rolls one percent inside it.")
+        else:                                           # dp: a preset range was tapped, roll now
+            lo, hi = (int(x) for x in parts[3].split("-"))
+            pct = random.randint(lo, hi)
+            st = {"kind": "ddur", "code": code, "page": parts[4], "pct": pct}
+            prompt = f"🎲 Rolled {pct}% off for {_weapon_label(w)}.\n" + _WM_DURATION_PROMPT.replace("\nSend /cancel to stop.", "")
+    context.user_data["wm_edit"] = st
+    await q.answer()
+    await _reply(q.message, prompt + "\nSend /cancel to stop.")
+    return WM_INPUT
+
+
+async def _wm_ask_duration(msg, context, st, pct, rolled):
+    st.update({"kind": "ddur", "pct": pct})
+    await _reply(msg, (f"🎲 Rolled {pct}% off.\n" if rolled else f"✅ {pct}% off.\n") + _WM_DURATION_PROMPT)
+    return WM_INPUT
+
+
+async def wm_input(update, context):
+    msg, user = update.effective_message, update.effective_user
+    if msg is None or user is None or not _is_owner(user.id):
+        return -1
+    st = context.user_data.get("wm_edit")
+    if not st:
+        await _reply(msg, "⌛ That input expired. Open it again from /help, Weapons.")
+        return -1
+    kind, retry = st["kind"], "\nTry again, or send /cancel."
+    # ---------------- ➕ Create Weapon: ask each value, then preview
+    if kind == "new":
+        step, draft = st["step"], st["draft"]
+        value, err = await _wm_value(step, msg)
+        if err:
+            await _reply(msg, err + retry)
+            return WM_INPUT
+        draft[step] = value
+        i = WM_NEW_STEPS.index(step) + 1
+        if i < len(WM_NEW_STEPS):
+            st["step"] = WM_NEW_STEPS[i]
+            await _reply(msg, f"Step {i + 1} of {len(WM_NEW_STEPS)}\n" + _wm_prompt(st["step"]) + "\nSend /cancel to stop.")
+            return WM_INPUT
+        context.user_data.pop("wm_edit", None)
+        context.user_data["wm_draft"] = draft
+        caption = "🔎 Preview\n\n" + _wm_weapon_text({"_id": draft["code"], "name": draft["name"], "anime": draft["anime"], "rarity": draft["rarity"],
+                                                    "shop_price": draft["price"], "shop_enabled": draft["price"] > 0, "photo": draft["photo"]})
+        await msg.reply_photo(photo=draft["photo"], caption=caption, reply_markup=_kb([[("✅ Save", "wm:sv"), ("❌ Cancel", "wm:cx")]]))
+        return -1
+    # ---------------- ✏️ edit one value of a weapon
+    if kind == "edit":
+        code, field = st["code"], st["field"]
+        w = await asyncio.to_thread(get_weapon, code)
+        if w is None:
+            context.user_data.pop("wm_edit", None)
+            await _reply(msg, "❌ That weapon no longer exists.")
+            return -1
+        value, err = await _wm_value(field, msg, code)
+        if err:
+            await _reply(msg, err + retry)
+            return WM_INPUT
+        upd = {"shop_price": value, "shop_enabled": value > 0} if field == "price" else {field: value}
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": upd})
+        context.user_data.pop("wm_edit", None)
+        text, kb = await asyncio.to_thread(_wm_weapon_view, code, st["page"])
+        await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
+        await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {field}\n👤 By: {_by(user)}", user)
+        _success(update)
+        return -1
+    # ---------------- 💸 discount: percent (customise or rolled from a range), then how long
+    if kind == "dpct":
+        n = _parse_int(msg.text)
+        if n is None or not 1 <= n <= WM_DISC_MAX:
+            await _reply(msg, f"❌ Send a whole number from 1 to {WM_DISC_MAX}, for example 30." + retry)
+            return WM_INPUT
+        return await _wm_ask_duration(msg, context, st, n, False)
+    if kind == "drange":
+        rng = rewards._parse_range(str(msg.text or "").strip(), WM_DISC_MAX)
+        if rng is None or rng[0] < 1:
+            await _reply(msg, f"❌ Send a range from 1 to {WM_DISC_MAX}, like 20-60." + retry)
+            return WM_INPUT
+        return await _wm_ask_duration(msg, context, st, random.randint(rng[0], rng[1]), True)
+    if kind == "ddur":
+        mins = _wm_minutes(msg.text)
+        if mins is None:
+            await _reply(msg, "❌ Send the time like 30m, 2h or 1d (1 minute to 30 days), or 0 for no end date." + retry)
+            return WM_INPUT
+        code = st["code"]
+        w = await asyncio.to_thread(get_weapon, code)
+        if w is None or int(w.get("shop_price") or 0) <= 0:
+            context.user_data.pop("wm_edit", None)
+            await _reply(msg, "❌ That weapon is gone or has no shop price, so it cannot be discounted.")
+            return -1
+        until = _utcnow() + timedelta(minutes=mins) if mins else None
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {"discount_pct": st["pct"], "discount_until": until}})
+        context.user_data.pop("wm_edit", None)
+        text, kb = await asyncio.to_thread(_wm_disc_view, code, st["page"])
+        await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
+        await _notify(context, f"💸 WEAPON DISCOUNT\n⚔️ {_weapon_label(w)}\n🏷 -{st['pct']}%"
+                               + (f" until {_when_text(until)}" if until else " (no end date)") + f"\n👤 By: {_by(user)}", user)
+        _success(update)
+        return -1
+    # ---------------- 🧬 Evolution Weapon: evolution code, weapon code or off, stones
+    text = (msg.text or "").strip()
+    if kind == "ecode":
+        recipe = await asyncio.to_thread(get_recipe_sync, text) if _valid_code(text) else None
+        if recipe is None:
+            await _reply(msg, "❌ No evolution recipe found for that code. Send the 4-digit code of an evolution, for example 0123 (see /evolution)." + retry)
+            return WM_INPUT
+        st.update({"kind": "ewep", "evo": text})
+        now = recipe.get("weapon_code")
+        await _reply(msg, "Step 2 of 3\n⚔️ Weapon. Send the 4-digit code of the weapon this evolution needs (1 of it), for example 0042, "
+                          "or off to remove the weapon requirement." + (f"\nNow it needs weapon {now}." if now else "") + "\nSend /cancel to stop.")
+        return WM_INPUT
+    if kind == "ewep":
+        weapon = None
+        if text.lower() != "off":
+            weapon = norm_code(text)
+            if not weapon or await asyncio.to_thread(get_weapon, weapon) is None:
+                await _reply(msg, "❌ Send the 4-digit code of an existing weapon (see 🛠 Weapon Manager), or off." + retry)
+                return WM_INPUT
+        st.update({"kind": "estones", "weapon": weapon})
+        await _reply(msg, "Step 3 of 3\n💎 Stones. Send how many Evolution Stones the evolution needs (0 or more; without a weapon it needs at least "
+                          f"{EVO_MIN_STONES}), for example 20, or skip to keep the current stones.\nSend /cancel to stop.")
+        return WM_INPUT
+    if kind == "estones":
+        stones = None
+        if text.lower() not in ("skip", "/skip", "-"):
+            stones = _parse_int(text)
+            if stones is None or stones > EVO_MAX_STONES:
+                await _reply(msg, f"❌ Send a whole number from 0 to {EVO_MAX_STONES}, for example 20, or skip." + retry)
+                return WM_INPUT
+        evo_code, weapon = st["evo"], st["weapon"]
+        res = await asyncio.to_thread(set_recipe_weapon_sync, evo_code, weapon, stones)
+        context.user_data.pop("wm_edit", None)
+        if not res["ok"]:
+            await _reply(msg, res["error"])
+            return -1
+        evo = await asyncio.to_thread(_row, evo_code)
+        label = evo[1] if evo else evo_code
+        if weapon:
+            w = await asyncio.to_thread(get_weapon, weapon)
+            done, what = f"✅ Saved.\n{label} [{evo_code}] now needs 1× {_weapon_label(w)}.\n💎 Stones: {res['stones']}", f"⚔️ Weapon: {_weapon_label(w)}"
+        else:
+            done, what = f"✅ Saved.\n{label} [{evo_code}] no longer needs a weapon.\n💎 Stones: {res['stones']}", "⚔️ Weapon: removed"
+        await _reply(msg, done, reply_markup=_kb([[("🛠 Weapon Manager", "wm:list:0")]]))
+        await _notify(context, f"⚔️ EVOLUTION WEAPON CHANGED\n🎭 {label} [{evo_code}]\n{what}\n💎 Stones: {res['stones']}\n👤 By: {_by(user)}", user)
+        _success(update)
+        return -1
+    context.user_data.pop("wm_edit", None)
+    return -1
+
+
+async def wm_cancel(update, context):
+    for k in _WM_TEXT_KEYS:
+        context.user_data.pop(k, None)
+    if _deps.get("cancel_all"):
+        await _deps["cancel_all"](update, context)
+        return -1
+    if update.effective_message is not None:
+        await _reply(update.effective_message, "❌ Cancelled.")
+    return -1
+
+
+# ---------------------------------------------------------------- /gift w<code> (the Owner's /gift in bot.py hands weapon gifts to this)
+WEAPON_GIFT_RE = re.compile(r"[wW](\d{4})")
+
+
+def is_weapon_gift_arg(text):
+    return bool(WEAPON_GIFT_RE.fullmatch(str(text or "").strip()))
+
+
+async def gift_weapon(update, context):
+    """/gift w0042 (reply to a player in a group)  or  /gift w0042 <user_id> (Owner DM): gives 1 weapon."""
+    user, msg, chat = update.effective_user, update.effective_message, update.effective_chat
+    if user is None or msg is None or chat is None:
+        return
+    if not _is_owner(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return
+    args = list(getattr(context, "args", None) or [])
+    code = args[0].strip()[1:]
+    target_id, reply = None, msg.reply_to_message
+    if chat.type != "private" and reply is not None and reply.from_user is not None:
+        if reply.from_user.is_bot:
+            await _reply(msg, "❌ You cannot gift a weapon to a bot.")
+            return
+        target_id = reply.from_user.id
+    elif chat.type == "private" and len(args) >= 2 and args[1].isdigit():
+        target_id = int(args[1])
+    if target_id is None:
+        await _reply(msg, "🎁 Weapon Gift Usage\n\nOwner DM: /gift w0042 <user_id>\nGroup reply: /gift w0042")
+        return
+    if target_id == user.id:
+        await _reply(msg, "❌ You cannot gift a weapon to yourself.")
+        return
+    w = await asyncio.to_thread(get_weapon, code)
+    if not w:
+        await _reply(msg, "❌ Weapon not found. A weapon gift looks like /gift w0042 (codes: /weaponlist).")
+        return
+    if not await asyncio.to_thread(_user_exists, target_id):
+        await _reply(msg, "❌ That user has not started the bot yet.")
+        return
+    await asyncio.to_thread(add_user_weapon, target_id, code, 1)
+    await _reply(msg, f"🎁 Gift sent successfully!\n⚔️ {_weapon_label(w)}\n👤 User ID: {target_id}")
+    try:
+        await context.bot.send_message(chat_id=target_id, text=f"🎁 You received a weapon gift!\n⚔️ {_weapon_label(w)}\n👑 From: Owner\nUse it in /evolve.")
+    except Exception as e:
+        logger.info("weapon gift notification skipped: %s", e)
+    await _notify(context, f"🎁 WEAPON GIFT\n⚔️ {_weapon_label(w)}\n🎯 To: {target_id}\n👤 By: {_by(user)}", user)
     _success(update)
 
 
@@ -3994,6 +4570,7 @@ _CMD_GUIDE = (
     "• duration <time> (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
     "• stock <code> <number or range> (1-1000, like 3-10; 0 = none)\n"
     "• price <code> <berries or range> (like 5000-20000; 0 = none)\n\n"
+    "/gift w<code>\nGives 1 weapon. Reply to a player in a group with /gift w0042, or in your DM send /gift w0042 <user_id>.\n\n"
     "/giveweapon <user_id> <code> [qty]\nGives a weapon (qty 1-99), or reply to a user with /giveweapon <code> [qty]. "
     "The user must have started the bot.\n\n"
     "/delweapon <code> [confirm]\nDeletes a weapon and removes it from every player. The first send shows a warning; "
@@ -4519,6 +5096,7 @@ def weapon_help_module():
         ("/editweapon <code> <name|anime|rarity|price|photo>", "Edit a weapon"),
         ("/weaponlist", "List all weapons"),
         ("/evoweapon <evolution code> <weapon code|off> [stones]", "Set the weapon an evolution needs"),
+        ("/gift w<code>", "Give 1 weapon: reply to a player (group) or /gift w0042 <user_id> (DM)"),
         ("/giveweapon <user_id> <code> [qty]", "Give a weapon (or reply to a user)"),
         ("/delweapon <code> [confirm]", "Delete a weapon"),
         ("/weapondrops", "Drop panel: ON/OFF, drop now, timing, duration, groups, weapons, command and button guides"),
@@ -4531,7 +5109,7 @@ def weapon_help_module():
              "", "⌨️ Commands & usage"]
     lines += [f"{i}. {syntax} - {desc}" for i, (syntax, desc) in enumerate(entries, 1)]
     lines += ["", "Players use /weapons (their weapons) and /weaponshop.",
-              "Open /weapondrops and tap 📜 Commands or 🔘 Buttons for the full guide."]
+              "Use the buttons below: ➕ Create Weapon, 💸 Discount and 🛠 Weapon Manager do everything with buttons. 📜 Commands lists every weapon command."]
     return ("weapons", "⚔️ Weapons", "\n".join(lines))
 
 
@@ -4579,6 +5157,14 @@ def _register_weapons(app):
         allow_reentry=True,
         conversation_timeout=_deps["conv_timeout"],
     ))
+    app.add_handler(ConversationHandler(            # ⚔️ Weapon Manager typed steps (create, edit, discount, evolution weapon; /cancel stops)
+        entry_points=[CallbackQueryHandler(wm_entry, pattern=r"^wm:(new|evo|e:\d{4}:(name|anime|rarity|price|photo)|dx:\d{4}:\d+|dcr:\d{4}:\d+|dp:\d{4}:\d{1,2}-\d{1,2}:\d+)$")],
+        states={WM_INPUT: [MessageHandler(text | filters.PHOTO, wm_input)]},
+        fallbacks=[CommandHandler("cancel", wm_cancel)],
+        allow_reentry=True,
+        conversation_timeout=_deps["conv_timeout"],
+    ))
+    app.add_handler(CallbackQueryHandler(wm_callback, pattern=r"^wm:(list:\d+|w:\d{4}:\d+|dl:\d{4}:\d+|dy:\d{4}:\d+|dc:\d+|dw:\d{4}:\d+|dr:\d{4}:\d+|dd:\d{4}:\d+|sv|cx)$"))
     for name, fn in (("weapons", weapons_command), ("weaponshop", weaponshop_command),
                      ("weaponlist", weaponlist_command), ("editweapon", editweapon_command),
                      ("delweapon", delweapon_command), ("giveweapon", giveweapon_command),
