@@ -2013,6 +2013,34 @@ def find_characters_by_recruit_name_partial(value):
 def find_characters_by_name_parts(query):
     return rewards.filter_hidden(mongo_db.find_characters_by_name_parts(query))
 
+_LOOKUP_INDEX = {"ts": None, "rows": []}
+
+
+def _name_words(text):
+    return [w.casefold() for w in re.findall(r"[^\W_]+", str(text or ""))]
+
+
+def find_characters_for_lookup(query):
+    """The name search of /check and /view: find_characters_by_name_parts, plus every character whose name contains ALL the typed
+    words as whole words anywhere in it. So '/check urahara' also lists 'Kisuke Urahara (Bankai)' next to 'Kisuke Urahara',
+    the same as '/check kisuke' does. Unchanged when a character's name is exactly what was typed."""
+    rows = list(find_characters_by_name_parts(query))
+    words = _name_words(query)
+    if not words:
+        return rows
+    typed = " ".join(words)
+    if any(" ".join(_name_words(r[1])) == typed for r in rows):
+        return rows
+    now = time.monotonic()
+    if _LOOKUP_INDEX["ts"] is None or now - _LOOKUP_INDEX["ts"] > 60:      # name index of every character, refreshed every minute
+        _LOOKUP_INDEX["rows"] = [(str(r[0]), set(_name_words(r[1]))) for r in mongo_db.get_all_characters()]
+        _LOOKUP_INDEX["ts"] = now
+    have = {str(r[0]) for r in rows}
+    extra_codes = sorted(c for c, ws in _LOOKUP_INDEX["rows"] if c not in have and all(w in ws for w in words))
+    extra = [r for r in (get_character_by_code(c) for c in extra_codes[:20]) if r]
+    return rows + rewards.filter_hidden(extra)
+
+
 def get_character(value):
     value = str(value).strip()
     if not value:
@@ -7176,7 +7204,7 @@ async def view(update, context):
     elif query.isdigit():
         character = (await asyncio.to_thread(get_character_by_code, query))
     else:
-        name_rows = (await asyncio.to_thread(find_characters_by_name_parts, query))
+        name_rows = (await asyncio.to_thread(find_characters_for_lookup, query))
         if name_rows:
             owned = await asyncio.to_thread(_owned_character_codes, update.effective_user.id)
             name_rows = [r for r in name_rows if str(r[0]) in owned]   # /view: only characters in your collection
@@ -8457,7 +8485,7 @@ async def check(update, context):
     elif query.isdigit():
         character = (await asyncio.to_thread(get_character_by_code, query))
     else:
-        matches = (await asyncio.to_thread(find_characters_by_name_parts, query))
+        matches = (await asyncio.to_thread(find_characters_for_lookup, query))
         if len(matches) > 1:
             await safe_reply_text(
                 update.message,
