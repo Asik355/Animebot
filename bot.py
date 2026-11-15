@@ -247,8 +247,13 @@ def log_character_action(code, name, user, action):
         print("Character action log error:", e)
 
 
+def _no_tag(text):
+    """Stops Telegram from turning '@name' inside a public message into a tag (a zero-width character after the @)."""
+    return str(text or "").replace("@", "@\u200b")
+
+
 def get_character_adder_text(code):
-    """'Name (@username)' of whoever first added this character, or 'Unknown' when no record exists."""
+    """Name of whoever first added this character (no @username, so /check and /view never tag anyone), or 'Unknown' when no record exists."""
     try:
         docs = [d for d in _mc("character_additions_v2").find({"character_code": str(code)})
                 if (d.get("action") or "add") == "add"]
@@ -256,11 +261,10 @@ def get_character_adder_text(code):
             return "Unknown"
         d = min(docs, key=lambda x: str(x.get("added_at") or "9999"))
         name = " ".join(v for v in [d.get("added_first_name"), d.get("added_last_name")] if v).strip()
-        username = (d.get("added_username") or "").strip()
-        handle = f"@{username}" if username else "No username"
-        if not name:
-            return html_escape(handle) if username else "Unknown"
-        return f"{html_escape(name)} ({html_escape(handle)})"
+        username = (d.get("added_username") or "").strip().lstrip("@")
+        if name:
+            return html_escape(_no_tag(name))
+        return html_escape(_no_tag(username)) if username else "Unknown"        # username without the @: shown, never tagged
     except Exception as e:
         print("Character adder lookup error:", e)
         return "Unknown"
@@ -8421,7 +8425,7 @@ async def send_character_check_result(bot, chat_id, character, source_message=No
     for uid, qty in owners:
         u = owner_names.get(int(uid))
         first, last, username = u if u else ("Unknown", "", "")
-        display = " ".join(v for v in [first, last] if v).strip() or "Unknown"
+        display = _no_tag(" ".join(v for v in [first, last] if v).strip()) or "Unknown"
         lines.append(f"• {display} ×{qty}")
     if not owners:
         lines.append("• No owners yet")

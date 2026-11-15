@@ -42,6 +42,7 @@ Claiming:
 
 import asyncio
 import logging
+import html as _html
 import random
 import time
 from collections import namedtuple
@@ -5133,7 +5134,7 @@ async def wdrop_callback(update, context):
         try:
             await context.bot.send_message(
                 chat_id=q.message.chat_id,
-                text=(f"🎉 {q.from_user.mention_html()} bought {w['name']}! "
+                text=(f"🎉 {_html.escape((q.from_user.full_name or 'Someone').replace('@', '@' + chr(0x200b)))} bought {_html.escape(w['name'])}! "
                       f"({max(int(item['stock_left']), 0)}/{int(item['stock_total'])} left)"),
                 parse_mode="HTML")
         except Exception:
