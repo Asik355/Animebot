@@ -572,6 +572,8 @@ def reward_lines(reward):
     if r.get("card"):
         row = _character_row(r["card"])
         lines.append(f"🎭 {_esc(str(row[1]))} [{r['card']}]" if row else f"🎭 Character [{r['card']}]")
+    if r.get("weapon"):
+        lines += [_esc(x) for x in _fusion().weapon_reward_lines(r["weapon"])]
     if r.get("banner"):
         b = get_banner(r["banner"])
         lines.append(f"🎌 Banner “{_esc(str((b or {}).get('name') or '?'))}” ({r['banner']}) - equip with /usebanner {r['banner']}")
@@ -602,6 +604,8 @@ def reward_short_lines(reward):
     if r.get("card"):
         row = _character_row(r["card"])
         lines.append(f"🎭 {_esc(str(row[1]))}" if row else f"🎭 [{r['card']}]")
+    if r.get("weapon"):
+        lines += [_esc(x) for x in _fusion().weapon_reward_lines(r["weapon"])]
     if r.get("banner"):
         b = get_banner(r["banner"])
         lines.append(f"🎌 {_esc(str((b or {}).get('name') or r['banner']))}")
@@ -697,6 +701,11 @@ def claim_quest(uid, q):
                 raise RuntimeError("event card character no longer exists")
             gid = mongo_db.add_collection(uid, r["card"], _grant_stamp())
             undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
+        if r.get("weapon"):
+            fu = _fusion()
+            if not fu.weapon_rewards_exist(r["weapon"]):
+                raise RuntimeError("quest reward weapon no longer exists")
+            fu.give_weapon_reward(uid, r["weapon"], undo)
         if r.get("banner"):
             token = banner_token(r["banner"])
             gid = f"{uid}:{token}"
@@ -900,6 +909,11 @@ def _ok(update):
 
 def _btn(label, data):
     return InlineKeyboardButton(label, callback_data=data)
+
+
+def _fusion():
+    import fusion                      # imported on use: fusion.py imports this file at start-up (weapons as a quest reward)
+    return fusion
 
 
 def _mention(uid, name):
@@ -1585,6 +1599,8 @@ def _aq_preview_text(st, f):
     if r.get("card"):
         row = _character_row(r["card"])
         lines.append(f"🎭 {_esc(str(row[1]))} [{r['card']}] (event card: hidden from all lists)" if row else f"🎭 [{r['card']}]")
+    if r.get("weapon"):
+        lines += [_esc(x) for x in _fusion().weapon_reward_lines(r["weapon"])]
     if st.get("banner_name"):
         lines.append(f"🎌 Banner “{_esc(st['banner_name'])}” (event banner: hidden from the banner list)")
     return "\n".join(lines)
@@ -1695,6 +1711,18 @@ async def addquest_input(update, context):
                 await _reply(msg, "❌ No character with that code. Send a 4-digit code, or 0 for none.")
                 return AQ_INPUT
             st["reward"]["card"] = code
+        return await _aq_ask(update, context, "weapon",
+                             "⚔️ Send the WEAPON reward: one or more weapon codes separated by commas, like 0042 or 0042 x3 "
+                             "(x3 = three copies), or 0 for none.")
+    if step == "weapon":
+        if _is_none_word(text):
+            st["reward"]["weapon"] = None
+        else:
+            picked, werr = await asyncio.to_thread(_fusion().parse_weapon_rewards, text)
+            if werr:
+                await _reply(msg, werr + "\nOr send 0 for none.")
+                return AQ_INPUT
+            st["reward"]["weapon"] = picked
         return await _aq_ask(update, context, "banner_photo", "🎌 Send the event BANNER photo, or 0 for no banner.")
     if step == "banner_photo":
         if msg.photo:
@@ -1797,6 +1825,7 @@ def _eq_menu(uid, qid):
     return InlineKeyboardMarkup([
         [_btn("🎯 Target", f"fs:eq:{uid}:{qid}:target"), _btn("🪙 Berrys", f"fs:eq:{uid}:{qid}:berrys")],
         [_btn("💎 Stones", f"fs:eq:{uid}:{qid}:stones"), _btn("🎭 Card", f"fs:eq:{uid}:{qid}:card")],
+        [_btn("⚔️ Weapon", f"fs:eq:{uid}:{qid}:weapon")],
         [_btn("🖼 Banner photo", f"fs:eq:{uid}:{qid}:bphoto"), _btn("🎌 Banner name", f"fs:eq:{uid}:{qid}:bname")],
         [_btn("👥 Wished person's Berrys", f"fs:eq:{uid}:{qid}:rberrys")],
         [_btn("✔️ Done", f"fs:eq:{uid}:{qid}:done")]])
@@ -1850,9 +1879,9 @@ async def editquest_menu(update, context):
     quest = await asyncio.to_thread(get_quest, state["qid"])
     has_banner = bool(quest and (quest.get("reward") or {}).get("banner"))
     is_pay = bool(quest and quest["qtype"] == "wish_pay")
-    if is_pay and action in ("card", "bphoto", "bname"):
+    if is_pay and action in ("card", "weapon", "bphoto", "bname"):
         await context.bot.send_message(chat_id=q.message.chat_id,
-                                       text="ℹ️ A pay-per-wish quest only pays Berrys / Stones. It has no card or banner.")
+                                       text="ℹ️ A pay-per-wish quest only pays Berrys / Stones. It has no card, weapon or banner.")
         return EQ_MENU
     if not is_pay and action == "rberrys":
         await context.bot.send_message(chat_id=q.message.chat_id,
@@ -1868,6 +1897,7 @@ async def editquest_menu(update, context):
                "berrys": "🪙 Send the new BERRYS reward (0 for none).",
                "stones": "💎 Send the new SPECIAL STONES reward (0 for none).",
                "card": "🎭 Send the new EVENT CARD character code (0 to remove). It will be hidden from all lists.",
+               "weapon": "⚔️ Send the new WEAPON reward: weapon codes separated by commas, like 0042 or 0042 x3 (0 to remove).",
                "bphoto": "🖼 Send the banner PHOTO." + ("" if has_banner else " (This adds a new event banner.)"),
                "bname": f"🎌 Send the new banner NAME (max {NAME_MAX} characters)."}
     await context.bot.send_message(chat_id=q.message.chat_id, text=prompts[action] + "\n\nSend /cancel to stop.")
@@ -1895,6 +1925,11 @@ def _apply_quest_edit(qid, field, value, extra, creator_id):
             reward["card"] = value
         else:
             reward.pop("card", None)
+    elif field == "weapon":
+        if value:
+            reward["weapon"] = value
+        else:
+            reward.pop("weapon", None)
     elif field == "bphoto":
         if reward.get("banner"):
             _col(BANNERS).update_one({"_id": reward["banner"]}, {"$set": {"photo_file_id": value, "updated_at": _stamp()}})
@@ -1946,6 +1981,11 @@ async def editquest_input(update, context):
             row = await asyncio.to_thread(_character_row, code) if code else None
             value = code if row else None
         err = "❌ No character with that code. Send a 4-digit code, or 0 to remove."
+    elif field == "weapon":
+        if _is_none_word(text):
+            value = 0
+        else:
+            value, err = await asyncio.to_thread(_fusion().parse_weapon_rewards, text)
     elif field == "bphoto":
         if msg.photo:
             value = msg.photo[-1].file_id
@@ -3076,7 +3116,7 @@ def register(app):
         entry_points=[CommandHandler("editquest", editquest_start),
                       CallbackQueryHandler(_go_handler("editquest"), pattern=_go_pattern("editquest", r":Q\d+"))],
         states={
-            EQ_MENU: [CallbackQueryHandler(editquest_menu, pattern=r"^fs:eq:\d+:Q\d+:(target|berrys|stones|card|bphoto|bname|rberrys|done)$")],
+            EQ_MENU: [CallbackQueryHandler(editquest_menu, pattern=r"^fs:eq:\d+:Q\d+:(target|berrys|stones|card|weapon|bphoto|bname|rberrys|done)$")],
             EQ_INPUT: [MessageHandler(filters.PHOTO, editquest_input), MessageHandler(text, editquest_input)],
         },
         fallbacks=fallbacks, allow_reentry=True, conversation_timeout=timeout))

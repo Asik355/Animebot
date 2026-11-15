@@ -2574,7 +2574,10 @@ def help_detail(role, key, owner_id):
                     [_module_button("📜 Commands", "wdp:cmds:h:0"),         # weapon command guide (fusion.py); h = opened from /help, so ⬅️ Back returns here
                      _module_button("➕ Create Weapon", "wm:new")],          # Weapon Manager (fusion.py): everything by buttons, Owner check inside
                     [_module_button("💸 Discount", "wm:dc:0"),
-                     _module_button("🛠 Weapon Manager", "wm:list:0")],     # two rows of two, « Back alone below
+                     _module_button("🛠 Weapon Manager", "wm:list:0")],
+                    [_module_button("🛒 Shop List", "wm:sl:0"),
+                     _module_button("🎁 Drop List", "wm:pl:0")],
+                    [_module_button("🏪 Shop Hours", "wm:sh:h")],            # rows of two, « Back alone below
                     [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             if k == "addedit" and role in ("owner", "executive"):
                 return text, InlineKeyboardMarkup([
@@ -2772,6 +2775,7 @@ def _reward_cards(v):
 
 def format_event_rewards(rw):
     parts = [format_reward("character", c) for c in _reward_cards(rw.get("card"))]
+    parts += fusion.weapon_reward_lines(rw.get("weapon"))
     if rw.get("berrys"):
         parts.append(format_reward("coins", rw["berrys"]))
     if rw.get("stones"):
@@ -2792,6 +2796,7 @@ def redeem_rewards_of(doc):
 
 def format_redeem_rewards(rw):
     parts = [format_reward("character", c) for c in _reward_cards(rw.get("character"))]
+    parts += fusion.weapon_reward_lines(rw.get("weapon"))
     if rw.get("coins"):
         parts.append(format_reward("coins", rw["coins"]))
     if rw.get("stones"):
@@ -12586,6 +12591,7 @@ async def event(update, context):
 
 EVENT_NAME, EVENT_CODE, EVENT_BERRYS, EVENT_STONES, EVENT_TRIGGER, EVENT_END_DAY, EVENT_END_MONTH, EVENT_END_YEAR, EVENT_END_HOUR, EVENT_END_MINUTE = range(400,410)
 EVENT_CHAR, EVENT_LIMIT = 410, 411
+EVENT_WEAPON = 412
 
 async def add_event_start(update, context):
     if not is_owner(update.effective_user.id):
@@ -12643,7 +12649,20 @@ async def add_event_char(update, context):
             await safe_reply_text(update.message, err + "\nOr send none to skip.")
             return EVENT_CHAR
         d["event_card"] = codes
-    if not (d.get("event_berrys") or d.get("event_stones") or d.get("event_card")):
+    await safe_reply_text(update.message, "⚔️ Weapons (optional): send one or more weapon codes, separated by commas, like 0042 or 0042 x3. Send none to skip:")
+    return EVENT_WEAPON
+
+async def add_event_weapon(update, context):
+    text = update.message.text.strip()
+    d = context.user_data
+    d["event_weapon"] = None
+    if text.lower() not in ("none", "skip", "0"):
+        picked, err = (await asyncio.to_thread(fusion.parse_weapon_rewards, text))
+        if err:
+            await safe_reply_text(update.message, err + "\nOr send none to skip.")
+            return EVENT_WEAPON
+        d["event_weapon"] = picked
+    if not (d.get("event_berrys") or d.get("event_stones") or d.get("event_card") or d.get("event_weapon")):
         await safe_reply_text(update.message, "❌ Give at least one reward. Send the Berrys amount again (0 to skip):")
         return EVENT_BERRYS
     await safe_reply_text(update.message, "6️⃣ Exact trigger phrase users must type:")
@@ -12717,13 +12736,14 @@ async def add_event_end_minute(update, context):
         await safe_reply_text(update.message,"❌ End time must be in the future.")
         return EVENT_END_MINUTE
     end_at=dt.isoformat(timespec="seconds")
-    rw={k: d[f"event_{k}"] for k in ("berrys","stones","card") if d.get(f"event_{k}")}
+    rw={k: d[f"event_{k}"] for k in ("berrys","stones","card","weapon") if d.get(f"event_{k}")}
     k0=next(iter(rw)); rewards_text=(await asyncio.to_thread(format_event_rewards, rw))
+    v0 = rw[k0][0] if isinstance(rw[k0], list) else next(iter(rw[k0])) if isinstance(rw[k0], dict) else rw[k0]
     def _create_event(session):
         _mc("events_v2").update_many({"active": 1}, {"$set": {"active": 0}}, session=session)
         mongo_db.insert_with_id("events_v2", {
             "name": d["event_name"], "event_code": d["event_code"], "description": "",
-            "reward_type": {"berrys":"coins","stones":"stones","card":"character"}[k0], "reward_value": (rw[k0][0] if isinstance(rw[k0], list) else rw[k0]),
+            "reward_type": {"berrys":"coins","stones":"stones","card":"character","weapon":"weapon"}[k0], "reward_value": v0,
             "rewards": rw, "max_per_user": d["event_limit"],
             "end_at": end_at, "active": 1, "created_at": timestamp(), "trigger_text": d["event_trigger"],
         }, session=session)
@@ -12782,10 +12802,16 @@ async def event_trigger_message(update, context):
                 raise RuntimeError("event reward user missing")
             undo.append(lambda amt=amt: mongo_db.add_special_stones(uid, -amt))
         for _c in _reward_cards(rw.get("card")):
-            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(_c))):
+            _row = (await asyncio.to_thread(get_character_by_code, str(_c)))        # 4-digit lookup (301 -> 0301)
+            if not _row:
                 raise RuntimeError("event reward character missing")
-            gid = (await asyncio.to_thread(mongo_db.add_collection, uid, _c, timestamp()))
+            gid = (await asyncio.to_thread(mongo_db.add_collection, uid, _row[0], timestamp()))
             undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
+        weapon_rw = rw.get("weapon") or {}
+        if weapon_rw:
+            if not (await asyncio.to_thread(fusion.weapon_rewards_exist, weapon_rw)):
+                raise RuntimeError("event reward weapon missing")
+            await asyncio.to_thread(fusion.give_weapon_reward, uid, weapon_rw, undo)
     except Exception as e:
         for fn in reversed(undo):
             try:
@@ -12883,22 +12909,23 @@ async def add_redeem_start(update, context):
     context.user_data.pop("redeem_count", None)
     context.user_data.pop("redeem_expiry", None)
     context.user_data["redeem_rewards"] = {}
-    await safe_reply_text(update.message, "1️⃣ Reward type: Character, Berrys or Stone\n(you can add several rewards to one code)")
+    await safe_reply_text(update.message, "1️⃣ Reward type: Character, Weapon, Berrys or Stone\n(you can add several rewards to one code)")
     return REDEEM_TYPE
 
 async def _redeem_pick_type(update, context, text):
     """Shared by the first reward and 'add another reward'. Returns the next state, or None if the text was not a valid type."""
     text = text.strip().lower()
-    if text not in ("character", "berrys", "stone", "stones", "special stone", "special stones"):
-        await safe_reply_text(update.message, "❌ Send Character, Berrys or Stone.")
+    if text not in ("character", "weapon", "weapons", "berrys", "stone", "stones", "special stone", "special stones"):
+        await safe_reply_text(update.message, "❌ Send Character, Weapon, Berrys or Stone.")
         return None
-    typ = "coins" if text == "berrys" else "character" if text == "character" else "stones"
+    typ = "coins" if text == "berrys" else "character" if text == "character" else "weapon" if text in ("weapon", "weapons") else "stones"
     if typ in ("coins", "stones") and typ in context.user_data.get("redeem_rewards", {}):
-        await safe_reply_text(update.message, "❌ That reward is already added. Send a different type (Character, Berrys or Stone), or done.")
+        await safe_reply_text(update.message, "❌ That reward is already added. Send a different type (Character, Weapon, Berrys or Stone), or done.")
         return None
     context.user_data["redeem_type"] = typ
     await safe_reply_text(update.message,
         {"character": "2️⃣ Characters: send one or more (code or name), separated by commas:",
+         "weapon": "2️⃣ Weapons: send one or more weapon codes, separated by commas, like 0042 or 0042 x3 (x3 = three copies):",
          "coins": "2️⃣ Berrys amount:",
          "stones": "2️⃣ Special Stones amount:"}[typ]
     )
@@ -12925,6 +12952,18 @@ async def add_redeem_reward(update, context):
             await safe_reply_text(update.message, f"❌ A code can hold at most {MAX_REWARD_CHARACTERS} characters.")
             return REDEEM_REWARD
         rewards["character"] = merged
+    elif typ == "weapon":
+        picked, err = (await asyncio.to_thread(fusion.parse_weapon_rewards, text))
+        if err:
+            await safe_reply_text(update.message, err)
+            return REDEEM_REWARD
+        merged_w = dict(rewards.get("weapon") or {})
+        for _wc, _wq in picked.items():
+            merged_w[_wc] = min(merged_w.get(_wc, 0) + _wq, 99)
+        if len(merged_w) > fusion.MAX_REWARD_WEAPONS:
+            await safe_reply_text(update.message, f"❌ A code can hold at most {fusion.MAX_REWARD_WEAPONS} different weapons.")
+            return REDEEM_REWARD
+        rewards["weapon"] = merged_w
     else:
         amount = _positive_amount(text)
         if amount is None:
@@ -12935,7 +12974,7 @@ async def add_redeem_reward(update, context):
 
     await safe_reply_text(update.message,
         f"✅ Added. Rewards so far:\n🎁 {(await asyncio.to_thread(format_redeem_rewards, rewards))}\n\n"
-        "➕ Add another reward? Send Character, Berrys or Stone — or send done to continue.")
+        "➕ Add another reward? Send Character, Weapon, Berrys or Stone — or send done to continue.")
     return REDEEM_MORE
 
 async def add_redeem_more(update, context):
@@ -13038,6 +13077,8 @@ async def add_redeem_code(update, context):
     # first reward is also kept in the old single-reward fields
     if _rw.get("character"):
         _legacy_type, _legacy_value = "character", str(_reward_cards(_rw["character"])[0])
+    elif _rw.get("weapon"):
+        _legacy_type, _legacy_value = "weapon", str(next(iter(_rw["weapon"])))
     elif _rw.get("coins"):
         _legacy_type, _legacy_value = "coins", str(_rw["coins"])
     else:
@@ -13147,12 +13188,19 @@ async def redeem(update, context):
             await safe_reply_text(update.message, "⚠️ You have already redeemed this code.")
             return
 
-        cards = _reward_cards(rw.get("character"))
-        for _c in cards:      # check every character exists before giving anything
-            if not (await asyncio.to_thread(mongo_db.get_character_by_code, str(_c))):
+        cards = []
+        for _c in _reward_cards(rw.get("character")):      # check every character exists before giving anything
+            _row = (await asyncio.to_thread(get_character_by_code, str(_c)))      # the 4-digit lookup (301 -> 0301), like the reward text uses
+            if not _row:
                 await _rollback()
                 await safe_reply_text(update.message, "❌ This redeem reward is no longer available.")
                 return
+            cards.append(_row[0])                           # give the code exactly as the character list stores it
+        weapon_rw = rw.get("weapon") or {}
+        if weapon_rw and not (await asyncio.to_thread(fusion.weapon_rewards_exist, weapon_rw)):
+            await _rollback()
+            await safe_reply_text(update.message, "❌ This redeem reward is no longer available.")
+            return
 
         if rw.get("coins"):
             amt = int(rw["coins"])
@@ -13171,6 +13219,8 @@ async def redeem(update, context):
         for _c in cards:
             gid = (await asyncio.to_thread(mongo_db.add_collection, user_id, _c, timestamp()))
             undo.append(lambda gid=gid: mongo_db.delete_collection_by_id(gid))
+        if weapon_rw:
+            await asyncio.to_thread(fusion.give_weapon_reward, user_id, weapon_rw, undo)
 
         if max_claims is not None and claim_count + 1 >= int(max_claims):
             (await asyncio.to_thread(codes.update_one, {"_id": code}, {"$set": {"active": 0}}))
@@ -16241,6 +16291,7 @@ def register_owner_commands(app):
             EVENT_BERRYS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_berrys)],
             EVENT_STONES: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_stones)],
             EVENT_CHAR: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_char)],
+            EVENT_WEAPON: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_weapon)],
             EVENT_TRIGGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_trigger)],
             EVENT_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_limit)],
             EVENT_END_DAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end_day)],

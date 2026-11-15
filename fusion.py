@@ -43,6 +43,7 @@ Claiming:
 import asyncio
 import logging
 import random
+import time
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
@@ -1049,6 +1050,24 @@ def _evolve_keyboard(user_id, evo_code):
     return InlineKeyboardMarkup([[InlineKeyboardButton("EVOLVE", callback_data=f"evo:go:{int(user_id)}:{evo_code}")]])
 
 
+def _shrink_names(parts, budget):
+    """Cuts the longest name first, one character at a time, until all names fit `budget` characters together; every cut name ends with …"""
+    cut, marked = list(parts), [False] * len(parts)
+    while sum(len(c) for c in cut) > budget and max(len(c) for c in cut) > 3:
+        i = max(range(len(cut)), key=lambda j: len(cut[j]))
+        cut[i], marked[i] = cut[i][:-1], True
+    return [c.rstrip()[:-1] + "…" if m and len(c) > 1 else c for c, m in zip(cut, marked)]
+
+
+def _recipe_label(symbol, ingredient_names, qty_suffix, evo_name, limit=64):
+    """'💫 Naruto + Sasuke ➡️ Final Fight' (or 'Naruto ×3 ➡️ Prime Naruto') that fits `limit` characters.
+    A long label shortens every name evenly with …, so the evolved name never loses its end (no more '... ➡️ Naruto Uzumaki & Sa')."""
+    names = list(ingredient_names) + [evo_name]
+    overhead = len(f"{symbol} ") + len(" ➡️ ") + 3 * (len(ingredient_names) - 1) + len(qty_suffix)
+    names = _shrink_names(names, max(8, limit - overhead))
+    return f"{symbol} " + " + ".join(names[:-1]) + qty_suffix + f" ➡️ {names[-1]}"
+
+
 def _recipe_buttons_sync(user_id, recipes):
     """One button per recipe (max 10): 'Naruto ×2 ➡️ Sage Naruto' or 'Naruto + Sasuke ➡️ Final Fight'."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -1057,8 +1076,9 @@ def _recipe_buttons_sync(user_id, recipes):
         ingredients = recipe_ingredients(r)
         cards, evo = [_row(c) for c, _q in ingredients], _row(r["_id"])
         if evo and all(cards):
-            names = " + ".join(c[1] for c in cards) if len(cards) > 1 else f"{cards[0][1]} ×{ingredients[0][1]}"
-            rows.append([InlineKeyboardButton(f"{fusion_symbol(r)} {names} ➡️ {evo[1]}"[:60], callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
+            suffix = f" ×{ingredients[0][1]}" if len(cards) == 1 else ""
+            label = _recipe_label(fusion_symbol(r), [c[1] for c in cards], suffix, evo[1])
+            rows.append([InlineKeyboardButton(label, callback_data=f"evo:pick:{int(user_id)}:{r['_id']}")])
     return InlineKeyboardMarkup(rows) if rows else None
 
 
@@ -1203,8 +1223,9 @@ async def delevo_command(update, context):
 
 # ---------------------------------------------------------------- /addevo conversation (the exact 10 steps)
 (E_BASE, E_QTY, E_NAME, E_ANIME, E_RARITY, E_WORTH, E_STONES, E_BERRIES, E_CODE, E_PHOTO) = range(200, 210)
+E_WEAPON = 228                                    # ⚔️ With Weapon: the weapon code step
 _EVO_KEYS = ("evo_base", "evo_base_name", "evo_qty", "evo_name", "evo_anime", "evo_rarity", "evo_worth",
-             "evo_stones", "evo_berries", "evo_code")
+             "evo_stones", "evo_berries", "evo_code", "evo_weapon")
 
 
 def _clear_evo(context):
@@ -1241,7 +1262,24 @@ async def addevo_base(update, context):
         _clear_evo(context)
         return -1
     context.user_data["evo_base"], context.user_data["evo_base_name"] = code, row[1]
+    if context.user_data.get("evo_kind") == "weapon":                    # ⚔️ With Weapon: the weapon comes before the quantity
+        await _reply(msg, f"{_stepno(context, 1)} Weapon Code\nSend the 4-digit code of the weapon {row[1]} needs (1 of it), for example 0042 (see /weaponlist):")
+        return E_WEAPON
     await _reply(msg, f"2️⃣ Base Character Quantity\nHow many copies of {row[1]} are required? (1-{EVO_MAX_BASE_QTY})")
+    return E_QTY
+
+
+async def addevo_weapon(update, context):
+    msg = update.effective_message
+    code = norm_code(msg.text)
+    w = await asyncio.to_thread(get_weapon, code) if code else None
+    if w is None:
+        await _reply(msg, "❌ Send the 4-digit code of an existing weapon, for example 0042 (see /weaponlist). Or /cancel.")
+        return E_WEAPON
+    context.user_data["evo_weapon"] = code
+    base_name = context.user_data.get("evo_base_name") or "the character"
+    await _reply(msg, f"✅ Weapon: {_weapon_label(w)}\n{_stepno(context, 2)} Base Character Quantity\n"
+                      f"How many copies of {base_name} are required? (1-{EVO_MAX_BASE_QTY})")
     return E_QTY
 
 
@@ -1252,7 +1290,7 @@ async def addevo_qty(update, context):
         await _reply(msg, f"❌ Send a whole number from 1 to {EVO_MAX_BASE_QTY}.")
         return E_QTY
     context.user_data["evo_qty"] = n
-    await _reply(msg, "3️⃣ Evolution Character Name:")
+    await _reply(msg, f"{_stepno(context, 3)} Evolution Character Name:")
     return E_NAME
 
 
@@ -1299,15 +1337,19 @@ async def addevo_worth(update, context):
         await _reply(msg, "❌ Worth must be a whole number (0 or more).")
         return E_WORTH
     context.user_data["evo_worth"] = n
-    await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (minimum {EVO_MIN_STONES}):")
+    if context.user_data.get("evo_kind") == "weapon":
+        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (0 or more; the weapon is needed too):")
+    else:
+        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (minimum {EVO_MIN_STONES}):")
     return E_STONES
 
 
 async def addevo_stones(update, context):
     msg = update.effective_message
     n = _parse_int(msg.text)
-    if n is None or n < EVO_MIN_STONES:
-        await _reply(msg, f"❌ Evolution Stones must be a number of at least {EVO_MIN_STONES}.")
+    min_stones = 0 if context.user_data.get("evo_kind") == "weapon" else EVO_MIN_STONES
+    if n is None or n < min_stones:
+        await _reply(msg, f"❌ Evolution Stones must be a number of at least {min_stones}.")
         return E_STONES
     if n > EVO_MAX_STONES:
         await _reply(msg, f"❌ Evolution Stones cannot be more than {EVO_MAX_STONES}.")
@@ -1352,9 +1394,12 @@ async def addevo_photo(update, context):
         return E_PHOTO
     d = dict(context.user_data)
     pair = d.get("evo_kind") == "pair"
-    required = [k for k in _EVO_KEYS if k not in ("evo_base_name", "evo_second", "evo_second_name", "evo_qty2", "evo_kind", "evo_phase")]
+    with_weapon = d.get("evo_kind") == "weapon"
+    required = [k for k in _EVO_KEYS if k not in ("evo_base_name", "evo_second", "evo_second_name", "evo_qty2", "evo_kind", "evo_phase", "evo_weapon")]
     if pair:
         required += ["evo_second", "evo_qty2"]
+    if with_weapon:
+        required += ["evo_weapon"]
     if not all(k in d for k in required):
         _clear_evo(context)
         await _reply(msg, "❌ The setup expired. Start again with /addevo.")
@@ -1368,8 +1413,14 @@ async def addevo_photo(update, context):
     try:
         res = await asyncio.to_thread(
             create_evolution_sync, d["evo_base"], d["evo_qty"], d["evo_name"], d["evo_anime"], d["evo_rarity"],
-            d["evo_worth"], d["evo_stones"], d["evo_berries"], d["evo_code"], photo_id, user.id,
+            d["evo_worth"], max(d["evo_stones"], EVO_MIN_STONES) if with_weapon else d["evo_stones"],     # the weapon version may need fewer stones: set below
+            d["evo_berries"], d["evo_code"], photo_id, user.id,
             d.get("evo_second") if pair else None, d.get("evo_qty2") if pair else None)
+        if res["ok"] and with_weapon:                                      # ⚔️ With Weapon: fill the weapon slot and the real stones
+            attach = await asyncio.to_thread(set_recipe_weapon_sync, d["evo_code"], d["evo_weapon"], d["evo_stones"])
+            if not attach["ok"]:
+                res = {"ok": False, "error": attach["error"] + "\nThe evolution was created without the weapon. "
+                                             "Add it with 🧬 Evolution Weapon in the Weapon Manager."}
     except Exception as e:
         logger.error("addevo failed: %s", e)
         _clear_evo(context)
@@ -1384,6 +1435,9 @@ async def addevo_photo(update, context):
     base, evo = _row(d["evo_base"]), _row(d["evo_code"])
     second = _row(d["evo_second"]) if pair else None
     lines = f"{d['evo_qty']}× {_char_label(base)}\n" + (f"+ {d['evo_qty2']}× {_char_label(second)}\n" if pair else "")
+    weapon = await asyncio.to_thread(get_weapon, d["evo_weapon"]) if with_weapon else None
+    if weapon:
+        lines += f"+ 1× ⚔️ {_weapon_label(weapon)}\n"
     await _reply(msg, "✅ Evolution created!\n\n" + f"{fusion_symbol(recipe)} " + lines + f"➡️ {_char_label(evo)}\n"
                       f"💎 {d['evo_stones']} Stones • 🪙 {d['evo_berries']:,} Berries")
     try:
@@ -1399,7 +1453,8 @@ async def addevo_photo(update, context):
                 f"💰 Worth: {d['evo_worth']}\n"
                 f"📷 Photo: Added\n"
                 f"🧬 Recipe: {fusion_symbol(recipe)} {_ingredient_text(recipe)} ➡️ {evo[1]} [{evo[0]}]\n"
-                f"💎 Evolution Stones: {d['evo_stones']}\n"
+                + (f"⚔️ Weapon: {_weapon_label(weapon)}\n" if weapon else "")
+                + f"💎 Evolution Stones: {d['evo_stones']}\n"
                 f"🪙 Berries: {d['evo_berries']:,}\n"
                 f"👤 By: {_by(user)}", actor_id=user.id)
         if _deps["mark_success"]:
@@ -1782,6 +1837,8 @@ def _stepno(context, n):
     """Step label. Same Card keeps the original 1️⃣..🔟; Different Card has two extra steps and uses 'Step N/12:'."""
     if context.user_data.get("evo_kind") == "pair":
         return f"Step {n + 2}/12:"
+    if context.user_data.get("evo_kind") == "weapon":
+        return f"Step {n + 1}/11:"
     return _EMOJI[n]
 
 
@@ -1791,13 +1848,16 @@ def _parse_kind(text):
         return "same"
     if t in ("2", "d", "diff", "different", "two", "different card"):
         return "pair"
+    if t in ("3", "w", "weapon", "with weapon"):
+        return "weapon"
     return None
 
 
 def _type_keyboard(uid):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     return InlineKeyboardMarkup([[InlineKeyboardButton("🌟 Same Card", callback_data=f"evoadd:{int(uid)}:same"),
-                                  InlineKeyboardButton("💫 Different Card", callback_data=f"evoadd:{int(uid)}:diff")]])
+                                  InlineKeyboardButton("💫 Different Card", callback_data=f"evoadd:{int(uid)}:diff")],
+                                 [InlineKeyboardButton("⚔️ With Weapon", callback_data=f"evoadd:{int(uid)}:weapon")]])
 
 
 def _begin_kind(context, kind):
@@ -1816,7 +1876,7 @@ async def addevo_type_text(update, context):
         return -1
     kind = _parse_kind(msg.text)
     if kind is None:
-        await _reply(msg, "❌ Choose Same Card or Different Card (or send 1 or 2).", reply_markup=_type_keyboard(update.effective_user.id))
+        await _reply(msg, "❌ Choose Same Card, Different Card or With Weapon (or send 1, 2 or 3).", reply_markup=_type_keyboard(update.effective_user.id))
         return E_TYPE
     text, state = _begin_kind(context, kind)
     await _reply(msg, text)
@@ -1843,10 +1903,10 @@ async def addevo_type_callback(update, context):
     if context.user_data.get("evo_phase") != "type":
         await q.answer("⚠️ This setup is no longer active. Use /addevo.", show_alert=True)
         return None
-    kind = "pair" if choice == "diff" else "same"
+    kind = "pair" if choice == "diff" else "weapon" if choice == "weapon" else "same"
     text, state = _begin_kind(context, kind)
     await q.answer()
-    title = "💫 Different Card" if kind == "pair" else "🌟 Same Card"
+    title = "💫 Different Card" if kind == "pair" else "⚔️ With Weapon" if kind == "weapon" else "🌟 Same Card"
     try:
         await q.edit_message_text(f"{title}\n\n{text}")           # the buttons disappear, so a choice cannot be tapped twice
     except Exception:
@@ -2154,7 +2214,7 @@ def _register_evolution(app):
     text = filters.TEXT & ~filters.COMMAND
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addevo", addevo_start),
-                      CallbackQueryHandler(addevo_type_callback, pattern=r"^evoadd:\d+:(same|diff)$")],
+                      CallbackQueryHandler(addevo_type_callback, pattern=r"^evoadd:\d+:(same|diff|weapon)$")],
         states={
             E_TYPE: [MessageHandler(text, addevo_type_text)],
             E_ACODE: [MessageHandler(text, addevo_acode)],
@@ -2162,6 +2222,7 @@ def _register_evolution(app):
             E_BCODE: [MessageHandler(text, addevo_bcode)],
             E_BQTY: [MessageHandler(text, addevo_bqty)],
             E_BASE: [MessageHandler(text, addevo_base)],
+            E_WEAPON: [MessageHandler(text, addevo_weapon)],
             E_QTY: [MessageHandler(text, addevo_qty)],
             E_NAME: [MessageHandler(text, addevo_name)],
             E_ANIME: [MessageHandler(text, addevo_anime)],
@@ -2897,6 +2958,9 @@ def shop_items_sync():
 
 
 def shop_buy_sync(user_id, code, receipt_key=None):
+    closed = shop_closed_text()
+    if closed:
+        return {"status": "closed", "text": closed}
     w = get_weapon(code)
     if not w or not w.get("shop_enabled") or int(w.get("shop_price") or 0) <= 0:
         return {"status": "notforsale"}
@@ -2995,6 +3059,10 @@ async def weaponshop_command(update, context):
     user, msg = update.effective_user, update.effective_message
     if user is None or msg is None or user.is_bot:
         return
+    closed = await asyncio.to_thread(shop_closed_text)
+    if closed:
+        await _reply(msg, closed)
+        return
     page = await asyncio.to_thread(_shop_page_sync, user.id, 0)
     if page is None:
         await _reply(msg, "⚔️ The weapon shop is empty right now. Check back later, weapons also drop in groups!")
@@ -3018,6 +3086,10 @@ async def wshop_callback(update, context):
         return
     if q.from_user.id != owner:
         await q.answer("❌ This is not your weapon shop. Use /weaponshop.", show_alert=True)
+        return
+    closed = await asyncio.to_thread(shop_closed_text)
+    if closed:                                            # shop hours: nothing can be browsed or bought while it is closed
+        await q.answer(closed[:190], show_alert=True)
         return
 
     if action == "open":                                  # button under /shop
@@ -3369,6 +3441,110 @@ async def editweapon_command(update, context):
     _success(update)
 
 
+# ---------------------------------------------------------------- /editweapon <code or name>: step by step with ⏭ Skip (like /editcharacter)
+EW_INPUT = 260
+_EW_STEPS = ("name", "anime", "type", "rarity", "price", "photo")
+_EW_LABELS = {"name": "Name", "anime": "Anime", "type": "Type", "rarity": "Rarity", "price": "Shop price", "photo": "Photo"}
+EDIT_GUIDED_USAGE = ("✏️ Edit a weapon step by step:\n/editweapon <weapon code or name>\n\nOr change one thing at once:\n"
+                     "/editweapon <code> name <new name>\n/editweapon <code> anime <anime>\n/editweapon <code> rarity <rarity>\n"
+                     "/editweapon <code> price <berries>  (0 = remove from shop)\n/editweapon <code> photo  (reply to a photo)")
+
+
+def _ew_skip_keyboard():
+    kb = _skip_markup()                                   # the bot's own ⏭ Skip keyboard (same one /editcharacter shows)
+    if kb is not None:
+        return kb
+    from telegram import ReplyKeyboardMarkup
+    return ReplyKeyboardMarkup([["⏭ Skip"]], resize_keyboard=True, one_time_keyboard=True)
+
+
+def _ew_is_skip(text):
+    return str(text or "").strip().casefold() in ("⏭ skip", "skip", "/skip") or bool(_is_skip(text))
+
+
+def _ew_current(w, step):
+    return {"name": w["name"], "anime": w.get("anime") or "not set", "type": w.get("type") or "not set", "rarity": w.get("rarity") or "not set",
+            "price": (f"{int(w['shop_price']):,} {BERRY}" if int(w.get("shop_price") or 0) else "not in the shop"),
+            "photo": "set" if w.get("photo") else "not set"}[step]
+
+
+def _ew_prompt(w, n):
+    step = _EW_STEPS[n]
+    return (f"Step {n + 1} of {len(_EW_STEPS)}: {_EW_LABELS[step]}\nNow: {_ew_current(w, step)}\n{_wm_prompt(step, w)}\n"
+            "Tap ⏭ Skip to keep it, or send /cancel to stop.")
+
+
+async def editweapon_start(update, context):
+    user, msg = update.effective_user, update.effective_message
+    if user is None or msg is None:
+        return -1
+    if not _is_staff(user.id):
+        await _reply(msg, NOT_ALLOWED_TEXT)
+        return -1
+    args = list(getattr(context, "args", None) or [])
+    if args and norm_code(args[0]) and len(args) >= 2:          # the old one-line form: /editweapon <code> <field> <value>
+        await editweapon_command(update, context)
+        return -1
+    if not args:
+        await _reply(msg, EDIT_GUIDED_USAGE)
+        return -1
+    w, err = await asyncio.to_thread(find_weapon, " ".join(args))
+    if err:
+        await _reply(msg, err)
+        return -1
+    context.user_data["ew"] = {"code": w["_id"], "n": 0, "changes": {}}
+    await _reply(msg, f"✏️ Editing {_weapon_label(w)}\n\n" + _ew_prompt(w, 0), reply_markup=_ew_skip_keyboard())
+    return EW_INPUT
+
+
+async def editweapon_step(update, context):
+    msg, user = update.effective_message, update.effective_user
+    st = context.user_data.get("ew")
+    if msg is None or user is None or not _is_staff(user.id):
+        return -1
+    if not st:
+        await _reply(msg, "⌛ That edit expired. Send /editweapon again.")
+        return -1
+    from telegram import ReplyKeyboardRemove
+    w = await asyncio.to_thread(get_weapon, st["code"])
+    if w is None:
+        context.user_data.pop("ew", None)
+        await _reply(msg, "❌ That weapon no longer exists.", reply_markup=ReplyKeyboardRemove())
+        return -1
+    step = _EW_STEPS[st["n"]]
+    if not _ew_is_skip(msg.text):
+        value, err = await _wm_value(step, msg, st["code"])
+        if err:
+            await _reply(msg, err + "\nTry again, tap ⏭ Skip, or send /cancel.", reply_markup=_ew_skip_keyboard())
+            return EW_INPUT
+        st["changes"].update({"shop_price": value, "shop_enabled": value > 0} if step == "price" else {step: value})
+    st["n"] += 1
+    if st["n"] < len(_EW_STEPS):
+        await _reply(msg, _ew_prompt(w, st["n"]), reply_markup=_ew_skip_keyboard())
+        return EW_INPUT
+    context.user_data.pop("ew", None)
+    if not st["changes"]:
+        await _reply(msg, "ℹ️ Nothing was changed.", reply_markup=ReplyKeyboardRemove())
+        return -1
+    await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": st["code"]}, {"$set": st["changes"]})
+    w = await asyncio.to_thread(get_weapon, st["code"])
+    changed = ", ".join(sorted({"shop_price": "price", "shop_enabled": "price"}.get(k, k) for k in st["changes"]))
+    await _reply(msg, "✅ Weapon updated.\n\n" + _wm_weapon_text(w), reply_markup=ReplyKeyboardRemove())
+    await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {changed}\n👤 By: {_by(user)}", user)
+    _success(update)
+    return -1
+
+
+async def editweapon_cancel(update, context):
+    context.user_data.pop("ew", None)
+    from telegram import ReplyKeyboardRemove
+    if update.effective_message is not None:
+        await _reply(update.effective_message, "❌ Cancelled. Nothing was changed.", reply_markup=ReplyKeyboardRemove())
+    if _deps.get("cancel_all"):
+        await _deps["cancel_all"](update, context)
+    return -1
+
+
 def _recipes_using_weapon(code):
     try:
         return list(_col(mongo_db.FUSION_EVOLUTION_RECIPES).find({"weapon_code": code}))
@@ -3490,37 +3666,173 @@ async def evoweapon_command(update, context):
 
 
 # ==========================================================================
-# ⚔️ WEAPON MANAGER (Owner: /help → Weapons): create, edit, delete, discount and evolution weapon, all with buttons.
-# Callback data: wm:<action>[:<arg>[:<arg2>]]  (far below 64 bytes)
-#   screens (edited in place):  list:<page>  w:<code>:<page>  dl|dy:<code>:<page>  dc:<page>  dw|dr|dd:<code>:<page>  sv  cx
-#   typed steps (a new message asks, /cancel stops):  new  evo  e:<code>:<field>  dx|dcr:<code>:<page>  dp:<code>:<lo>-<hi>:<page>
+# ⚔️ WEAPON MANAGER (Owner: /help → Weapons): create, edit, delete, discount, shop hours, lists and evolution weapon, all with buttons.
+# Callback data: wm:<action>[:<arg>...]  (always far below 64 bytes)
+#   screens (edited in place):  list:<page>  w:<code>:<page>  dl|dy:<code>:<page>  sl|pl|dc:<page>  st:<code>:<page>:<w|s>  sv  cx
+#     discount: dw:<code>:<page>  dt|dm|dr|da|ad|dd:<code>:<page>:<s|d>  az:<code>:<page>:<s|d>:<day>
+#     shop hours: sh|sho|shc|sha|shd:<h|m>  shm:<h|m>:<m|a>  shz:<h|m>:<day>
+#   typed steps (a new message asks, /cancel stops):  new  evo  e:<code>:<field>  dx|dcr:<code>:<page>:<s|d>  dp:<code>:<lo>-<hi>:<page>:<s|d>
+#     at:<code>:<page>:<s|d>:<st|en|pc|rg>  sht:<h|m>:<o|c>
 # ==========================================================================
 WM_INPUT = 250
 WM_NEW_STEPS = ("name", "anime", "type", "rarity", "price", "code", "photo")
 WM_DISC_MAX = 90                 # biggest discount in %
 WM_DISC_MAX_MIN = 43200          # longest sale: 30 days (in minutes)
 _WM_TEXT_KEYS = ("wm_edit", "wm_draft")
+_DAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+# discount target -> (percent field, end-time field, automatic-schedule field, label)
+_DISC = {"s": ("discount_pct", "discount_until", "auto_shop", "🏪 Shop"), "d": ("discount_drop_pct", "discount_drop_until", "auto_drop", "⚔️ Drop")}
 
 
 def _wm_back(uid):
     return f"help:{uid}:owner:weapons"
 
 
-def _discount_of(w, now=None):
-    """(percent, ends_at) of a discount that is running now, else (0, None). A discount is optional and set per weapon."""
-    pct = int(w.get("discount_pct") or 0)
-    if pct <= 0:
+# ---------------------------------------------------------------- 12-hour clock and daily windows
+def _parse_clock(text):
+    """'6:30 PM' / '6:30pm' / '6 pm' / '18:30' -> '18:30' (24-hour, stored), or None. A bare number like '6' is not accepted."""
+    s = str(text or "").strip().lower().replace(".", "")
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(am|pm|a|p)?", s)
+    if not m:
+        return None
+    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), m.group(3)
+    if mi > 59:
+        return None
+    if ap:
+        if not 1 <= h <= 12:
+            return None
+        h = h % 12 + (12 if ap.startswith("p") else 0)
+    elif m.group(2) is None or h > 23:
+        return None
+    return f"{h:02d}:{mi:02d}"
+
+
+def _fmt12(hhmm):
+    """'18:30' -> '6:30 PM'."""
+    try:
+        h, m = (int(x) for x in str(hhmm).split(":"))
+    except ValueError:
+        return str(hhmm)
+    return f"{(h % 12) or 12}:{m:02d} {'AM' if h < 12 else 'PM'}"
+
+
+def _merge_clock_tokens(tokens):
+    """['6:30', 'PM', '8', 'pm'] -> ['6:30 PM', '8 pm'] (so /dropconfig fixed 6:30 PM 8:00 PM works)."""
+    out = []
+    for t in tokens:
+        if out and t.lower().replace(".", "") in ("am", "pm") and not re.search(r"[ap]m?$", out[-1].lower()):
+            out[-1] += " " + t
+        else:
+            out.append(t)
+    return out
+
+
+def _in_window(start, end, days, now_ist):
+    """A daily window (start/end are 'HH:MM', end before start = overnight, days = weekday numbers 0=Mon..6=Sun, empty = every day).
+    Returns (inside, current_start, current_end, next_start) as IST datetimes (None where it does not apply)."""
+    days = set(days or range(7))
+    sh, sm = (int(x) for x in start.split(":"))
+    eh, em = (int(x) for x in end.split(":"))
+    length = ((eh * 60 + em) - (sh * 60 + sm)) % 1440 or 1440
+    cur_start = cur_end = next_start = None
+    for off in range(-1, 9):
+        begin = (now_ist + timedelta(days=off)).replace(hour=sh, minute=sm, second=0, microsecond=0)
+        if begin.weekday() not in days:
+            continue
+        finish = begin + timedelta(minutes=length)
+        if begin <= now_ist < finish:
+            if cur_end is None or finish > cur_end:
+                cur_start, cur_end = begin, finish
+        elif begin > now_ist and (next_start is None or begin < next_start):
+            next_start = begin
+    return cur_end is not None, cur_start, cur_end, next_start
+
+
+def _when_short(dt):
+    """'6:30 PM' for today, 'Tue 6:30 PM' for another day (IST)."""
+    d = _aware(dt).astimezone(IST)
+    clock = f"{(d.hour % 12) or 12}:{d.minute:02d} {'AM' if d.hour < 12 else 'PM'}"
+    return clock if d.date() == _utcnow().astimezone(IST).date() else f"{_DAY_NAMES[d.weekday()]} {clock}"
+
+
+def _days_text(days):
+    days = sorted(set(days or []))
+    if not days or len(days) == 7:
+        return "every day"
+    return ", ".join(_DAY_NAMES[d] for d in days)
+
+
+# ---------------------------------------------------------------- shop hours (settings doc "shop"; default = always open)
+DEFAULT_SHOP = {"mode": "manual", "manual_open": True, "open_at": None, "close_at": None, "days": [], "announce": False,
+                "override": None, "override_until": None, "last_state": None}
+
+
+def get_shop_settings():
+    doc = _col(SETTINGS_COL).find_one({"_id": "shop"}) or {}
+    return {**DEFAULT_SHOP, **doc}
+
+
+def set_shop_settings(**fields):
+    _col(SETTINGS_COL).update_one({"_id": "shop"}, {"$set": fields}, upsert=True)
+
+
+def shop_status(s=None):
+    """{'open': bool, 'opens_at': IST datetime|None, 'closes_at': IST datetime|None, 'schedule': bool}."""
+    s = s or get_shop_settings()
+    if s["mode"] != "auto" or not (s.get("open_at") and s.get("close_at")):
+        return {"open": bool(s["manual_open"]) if s["mode"] == "manual" else True, "opens_at": None, "closes_at": None, "schedule": False}
+    now = _utcnow()
+    inside, _start, end, nxt = _in_window(s["open_at"], s["close_at"], s.get("days"), now.astimezone(IST))
+    is_open, until = inside, _aware(s.get("override_until"))
+    if s.get("override") in ("open", "closed") and until and until > now:      # Open Now / Close Now until the next scheduled change
+        is_open = s["override"] == "open"
+    return {"open": is_open, "opens_at": None if is_open else nxt, "closes_at": end if (is_open and inside) else None, "schedule": True}
+
+
+def shop_closed_text():
+    """None while the shop is open, else the text players see."""
+    st = shop_status()
+    if st["open"]:
+        return None
+    if st["opens_at"]:
+        mins = max(1, int((st["opens_at"] - _utcnow().astimezone(IST)).total_seconds() // 60))
+        return f"🔴 The weapon shop is closed. It opens at {_when_short(st['opens_at'])} IST (in {fmt_minutes(mins)})."
+    return "🔴 The weapon shop is closed. It stays closed until the Owner opens it."
+
+
+# ---------------------------------------------------------------- discounts: separate for the shop (s) and for drops (d), manual or automatic
+def _auto_discount_now(w, t, auto, now):
+    if not (auto and auto.get("start") and auto.get("end")):
         return 0, None
-    until = w.get("discount_until")
-    if until is not None and _aware(until) <= (now or _utcnow()):
+    inside, begin, end, _n = _in_window(auto["start"], auto["end"], auto.get("days"), now.astimezone(IST))
+    if not inside:
         return 0, None
-    return pct, until
+    if auto.get("pct"):
+        pct = int(auto["pct"])
+    elif auto.get("lo") and auto.get("hi"):                # one percent per day, the same for everyone
+        pct = random.Random(f"{w['_id']}:{t}:{begin.date()}").randint(int(auto["lo"]), int(auto["hi"]))
+    else:
+        return 0, None
+    return pct, end
+
+
+def _discount_of(w, t="s", now=None):
+    """(percent, ends_at) of the discount running now for target t ('s' shop, 'd' drops), else (0, None).
+    A manual discount wins; otherwise the automatic schedule applies. A discount is optional and set per weapon."""
+    pk, uk, ak, _label = _DISC[t]
+    now = now or _utcnow()
+    pct = int(w.get(pk) or 0)
+    if pct > 0:
+        until = w.get(uk)
+        if until is None or _aware(until) > now:
+            return pct, until
+    return _auto_discount_now(w, t, w.get(ak), now)
 
 
 def _shop_price(w):
-    """The price the shop charges right now: the normal shop price, or the sale price while a discount runs."""
+    """The price the shop charges right now: the normal shop price, or the sale price while a shop discount runs."""
     base = int(w.get("shop_price") or 0)
-    pct, _until = _discount_of(w)
+    pct, _until = _discount_of(w, "s")
     return max(1, base * (100 - pct) // 100) if pct and base > 0 else base
 
 
@@ -3529,7 +3841,7 @@ def _when_text(dt):
 
 
 def _shop_price_lines(w):
-    base, pct, until = int(w["shop_price"]), *_discount_of(w)
+    base, (pct, until) = int(w["shop_price"]), _discount_of(w, "s")
     if not pct:
         return f"🪙 Price: {base:,} {BERRY}"
     return (f"🪙 Price: {_shop_price(w):,} {BERRY} (was {base:,}, -{pct}%)\n"
@@ -3551,14 +3863,38 @@ def _wm_minutes(text):
     return total if 1 <= total <= WM_DISC_MAX_MIN else None
 
 
+def _auto_text(auto):
+    if not (auto and auto.get("start") and auto.get("end")):
+        return "not set"
+    pct = f"-{auto['pct']}%" if auto.get("pct") else (f"random -{auto['lo']}% to -{auto['hi']}% (one per day)" if auto.get("lo") else "no percent yet")
+    return f"{_fmt12(auto['start'])} to {_fmt12(auto['end'])} IST, {_days_text(auto.get('days'))}, {pct}"
+
+
+def _disc_status_lines(w, t):
+    pk, uk, ak, label = _DISC[t]
+    pct, until = _discount_of(w, t)
+    man = int(w.get(pk) or 0)
+    man_ok = man > 0 and (w.get(uk) is None or _aware(w.get(uk)) > _utcnow())
+    lines = [f"{label}: " + (f"-{pct}% now" + (f" (ends {_when_text(until)})" if until else "") if pct else "no discount now"),
+             "🖐 Manual: " + (f"-{man}%" + (f" until {_when_text(w[uk])}" if w.get(uk) else " (no end date)") if man_ok else "none"),
+             "🕒 Automatic: " + _auto_text(w.get(ak))]
+    return lines
+
+
 def _wm_weapon_text(w):
     price = int(w.get("shop_price") or 0)
+    if price and w.get("shop_enabled"):
+        shop = f"🛒 Shop price: {price:,} {BERRY}"
+    elif price:
+        shop = f"🛒 Not in the shop (price kept: {price:,} {BERRY})"
+    else:
+        shop = "🛒 Not in the shop"
     lines = [f"⚔️ {_weapon_label(w)}", "", f"📺 Anime: {w.get('anime') or 'Not set'}", f"🗡 Type: {w.get('type') or 'Not set'}",
-             _rarity_text(w.get("rarity")),
-             "🛒 Shop price: " + (f"{price:,} {BERRY}" if price and w.get("shop_enabled") else "not in the shop")]
-    pct, until = _discount_of(w)
-    if pct and price:
-        lines.append(f"💸 Discount: -{pct}% → {_shop_price(w):,} {BERRY}" + (f" (ends {_when_text(until)})" if until else ""))
+             _rarity_text(w.get("rarity")), shop]
+    for t in ("s", "d"):
+        pct, until = _discount_of(w, t)
+        if pct:
+            lines.append(f"💸 {_DISC[t][3]} discount: -{pct}%" + (f" (ends {_when_text(until)})" if until else ""))
     lines.append("🖼 Photo: " + ("set" if w.get("photo") else "not set"))
     return "\n".join(lines)
 
@@ -3573,10 +3909,11 @@ def _wm_nav(kind, page, pages):
     return [("◀️", f"wm:{kind}:{(page - 1) % pages}"), (f"{page + 1}/{pages}", f"wm:{kind}:{page}"), ("▶️", f"wm:{kind}:{(page + 1) % pages}")]
 
 
+# ---------------------------------------------------------------- weapon manager screens
 def _wm_list_view(page, uid):
     page, pages, chunk = _wm_pages(all_weapons(), page)
     text = "🛠 WEAPON MANAGER\n\n" + ("Tap a weapon to edit or delete it." if chunk else "No weapons yet. Go back and tap ➕ Create Weapon.")
-    rows = [[("🧬 Evolution Weapon", "wm:evo")]]
+    rows = [[("🧬 Evolution Weapon", "wm:evo")], [("🏪 Shop Hours", "wm:sh:m"), ("ℹ️ Buttons", "wdp:btns:m:0")]]
     rows += [[(f"⚔️ {w['name'][:24]} [{w['_id']}]", f"wm:w:{w['_id']}:{page}")] for w in chunk]
     if pages > 1:
         rows.append(_wm_nav("list", page, pages))
@@ -3589,10 +3926,12 @@ def _wm_weapon_view(code, page):
     if not w:
         return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:list:{page}")]])
     e = f"wm:e:{code}:"
+    listed = bool(w.get("shop_enabled")) and int(w.get("shop_price") or 0) > 0
     return _wm_weapon_text(w), _kb([[("✏️ Name", e + "name"), ("✏️ Anime", e + "anime")],
                                    [("✏️ Type", e + "type"), ("✏️ Rarity", e + "rarity")],
                                    [("✏️ Shop price", e + "price"), ("🖼 Photo", e + "photo")],
-                                   [("🗑 Delete", f"wm:dl:{code}:{page}")],
+                                   [("🛒 In shop ✅" if listed else "🛒 Not in shop ⬜", f"wm:st:{code}:{page}:w")],
+                                   [("🎁 Drop settings", f"wdp:wpage:{code}:0"), ("🗑 Delete", f"wm:dl:{code}:{page}")],
                                    [("⬅️ Back", f"wm:list:{page}")]])
 
 
@@ -3610,65 +3949,256 @@ def _wm_delete_view(code, page):
         [[("🗑 Remove", f"wm:dy:{code}:{page}"), ("↩️ Cancel", f"wm:w:{code}:{page}")]])
 
 
-def _wm_disc_list_view(page, uid):
-    page, pages, chunk = _wm_pages(shop_items_sync(), page)
-    text = ("💸 DISCOUNT\n\nA discount is optional and set for each weapon. Weapons without one sell at their normal price.\n"
-            "Tap a weapon to put it on sale." if chunk else
-            "💸 DISCOUNT\n\nNo weapon is in the shop yet. Give a weapon a shop price in 🛠 Weapon Manager first.")
+def _wm_toggle_shop_sync(code):
+    """Lists / unlists a weapon in the shop (the price is kept). Returns (weapon, error|None)."""
+    w = get_weapon(code)
+    if not w:
+        return None, "That weapon no longer exists."
+    if int(w.get("shop_price") or 0) <= 0:
+        return w, "Give it a shop price first (✏️ Shop price)."
+    _col(WEAPONS_COL).update_one({"_id": code}, {"$set": {"shop_enabled": not w.get("shop_enabled")}})
+    return get_weapon(code), None
+
+
+def _wm_shop_list_view(page, uid):
+    items = [w for w in all_weapons() if int(w.get("shop_price") or 0) > 0]
+    page, pages, chunk = _wm_pages(items, page)
+    st = shop_status()
+    text = ("🛒 SHOP LIST\n\n" + ("🟢 The shop is open." if st["open"] else "🔴 The shop is closed.") + "\n✅ in the shop   ⬜ not in the shop\n"
+            + ("Tap a weapon to list or unlist it. Its price is kept." if chunk else "No weapon has a shop price yet. Set one with ✏️ Shop price in 🛠 Weapon Manager."))
     rows = []
     for w in chunk:
-        pct, _u = _discount_of(w)
-        rows.append([(f"⚔️ {w['name'][:20]} • {int(w['shop_price']):,}" + (f" • -{pct}%" if pct else ""), f"wm:dw:{w['_id']}:{page}")])
+        pct, _u = _discount_of(w, "s")
+        rows.append([(f"{'✅' if w.get('shop_enabled') else '⬜'} {w['name'][:18]} • {int(w['shop_price']):,}" + (f" • -{pct}%" if pct else ""),
+                      f"wm:st:{w['_id']}:{page}:s")])
+    if pages > 1:
+        rows.append(_wm_nav("sl", page, pages))
+    rows.append([("« Back", _wm_back(uid))])
+    return text, _kb(rows)
+
+
+def _wm_drop_list_view(page, uid):
+    page, pages, chunk = _wm_pages(all_weapons(), page)
+    text = ("🎁 DROP LIST\n\n✅ in the drop pool   ⬜ not in the pool   ⚠️ in the pool but cannot drop yet\n"
+            + ("Tap a weapon to set its stock, drop price and pool." if chunk else "No weapons yet."))
+    rows = []
+    for w in chunk:
+        on, stock, price = bool(w.get("drop_enabled")), int(w.get("drop_stock") or 0), int(w.get("drop_price") or 0)
+        mark = ("⚠️" if (stock <= 0 or price <= 0) else "✅") if on else "⬜"
+        pct, _u = _discount_of(w, "d")
+        info = f"{_wd_text(w, 'stock') or 0} • " + (_wd_text(w, 'price', True) or "no price") + (f" • -{pct}%" if pct else "")
+        rows.append([(f"{mark} {w['name'][:16]} • {info}", f"wdp:wpage:{w['_id']}:{page}")])
+    if pages > 1:
+        rows.append(_wm_nav("pl", page, pages))
+    rows.append([("« Back", _wm_back(uid))])
+    return text, _kb(rows)
+
+
+# ---------------------------------------------------------------- discount screens
+def _wm_disc_list_view(page, uid):
+    page, pages, chunk = _wm_pages(all_weapons(), page)
+    text = ("💸 DISCOUNT\n\nA discount is optional and set for each weapon, separately for the shop and for drops. "
+            "Weapons without one sell at their normal price.\n" + ("Tap a weapon." if chunk else "No weapons yet."))
+    rows = []
+    for w in chunk:
+        bits = [f"{_DISC[t][3][:1]} -{p}%" for t in ("s", "d") for p in [_discount_of(w, t)[0]] if p]
+        rows.append([(f"⚔️ {w['name'][:20]}" + (" • " + " ".join(bits) if bits else ""), f"wm:dw:{w['_id']}:{page}")])
     if pages > 1:
         rows.append(_wm_nav("dc", page, pages))
     rows.append([("« Back", _wm_back(uid))])
     return text, _kb(rows)
 
 
-def _wm_disc_view(code, page):
+def _wm_disc_hub_view(code, page):
     w = get_weapon(code)
     back = [("⬅️ Back", f"wm:dc:{page}")]
     if not w:
         return "ℹ️ That weapon no longer exists.", _kb([back])
     base = int(w.get("shop_price") or 0)
-    pct, until = _discount_of(w)
-    lines = [f"💸 DISCOUNT · {_weapon_label(w)}", "", f"🛒 Normal price: {base:,} {BERRY}" if base > 0 else "🛒 Not in the shop (no shop price)"]
-    if pct:
-        lines += [f"🏷 Discount: -{pct}%", f"🪙 Sale price: {_shop_price(w):,} {BERRY}",
-                  "⏳ Ends: " + (_when_text(until) if until else "no end date")]
-    else:
-        lines.append("No discount now. This weapon sells at its normal price until you set one.")
-    rows = [[("🎲 Random", f"wm:dr:{code}:{page}"), ("✏️ Customise", f"wm:dx:{code}:{page}")]]
-    if pct:
-        rows.append([("🗑 Remove Discount", f"wm:dd:{code}:{page}")])
+    text = "\n".join([f"💸 DISCOUNT · {_weapon_label(w)}", "", f"🛒 Shop price: {base:,} {BERRY}" if base else "🛒 Not in the shop (no shop price)",
+                      f"🎁 Drop price: {_wd_text(w, 'price', True) or 'not set'}", "",
+                      *_disc_status_lines(w, "s")[:1], *_disc_status_lines(w, "d")[:1], "", "Pick where the discount applies."])
+    return text, _kb([[("🏪 Shop", f"wm:dt:{code}:{page}:s"), ("⚔️ Drop", f"wm:dt:{code}:{page}:d")], back])
+
+
+def _wm_disc_target_view(code, page, t):
+    w = get_weapon(code)
+    back = [("⬅️ Back", f"wm:dw:{code}:{page}")]
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
+    pk, uk, ak, label = _DISC[t]
+    text = "\n".join([f"💸 {label} discount · {_weapon_label(w)}", "", *_disc_status_lines(w, t), "",
+                      "🖐 Manual: set a percent now, then how long it lasts.", "🕒 Automatic: a sale that switches on and off by itself every day."])
+    rows = [[("🖐 Manual", f"wm:dm:{code}:{page}:{t}"), ("🕒 Automatic", f"wm:da:{code}:{page}:{t}")]]
+    if int(w.get(pk) or 0) or w.get(ak):
+        rows.append([("🗑 Remove Discount", f"wm:dd:{code}:{page}:{t}")])
     rows.append(back)
-    return "\n".join(lines), _kb(rows)
+    return text, _kb(rows)
 
 
-def _wm_random_view(code, page):
+def _wm_disc_manual_view(code, page, t):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
+    return (f"🖐 Manual {_DISC[t][3]} discount · {_weapon_label(w)}\n\n🎲 Random: the bot rolls one percent inside a range.\n"
+            f"✏️ Customise: you type the exact percent (1-{WM_DISC_MAX}).\nThen you choose how long it lasts."), _kb(
+        [[("🎲 Random", f"wm:dr:{code}:{page}:{t}"), ("✏️ Customise", f"wm:dx:{code}:{page}:{t}")],
+         [("⬅️ Back", f"wm:dt:{code}:{page}:{t}")]])
+
+
+def _wm_random_view(code, page, t):
     w = get_weapon(code)
     if not w:
         return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
     d = f"wm:dp:{code}:"
-    return (f"🎲 RANDOM DISCOUNT · {_weapon_label(w)}\n\nPick a range. The bot rolls one percent inside it (once) and then asks how long the sale lasts.\n"
+    return (f"🎲 Random {_DISC[t][3]} discount · {_weapon_label(w)}\n\nPick a range. The bot rolls one percent inside it (once) and then asks how long the sale lasts.\n"
             "Or tap ✏️ Custom range to type your own, like 20-60."), _kb([
-        [("10-30%", f"{d}10-30:{page}"), ("30-50%", f"{d}30-50:{page}"), ("50-70%", f"{d}50-70:{page}")],
-        [("✏️ Custom range", f"wm:dcr:{code}:{page}")],
-        [("⬅️ Back", f"wm:dw:{code}:{page}")]])
+        [("10-30%", f"{d}10-30:{page}:{t}"), ("30-50%", f"{d}30-50:{page}:{t}"), ("50-70%", f"{d}50-70:{page}:{t}")],
+        [("✏️ Custom range", f"wm:dcr:{code}:{page}:{t}")],
+        [("⬅️ Back", f"wm:dm:{code}:{page}:{t}")]])
 
 
-def _wm_view_sync(action, a1, a2, uid):
+def _wm_disc_auto_view(code, page, t):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
+    ak = _DISC[t][2]
+    auto = w.get(ak) or {}
+    ready = bool(auto.get("start") and auto.get("end") and (auto.get("pct") or auto.get("lo")))
+    text = "\n".join([f"🕒 Automatic {_DISC[t][3]} discount · {_weapon_label(w)}", "", "Now: " + _auto_text(auto),
+                      "✅ Active: it switches on and off by itself." if ready else "⚠️ Set the start time, end time and a percent to turn it on.",
+                      "A manual discount, while it runs, wins over this schedule."])
+    c = f"wm:at:{code}:{page}:{t}:"
+    return text, _kb([[("🕒 Starts at", c + "st"), ("🕒 Ends at", c + "en")], [("📅 Days", f"wm:ad:{code}:{page}:{t}")],
+                      [("✏️ Percent", c + "pc"), ("🎲 Random range", c + "rg")], [("⬅️ Back", f"wm:dt:{code}:{page}:{t}")]])
+
+
+def _wm_days_rows(days, cb_day, cb_all):
+    days = set(days or range(7))
+    rows = [[((("✅ " if d in days else "⬜ ") + _DAY_NAMES[d]), cb_day(d)) for d in range(i, min(i + 4, 7))] for i in (0, 4)]
+    rows.append([("🔁 Every day", cb_all)])
+    return rows
+
+
+def _wm_disc_days_view(code, page, t):
+    w = get_weapon(code)
+    if not w:
+        return "ℹ️ That weapon no longer exists.", _kb([[("⬅️ Back", f"wm:dc:{page}")]])
+    auto = w.get(_DISC[t][2]) or {}
+    rows = _wm_days_rows(auto.get("days"), lambda d: f"wm:az:{code}:{page}:{t}:{d}", f"wm:az:{code}:{page}:{t}:x")
+    rows.append([("⬅️ Back", f"wm:da:{code}:{page}:{t}")])
+    return f"📅 Days · {_DISC[t][3]} automatic discount\n\nTap a day to turn it on or off. Now: {_days_text(auto.get('days'))}.", _kb(rows)
+
+
+def _wm_toggle_auto_day_sync(code, t, day):
+    w = get_weapon(code)
+    if not w:
+        return
+    ak = _DISC[t][2]
+    days = set((w.get(ak) or {}).get("days") or range(7))
+    if day == "x":
+        days = set(range(7))
+    else:
+        days ^= {int(day)}
+        if not days:
+            days = set(range(7))                # at least one day: an empty choice means every day
+    _col(WEAPONS_COL).update_one({"_id": code}, {"$set": {f"{ak}.days": sorted(days)}})
+
+
+# ---------------------------------------------------------------- shop hours screens
+def _wm_shop_hours_view(origin, uid):
+    s = get_shop_settings()
+    st = shop_status(s)
+    if st["open"]:
+        status = "🟢 OPEN" + (f" (closes {_when_short(st['closes_at'])} IST)" if st["closes_at"] else "")
+    else:
+        status = "🔴 CLOSED" + (f" (opens {_when_short(st['opens_at'])} IST)" if st["opens_at"] else "")
+    auto = s["mode"] == "auto"
+    lines = ["🏪 SHOP HOURS", "", f"Status: {status}", "Mode: " + ("🕒 Automatic" if auto else "🖐 Manual"),
+             ("Hours: " + (f"{_fmt12(s['open_at'])} to {_fmt12(s['close_at'])} IST, {_days_text(s.get('days'))}" if s.get("open_at") and s.get("close_at")
+                           else "not set (the shop stays open until you set them)")) if auto else "The shop stays as you set it with Open Now / Close Now.",
+             f"📣 Announce: {'✅ On' if s['announce'] else '⬜ Off'}"]
+    if auto and st["schedule"] and s.get("override") in ("open", "closed") and _aware(s.get("override_until")) and _aware(s["override_until"]) > _utcnow():
+        lines.append(f"ℹ️ {'Open Now' if s['override'] == 'open' else 'Close Now'} is on until the next scheduled change.")
+    o = origin
+    rows = [[("🖐 Manual" + ("" if auto else " ✅"), f"wm:shm:{o}:m"), ("🕒 Automatic" + (" ✅" if auto else ""), f"wm:shm:{o}:a")],
+            [("🟢 Open Now", f"wm:sho:{o}"), ("🔴 Close Now", f"wm:shc:{o}")]]
+    if auto:
+        rows += [[("🕒 Opens at", f"wm:sht:{o}:o"), ("🕒 Closes at", f"wm:sht:{o}:c")], [("📅 Days", f"wm:shd:{o}")]]
+    rows += [[("📣 Announce: " + ("✅ On" if s["announce"] else "⬜ Off"), f"wm:sha:{o}")],
+             [("⬅️ Back", "wm:list:0" if o == "m" else _wm_back(uid))]]
+    return "\n".join(lines), _kb(rows)
+
+
+def _wm_shop_days_view(origin):
+    s = get_shop_settings()
+    rows = _wm_days_rows(s.get("days"), lambda d: f"wm:shz:{origin}:{d}", f"wm:shz:{origin}:x")
+    rows.append([("⬅️ Back", f"wm:sh:{origin}")])
+    return f"📅 SHOP DAYS\n\nTap a day to turn it on or off. Now: {_days_text(s.get('days'))}.", _kb(rows)
+
+
+def _wm_shop_action_sync(action, origin, arg):
+    """Changes of the Shop Hours panel. Returns a short note (or None)."""
+    s = get_shop_settings()
+    if action == "shm":
+        if arg == "a":
+            set_shop_settings(mode="auto", override=None, override_until=None)
+            return None if (s.get("open_at") and s.get("close_at")) else "Set the opening and closing time. Until then the shop stays open."
+        set_shop_settings(mode="manual", override=None, override_until=None)
+        return None
+    if action in ("sho", "shc"):
+        want = action == "sho"
+        if s["mode"] == "auto" and s.get("open_at") and s.get("close_at"):
+            inside, _b, end, nxt = _in_window(s["open_at"], s["close_at"], s.get("days"), _utcnow().astimezone(IST))
+            set_shop_settings(override="open" if want else "closed", override_until=(end if inside else nxt))
+        else:
+            set_shop_settings(manual_open=want, override=None, override_until=None)
+        return "The shop is open now." if want else "The shop is closed now."
+    if action == "sha":
+        on = not s["announce"]
+        set_shop_settings(announce=on)
+        if on:
+            _snapshot_announcements_sync()
+        return "Shop announcements are on." if on else "Shop announcements are off."
+    if action == "shz":
+        days = set(s.get("days") or range(7))
+        if arg == "x":
+            days = set(range(7))
+        else:
+            days ^= {int(arg)}
+            days = days or set(range(7))
+        set_shop_settings(days=sorted(days))
+    return None
+
+
+def _wm_view_sync(action, a1, a2, a3, uid):
     if action == "list":
         return _wm_list_view(a1, uid)
     if action == "w":
         return _wm_weapon_view(a1, a2)
     if action == "dl":
         return _wm_delete_view(a1, a2)
+    if action == "sl":
+        return _wm_shop_list_view(a1, uid)
+    if action == "pl":
+        return _wm_drop_list_view(a1, uid)
     if action == "dc":
         return _wm_disc_list_view(a1, uid)
     if action == "dw":
-        return _wm_disc_view(a1, a2)
-    return _wm_random_view(a1, a2)                         # "dr"
+        return _wm_disc_hub_view(a1, a2)
+    if action == "dt":
+        return _wm_disc_target_view(a1, a2, a3)
+    if action == "dm":
+        return _wm_disc_manual_view(a1, a2, a3)
+    if action == "dr":
+        return _wm_random_view(a1, a2, a3)
+    if action == "da":
+        return _wm_disc_auto_view(a1, a2, a3)
+    if action == "ad":
+        return _wm_disc_days_view(a1, a2, a3)
+    if action == "shd":
+        return _wm_shop_days_view(a1)
+    return _wm_shop_hours_view(a1, uid)                   # "sh" and the actions that return to the panel
 
 
 def _wm_delete_sync(code):
@@ -3691,6 +4221,11 @@ async def _wm_show(q, text, kb):
     await _show(q, text, kb)
 
 
+def _wm_clear_discount_sync(code, t):
+    pk, uk, ak, _label = _DISC[t]
+    _col(WEAPONS_COL).update_one({"_id": code}, {"$unset": {pk: "", uk: "", ak: ""}})
+
+
 async def wm_callback(update, context):
     """Every wm: button that is not a typed step."""
     q = update.callback_query
@@ -3701,7 +4236,8 @@ async def wm_callback(update, context):
         return
     parts = (q.data or "").split(":")
     action, uid = parts[1] if len(parts) > 1 else "", q.from_user.id
-    a1, a2 = (parts[2] if len(parts) > 2 else "0"), (parts[3] if len(parts) > 3 else "0")
+    a1, a2, a3, a4 = (parts[i] if len(parts) > i else "0" for i in (2, 3, 4, 5))
+    note = None
     try:
         if action in ("sv", "cx"):                                       # preview of a new weapon (a photo message)
             draft = context.user_data.get("wm_draft")
@@ -3714,8 +4250,8 @@ async def wm_callback(update, context):
                 await q.answer("This preview has expired.", show_alert=True)
                 return
             price = int(draft["price"])
-            doc = {"_id": draft["code"], "code": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"], "rarity": draft["rarity"],
-                   "photo": draft["photo"], "shop_enabled": price > 0, "shop_price": price,
+            doc = {"_id": draft["code"], "code": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"],
+                   "rarity": draft["rarity"], "photo": draft["photo"], "shop_enabled": price > 0, "shop_price": price,
                    "drop_enabled": False, "drop_stock": 3, "drop_price": price,
                    "created_by": int(uid), "created_at": _stamp()}
             try:
@@ -3743,16 +4279,27 @@ async def wm_callback(update, context):
             text = f"🗑 {_weapon_label(w)} deleted." if w else "ℹ️ That weapon no longer exists."
             await _wm_show(q, text, _kb([[("« Weapon list", f"wm:list:{a2}")]]))
             return
-        if action == "dd":                                               # remove a discount
-            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": a1}, {"$unset": {"discount_pct": "", "discount_until": ""}})
-            await q.answer("Discount removed.")
-            action = "dw"
-        elif action not in ("list", "w", "dl", "dc", "dw", "dr"):
+        if action == "dd":                                               # remove a discount (a1 code, a2 page, a3 target)
+            await asyncio.to_thread(_wm_clear_discount_sync, a1, a3 if a3 in _DISC else "s")
+            note, action = "Discount removed.", "dt"
+        elif action == "st":                                             # list / unlist in the shop (a1 code, a2 page, a3 back to w|s)
+            w, err = await asyncio.to_thread(_wm_toggle_shop_sync, a1)
+            if err:
+                await q.answer(err, show_alert=True)
+                return
+            note = "Listed in the shop." if w.get("shop_enabled") else "Removed from the shop."
+            action, a1 = ("w", a1) if a3 == "w" else ("sl", a2)
+        elif action == "az":                                             # a day of an automatic discount
+            await asyncio.to_thread(_wm_toggle_auto_day_sync, a1, a3, a4)
+            action = "ad"
+        elif action in ("shm", "sho", "shc", "sha", "shz"):              # Shop Hours buttons (a1 = where we came from, a2 = mode / day)
+            note = await asyncio.to_thread(_wm_shop_action_sync, action, a1, a2)
+            action = "shd" if action == "shz" else "sh"
+        elif action not in ("list", "w", "dl", "sl", "pl", "dc", "dw", "dt", "dm", "dr", "da", "ad", "sh", "shd"):
             await q.answer()
             return
-        else:
-            await q.answer()
-        text, kb = await asyncio.to_thread(_wm_view_sync, action, a1, a2, uid)
+        await q.answer(note or "")
+        text, kb = await asyncio.to_thread(_wm_view_sync, action, a1, a2, a3, uid)
         await _wm_show(q, text, kb)
     except Exception as e:
         logger.error("weapon manager callback failed (%s): %s", q.data, e)
@@ -3829,17 +4376,18 @@ async def _wm_value(field, msg, code=None):
 
 _WM_DURATION_PROMPT = ("⏱ How long does the sale last? Send like 30m, 2h or 1d (up to 30 days), or 0 for no end date.\n"
                        "Send /cancel to stop.")
+_WM_CLOCK_HELP = "Send a time like 6:00 PM (24-hour like 18:00 also works)."
 
 
 async def wm_entry(update, context):
-    """Start of every typed step: ➕ Create Weapon, 🧬 Evolution Weapon, ✏️ edits, 🎲 / ✏️ discounts."""
+    """Start of every typed step: ➕ Create Weapon, 🧬 Evolution Weapon, ✏️ edits, discounts, shop hours."""
     q = update.callback_query
     if q is None or q.from_user is None or q.message is None:
         return -1
     if not _is_owner(q.from_user.id):
         await q.answer(NOT_ALLOWED_TEXT, show_alert=True)
         return -1
-    parts = (q.data or "").split(":")                 # wm:new | wm:evo | wm:e:<code>:<field> | wm:dx|dcr:<code>:<page> | wm:dp:<code>:<lo>-<hi>:<page>
+    parts = (q.data or "").split(":")
     kind = parts[1]
     context.user_data.pop("wdi", None)
     context.user_data.pop("wm_draft", None)
@@ -3850,6 +4398,9 @@ async def wm_entry(update, context):
         st = {"kind": "ecode"}
         prompt = ("🧬 Evolution Weapon · step 1 of 3\nEvolution code. Send the 4-digit code of the evolution (see /evolution), for example 0123. "
                   "Its recipe will need 1 of a weapon.")
+    elif kind == "sht":                                     # wm:sht:<origin>:<o|c>
+        st = {"kind": "shopt", "origin": parts[2], "field": parts[3]}
+        prompt = f"🕒 Shop {'opening' if parts[3] == 'o' else 'closing'} time (IST). " + _WM_CLOCK_HELP
     else:
         code = parts[2]
         w = await asyncio.to_thread(get_weapon, code)
@@ -3859,18 +4410,28 @@ async def wm_entry(update, context):
         if kind == "e":
             st = {"kind": "edit", "code": code, "field": parts[3], "page": 0}
             prompt = _wm_prompt(parts[3], w)
-        elif kind == "dx":
-            st = {"kind": "dpct", "code": code, "page": parts[3]}
-            prompt = (f"✏️ Discount for {_weapon_label(w)}. Send the percent off from 1 to {WM_DISC_MAX}, for example 30.")
+        elif kind == "dx":                                  # wm:dx:<code>:<page>:<t>
+            st = {"kind": "dpct", "code": code, "page": parts[3], "t": parts[4]}
+            prompt = f"✏️ {_DISC[parts[4]][3]} discount for {_weapon_label(w)}. Send the percent off from 1 to {WM_DISC_MAX}, for example 30."
         elif kind == "dcr":
-            st = {"kind": "drange", "code": code, "page": parts[3]}
-            prompt = (f"🎲 Custom range for {_weapon_label(w)}. Send the lowest and highest percent from 1 to {WM_DISC_MAX}, for example 20-60. "
-                      "The bot rolls one percent inside it.")
-        else:                                           # dp: a preset range was tapped, roll now
+            st = {"kind": "drange", "code": code, "page": parts[3], "t": parts[4]}
+            prompt = (f"🎲 Custom range for the {_DISC[parts[4]][3]} discount of {_weapon_label(w)}. Send the lowest and highest percent from 1 to "
+                      f"{WM_DISC_MAX}, for example 20-60. The bot rolls one percent inside it.")
+        elif kind == "dp":                                  # wm:dp:<code>:<lo>-<hi>:<page>:<t>: a preset range was tapped, roll now
             lo, hi = (int(x) for x in parts[3].split("-"))
             pct = random.randint(lo, hi)
-            st = {"kind": "ddur", "code": code, "page": parts[4], "pct": pct}
+            st = {"kind": "ddur", "code": code, "page": parts[4], "t": parts[5], "pct": pct}
             prompt = f"🎲 Rolled {pct}% off for {_weapon_label(w)}.\n" + _WM_DURATION_PROMPT.replace("\nSend /cancel to stop.", "")
+        else:                                               # at: wm:at:<code>:<page>:<t>:<st|en|pc|rg>
+            t, field = parts[4], parts[5]
+            lab = _DISC[t][3]
+            st = {"kind": {"st": "atime", "en": "atime", "pc": "apct", "rg": "arange"}[field], "code": code, "page": parts[3], "t": t, "field": field}
+            prompt = {"st": f"🕒 Start time (IST) of the automatic {lab} discount for {_weapon_label(w)}. " + _WM_CLOCK_HELP,
+                      "en": f"🕒 End time (IST) of the automatic {lab} discount for {_weapon_label(w)}. " + _WM_CLOCK_HELP
+                            + " An end before the start runs overnight.",
+                      "pc": f"✏️ Percent of the automatic {lab} discount for {_weapon_label(w)}. Send the percent off from 1 to {WM_DISC_MAX}, for example 30.",
+                      "rg": f"🎲 Random range of the automatic {lab} discount for {_weapon_label(w)}. Send a range from 1 to {WM_DISC_MAX}, for example "
+                            "20-50. The bot picks one percent per day (the same for everyone)."}[field]
     context.user_data["wm_edit"] = st
     await q.answer()
     await _reply(q.message, prompt + "\nSend /cancel to stop.")
@@ -3907,8 +4468,9 @@ async def wm_input(update, context):
             return WM_INPUT
         context.user_data.pop("wm_edit", None)
         context.user_data["wm_draft"] = draft
-        caption = "🔎 Preview\n\n" + _wm_weapon_text({"_id": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"], "rarity": draft["rarity"],
-                                                    "shop_price": draft["price"], "shop_enabled": draft["price"] > 0, "photo": draft["photo"]})
+        caption = "🔎 Preview\n\n" + _wm_weapon_text({"_id": draft["code"], "name": draft["name"], "anime": draft["anime"], "type": draft["type"],
+                                                    "rarity": draft["rarity"], "shop_price": draft["price"], "shop_enabled": draft["price"] > 0,
+                                                    "photo": draft["photo"]})
         await msg.reply_photo(photo=draft["photo"], caption=caption, reply_markup=_kb([[("✅ Save", "wm:sv"), ("❌ Cancel", "wm:cx")]]))
         return -1
     # ---------------- ✏️ edit one value of a weapon
@@ -3931,7 +4493,7 @@ async def wm_input(update, context):
         await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {field}\n👤 By: {_by(user)}", user)
         _success(update)
         return -1
-    # ---------------- 💸 discount: percent (customise or rolled from a range), then how long
+    # ---------------- 💸 manual discount: percent (customise or rolled from a range), then how long
     if kind == "dpct":
         n = _parse_int(msg.text)
         if n is None or not 1 <= n <= WM_DISC_MAX:
@@ -3949,19 +4511,72 @@ async def wm_input(update, context):
         if mins is None:
             await _reply(msg, "❌ Send the time like 30m, 2h or 1d (1 minute to 30 days), or 0 for no end date." + retry)
             return WM_INPUT
-        code = st["code"]
+        code, t = st["code"], st["t"]
         w = await asyncio.to_thread(get_weapon, code)
-        if w is None or int(w.get("shop_price") or 0) <= 0:
+        if w is None:
             context.user_data.pop("wm_edit", None)
-            await _reply(msg, "❌ That weapon is gone or has no shop price, so it cannot be discounted.")
+            await _reply(msg, "❌ That weapon no longer exists.")
             return -1
+        pk, uk, _ak, label = _DISC[t]
         until = _utcnow() + timedelta(minutes=mins) if mins else None
-        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {"discount_pct": st["pct"], "discount_until": until}})
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": {pk: st["pct"], uk: until}})
         context.user_data.pop("wm_edit", None)
-        text, kb = await asyncio.to_thread(_wm_disc_view, code, st["page"])
+        text, kb = await asyncio.to_thread(_wm_disc_target_view, code, st["page"], t)
         await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
-        await _notify(context, f"💸 WEAPON DISCOUNT\n⚔️ {_weapon_label(w)}\n🏷 -{st['pct']}%"
+        await _notify(context, f"💸 WEAPON DISCOUNT ({label})\n⚔️ {_weapon_label(w)}\n🏷 -{st['pct']}%"
                                + (f" until {_when_text(until)}" if until else " (no end date)") + f"\n👤 By: {_by(user)}", user)
+        _success(update)
+        return -1
+    # ---------------- 🕒 automatic discount: start, end, percent or random range
+    if kind in ("atime", "apct", "arange"):
+        code, t = st["code"], st["t"]
+        ak = _DISC[t][2]
+        w = await asyncio.to_thread(get_weapon, code)
+        if w is None:
+            context.user_data.pop("wm_edit", None)
+            await _reply(msg, "❌ That weapon no longer exists.")
+            return -1
+        upd, unset = {}, {}
+        if kind == "atime":
+            hhmm = _parse_clock(msg.text)
+            if hhmm is None:
+                await _reply(msg, "❌ I could not read that time. " + _WM_CLOCK_HELP + retry)
+                return WM_INPUT
+            upd[f"{ak}.{'start' if st['field'] == 'st' else 'end'}"] = hhmm
+        elif kind == "apct":
+            n = _parse_int(msg.text)
+            if n is None or not 1 <= n <= WM_DISC_MAX:
+                await _reply(msg, f"❌ Send a whole number from 1 to {WM_DISC_MAX}, for example 30." + retry)
+                return WM_INPUT
+            upd[f"{ak}.pct"], unset = n, {f"{ak}.lo": "", f"{ak}.hi": ""}
+        else:
+            rng = rewards._parse_range(str(msg.text or "").strip(), WM_DISC_MAX)
+            if rng is None or rng[0] < 1:
+                await _reply(msg, f"❌ Send a range from 1 to {WM_DISC_MAX}, like 20-50." + retry)
+                return WM_INPUT
+            if rng[0] == rng[1]:
+                upd[f"{ak}.pct"], unset = rng[0], {f"{ak}.lo": "", f"{ak}.hi": ""}
+            else:
+                upd[f"{ak}.lo"], upd[f"{ak}.hi"], unset = rng[0], rng[1], {f"{ak}.pct": ""}
+        ops = {"$set": upd}
+        if unset:
+            ops["$unset"] = unset
+        await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, ops)
+        context.user_data.pop("wm_edit", None)
+        text, kb = await asyncio.to_thread(_wm_disc_auto_view, code, st["page"], t)
+        await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
+        _success(update)
+        return -1
+    # ---------------- 🏪 shop opening / closing time
+    if kind == "shopt":
+        hhmm = _parse_clock(msg.text)
+        if hhmm is None:
+            await _reply(msg, "❌ I could not read that time. " + _WM_CLOCK_HELP + retry)
+            return WM_INPUT
+        await asyncio.to_thread(set_shop_settings, **{"open_at" if st["field"] == "o" else "close_at": hhmm})
+        context.user_data.pop("wm_edit", None)
+        text, kb = await asyncio.to_thread(_wm_shop_hours_view, st["origin"], user.id)
+        await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
         _success(update)
         return -1
     # ---------------- 🧬 Evolution Weapon: evolution code, weapon code or off, stones
@@ -4075,11 +4690,65 @@ async def gift_weapon(update, context):
     _success(update)
 
 
+# ---------------------------------------------------------------- weapons as a reward (redeem codes, events, festival quests)
+MAX_REWARD_WEAPONS = 10
+_WEAPON_REWARD_RE = re.compile(r"[wW]?(\d{4})(?:\s*[xX×*]\s*(\d{1,2}))?")
+
+
+def parse_weapon_rewards(text):
+    """'0042, 0007 x3' -> ({'0042': 1, '0007': 3}, None), or (None, error text). Every code must be an existing weapon (qty 1-99)."""
+    parts = [p.strip() for p in re.split(r"[,;\n]+", str(text or "")) if p.strip()]
+    if not parts:
+        return None, "❌ Send at least one weapon code, for example 0042 or 0042 x3."
+    out, bad = {}, []
+    for p in parts:
+        m = _WEAPON_REWARD_RE.fullmatch(p)
+        if not m:
+            bad.append(p)
+            continue
+        code, qty = m.group(1), int(m.group(2) or 1)
+        if not 1 <= qty <= MAX_QTY or get_weapon(code) is None:
+            bad.append(p)
+            continue
+        out[code] = min(out.get(code, 0) + qty, MAX_QTY)
+    if bad:
+        return None, ("❌ Not a valid weapon: " + ", ".join(bad) + ".\nSend existing weapon codes like 0042 or 0042 x3 "
+                      f"(quantity 1-{MAX_QTY}), separated by commas (codes: /weaponlist).")
+    if len(out) > MAX_REWARD_WEAPONS:
+        return None, f"❌ At most {MAX_REWARD_WEAPONS} different weapons in one reward."
+    return out, None
+
+
+def weapon_reward_lines(rw):
+    """['⚔️ Benihime [0042] ×2', ...] for a {code: qty} reward."""
+    lines = []
+    for code, qty in (rw or {}).items():
+        w = get_weapon(code)
+        lines.append((f"⚔️ {_weapon_label(w)}" if w else f"⚔️ Weapon [{code}]") + (f" ×{int(qty)}" if int(qty) > 1 else ""))
+    return lines
+
+
+def weapon_reward_text(rw):
+    return " + ".join(weapon_reward_lines(rw))
+
+
+def weapon_rewards_exist(rw):
+    return all(get_weapon(code) is not None for code in (rw or {}))
+
+
+def give_weapon_reward(user_id, rw, undo):
+    """Gives every weapon of a {code: qty} reward. Each step that worked adds a function to `undo` that takes it back again."""
+    for code, qty in (rw or {}).items():
+        add_user_weapon(user_id, code, int(qty))
+        undo.append(lambda c=code, q=int(qty): take_user_weapon(user_id, c, q))
+
+
 # ==========================================================================
 # GROUP DROPS: a weapon appears in the groups the Owner enabled; first come, first served, limited stock + time
 # ==========================================================================
 DEFAULT_SETTINGS = {"enabled": False, "mode": "random", "min_hours": 3, "max_hours": 8, "min_minutes": None, "max_minutes": None, "fixed_times": [],
-                    "duration_min": 10, "groups": [], "next_at": None, "last_fixed": None, "active_drop": None}
+                    "duration_min": 10, "groups": [], "next_at": None, "last_fixed": None, "active_drop": None,
+                    "per_drop": 1, "announce_drop": False, "lead_min": 10, "heads_up_for": None}
 
 
 def _ensure_settings():
@@ -4132,39 +4801,82 @@ def _fmt_ist(dt):
     return _aware(dt).astimezone(IST).strftime("%I:%M %p").lstrip("0") + " IST"
 
 
-def _drop_caption(drop, w, state="active"):
+def _drop_items(drop):
+    """The weapons of a drop. Drops made before several-weapons existed hold one weapon in the top-level fields."""
+    if drop.get("items"):
+        return drop["items"]
+    return [{"idx": 0, "weapon_code": drop.get("weapon_code"), "price": drop.get("price", 0), "list_price": drop.get("price", 0),
+             "discount_pct": 0, "stock_total": drop.get("stock_total", 0), "stock_left": drop.get("stock_left", 0),
+             "buyers": drop.get("buyers") or []}]
+
+
+def _drop_weapons_sync(drop):
+    return {i["weapon_code"]: get_weapon(i["weapon_code"]) for i in _drop_items(drop)}
+
+
+def _drop_all_sold(drop):
+    return all(int(i.get("stock_left") or 0) <= 0 for i in _drop_items(drop))
+
+
+def _drop_price_text(i):
+    base = f"🪙 Price: {int(i['price']):,} {BERRY}"
+    pct = int(i.get("discount_pct") or 0)
+    return base + (f" (was {int(i['list_price']):,}, -{pct}%)" if pct else "")
+
+
+def _drop_view(drop, weapons, state="active"):
+    """(text, markup or None, has_photo) of a drop message. `weapons` = {code: weapon doc or None}."""
+    items = _drop_items(drop)
     head = {"active": "⚔️ WEAPON DROP!", "soldout": "⚔️ WEAPON DROP: SOLD OUT", "expired": "⚔️ WEAPON DROP: ENDED"}[state]
-    lines = [head, "",
-             f"⚔️ {w['name']} [{w['_id']}]",
-             f"📺 Anime: {w.get('anime') or '-'}",
-             *([f"🗡 Type: {w['type']}"] if w.get("type") else []),
-             _rarity_text(w.get("rarity")),
-             f"🪙 Price: {int(drop['price']):,} {BERRY}",
-             f"📦 Stock: {max(int(drop['stock_left']), 0)}/{int(drop['stock_total'])}"]
+    single = len(items) == 1
+    lines = [head, ""]
+    for n, i in enumerate(items, 1):
+        w = weapons.get(i["weapon_code"]) or {"_id": i["weapon_code"], "name": f"Weapon {i['weapon_code']}"}
+        left, total = max(int(i["stock_left"]), 0), int(i["stock_total"])
+        stock = f"📦 Stock: {left}/{total}" if left else "📦 SOLD OUT"
+        if single:
+            lines += [f"⚔️ {w['name']} [{w['_id']}]", f"📺 Anime: {w.get('anime') or '-'}", *([f"🗡 Type: {w['type']}"] if w.get("type") else []),
+                      _rarity_text(w.get("rarity")), _drop_price_text(i), stock]
+        else:
+            kind = " • ".join(x for x in ((f"🗡 {w['type']}" if w.get("type") else None), (_rarity_text(w.get("rarity")) if w.get("rarity") else None)) if x)
+            lines += [f"{n}. ⚔️ {w['name']} [{w['_id']}]", *([f"   {kind}"] if kind else []), f"   {_drop_price_text(i)}", f"   {stock}", ""]
     if state == "active":
-        lines += [f"⏳ Ends at {_fmt_ist(drop['ends_at'])}", "", "One per player. First come, first served!"]
+        lines += [f"⏳ Ends at {_fmt_ist(drop['ends_at'])}", "", "One of each per player. First come, first served!" if not single else "One per player. First come, first served!"]
     elif state == "soldout":
         lines += ["", "Every weapon was bought. Watch for the next drop!"]
     else:
         lines += ["", "This drop is over. Watch for the next one!"]
-    return "\n".join(lines)
+    kb = None
+    if state == "active":
+        rows = []
+        for i in items:
+            if int(i["stock_left"]) <= 0:
+                continue
+            w = weapons.get(i["weapon_code"])
+            label = f"🛒 BUY FOR {int(i['price']):,} {BERRY}" if single else f"🛒 {(w['name'] if w else i['weapon_code'])[:18]} • {int(i['price']):,}"
+            rows.append([(label, f"wdrop:buy:{drop['_id']}:{i['idx']}")])
+        kb = _kb(rows) if rows else None
+    photo = drop.get("photo")
+    if photo is None:
+        w0 = weapons.get(items[0]["weapon_code"])
+        photo = bool(single and w0 and w0.get("photo"))
+    return "\n".join(lines).rstrip(), kb, bool(photo)
 
 
-def _drop_keyboard(drop):
-    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-    return InlineKeyboardMarkup([[InlineKeyboardButton(f"🛒 BUY FOR {int(drop['price']):,} {BERRY}",
-                                                       callback_data=f"wdrop:buy:{drop['_id']}")]])
-
-
-def _create_drop_sync(w, duration_min):
+def _create_drop_sync(weapons, duration_min):
     """Inserts the drop and claims the single 'active drop' slot. Returns the drop doc or None when one is running."""
     _ensure_settings()
     now = _utcnow()
-    s_lo, s_hi = _wd_bounds(w, "stock")                    # a range is rolled once per drop (a single number always gives itself)
-    p_lo, p_hi = _wd_bounds(w, "price")
-    stock, price = random.randint(s_lo, s_hi), random.randint(p_lo, p_hi)
-    drop = {"_id": secrets.token_hex(4), "weapon_code": w["_id"], "price": price,
-            "stock_total": stock, "stock_left": stock, "buyers": [],
+    items = []
+    for idx, w in enumerate(weapons):
+        s_lo, s_hi = _wd_bounds(w, "stock")                # a range is rolled once per drop (a single number always gives itself)
+        p_lo, p_hi = _wd_bounds(w, "price")
+        stock, listed = random.randint(s_lo, s_hi), random.randint(p_lo, p_hi)
+        pct, _until = _discount_of(w, "d")                  # the weapon's drop discount (manual or automatic), if one runs now
+        price = max(1, listed * (100 - pct) // 100) if pct else listed
+        items.append({"idx": idx, "weapon_code": w["_id"], "price": price, "list_price": listed, "discount_pct": pct,
+                      "stock_total": stock, "stock_left": stock, "buyers": []})
+    drop = {"_id": secrets.token_hex(4), "items": items, "photo": bool(len(weapons) == 1 and weapons[0].get("photo")),
             "created_at": now, "ends_at": now + timedelta(minutes=int(duration_min)),
             "status": "active", "dirty": False, "messages": []}
     _drops().insert_one(drop)
@@ -4176,27 +4888,67 @@ def _create_drop_sync(w, duration_min):
     return drop
 
 
-async def start_drop(bot, w, source="auto"):
-    """Starts a drop of weapon `w` in every enabled group. Returns (ok, text)."""
+def _pool_diagnosis_sync():
+    """What stops each weapon from dropping: ['• Benihime [0042]: not in the pool', ...]."""
+    lines = []
+    for w in all_weapons():
+        why = [x for x, bad in (("not in the pool", not w.get("drop_enabled")), ("no stock", int(w.get("drop_stock") or 0) <= 0),
+                                ("no drop price", int(w.get("drop_price") or 0) <= 0)) if bad]
+        if why:
+            lines.append(f"• {w['name']} [{w['_id']}]: {', '.join(why)}")
+    return lines
+
+
+def _no_pool_text(lines, short=False):
+    if not lines:
+        return "❌ No weapons yet. Create one with /help, Weapons, ➕ Create Weapon."
+    if short:                                               # popup alerts hold about 200 characters
+        text, extra = "❌ No weapon can drop yet:\n", 0
+        for n, line in enumerate(lines):
+            if len(text) + len(line) + 1 > 150:
+                extra = len(lines) - n
+                break
+            text += line + "\n"
+        return text + (f"…and {extra} more. Open /weapondrops, Weapons." if extra else "Fix it in /weapondrops, Weapons.")
+    return "❌ No weapon can drop yet:\n" + "\n".join(lines) + "\n\nOpen /weapondrops, then ⚔️ Weapons to fix it."
+
+
+def _pick_drop_weapons(pool, settings):
+    """One or more different weapons from the pool, as many as the 'Weapons per drop' setting says."""
+    per = max(1, min(5, int(settings.get("per_drop") or 1)))
+    return random.sample(pool, min(per, len(pool)))
+
+
+async def start_drop(bot, weapons, source="auto"):
+    """Starts a drop of one weapon (dict) or several (list) in every enabled group. Returns (ok, text)."""
+    weapons = [weapons] if isinstance(weapons, dict) else list(weapons)
     settings = await asyncio.to_thread(get_settings)
     groups = await asyncio.to_thread(_drop_target_groups, settings)
     if not groups:
         return False, "❌ No group is enabled for weapon drops. Use /dropgroups."
-    if int(w.get("drop_price") or 0) <= 0 or int(w.get("drop_stock") or 0) <= 0:
-        return False, "❌ That weapon needs a drop price and stock first (/dropconfig price|stock)."
-    drop = await asyncio.to_thread(_create_drop_sync, w, settings["duration_min"])
+    for w in weapons:
+        if int(w.get("drop_price") or 0) <= 0 or int(w.get("drop_stock") or 0) <= 0:
+            return False, f"❌ {w['name']} needs a drop price and stock first (/dropconfig price|stock)."
+    drop = await asyncio.to_thread(_create_drop_sync, weapons, settings["duration_min"])
     if drop is None:
         return False, "❌ A weapon drop is already running."
+    wmap = {w["_id"]: w for w in weapons}
+    text, kb, has_photo = _drop_view(drop, wmap)
     sent = 0
     for cid in groups:
         try:
-            caption, kb = _drop_caption(drop, w), _drop_keyboard(drop)
-            if w.get("photo"):
-                m = await bot.send_photo(chat_id=cid, photo=w["photo"], caption=caption, reply_markup=kb)
+            if has_photo:
+                m = await bot.send_photo(chat_id=cid, photo=weapons[0]["photo"], caption=text, reply_markup=kb)
             else:
-                m = await bot.send_message(chat_id=cid, text=caption, reply_markup=kb)
+                m = await bot.send_message(chat_id=cid, text=text, reply_markup=kb)
+            pinned = False
+            try:                                            # the drop stays pinned while it is open
+                await bot.pin_chat_message(chat_id=cid, message_id=m.message_id)
+                pinned = True
+            except Exception as e:
+                logger.info("drop message pin in %s skipped: %s", cid, e)
             await asyncio.to_thread(_drops().update_one, {"_id": drop["_id"]},
-                                    {"$push": {"messages": {"chat_id": cid, "message_id": m.message_id}}})
+                                    {"$push": {"messages": {"chat_id": cid, "message_id": m.message_id, "pinned": pinned}}})
             sent += 1
         except Exception as e:
             logger.info("drop message to %s failed: %s", cid, e)
@@ -4204,7 +4956,7 @@ async def start_drop(bot, w, source="auto"):
     if sent == 0:                                   # nobody could receive it: do not keep a dead drop alive
         await asyncio.to_thread(_finish_drop_sync, drop["_id"], "ended")
         return False, "❌ The drop could not be sent to any group (is the bot still in them?)."
-    return True, f"✅ Weapon drop started: {w['name']} in {sent} group(s)."
+    return True, f"✅ Weapon drop started: {', '.join(w['name'] for w in weapons)} in {sent} group(s)."
 
 
 def _finish_drop_sync(drop_id, status):
@@ -4215,12 +4967,23 @@ def _finish_drop_sync(drop_id, status):
     return doc
 
 
-async def _edit_drop_messages(bot, drop, w, state):
-    text = _drop_caption(drop, w, state)
-    kb = _drop_keyboard(drop) if state == "active" else None
+async def _unpin_drop_messages(bot, drop):
+    """Unpins this drop's own message (only that one) in every group where it was pinned."""
+    for m in drop.get("messages") or []:
+        if not m.get("pinned"):
+            continue
+        try:
+            await bot.unpin_chat_message(chat_id=m["chat_id"], message_id=m["message_id"])
+        except Exception as e:
+            logger.info("drop message unpin in %s skipped: %s", m.get("chat_id"), e)
+        await asyncio.sleep(0.05)
+
+
+async def _edit_drop_messages(bot, drop, weapons, state):
+    text, kb, has_photo = _drop_view(drop, weapons, state)
     for m in drop.get("messages") or []:
         try:
-            if w.get("photo"):
+            if has_photo:
                 await bot.edit_message_caption(chat_id=m["chat_id"], message_id=m["message_id"], caption=text, reply_markup=kb)
             else:
                 await bot.edit_message_text(chat_id=m["chat_id"], message_id=m["message_id"], text=text, reply_markup=kb)
@@ -4228,10 +4991,12 @@ async def _edit_drop_messages(bot, drop, w, state):
             if "not modified" not in str(e).lower():
                 logger.info("drop message edit skipped: %s", e)
         await asyncio.sleep(0.1)
+    if state != "active":                           # sold out or ended: take the pin off
+        await _unpin_drop_messages(bot, drop)
 
 
-def _drop_buy_sync(user_id, drop_id):
-    """One purchase. The stock slot is claimed with ONE conditional update, so the last weapon can never be sold twice."""
+def _drop_buy_legacy_sync(user_id, drop_id):
+    """A purchase from a drop made before several-weapons existed (one weapon in the top-level fields)."""
     now = _utcnow()
     drop = _drops().find_one_and_update(
         {"_id": drop_id, "status": "active", "ends_at": {"$gt": now}, "stock_left": {"$gt": 0},
@@ -4266,7 +5031,53 @@ def _drop_buy_sync(user_id, drop_id):
         _refund(user_id, price)
         _release()
         raise
-    return {"status": "ok", "drop": drop, "weapon": w, "price": price, "owned": count_user_weapon(user_id, w["_id"]),
+    return {"status": "ok", "drop": drop, "weapon": w, "price": price, "item": _drop_items(drop)[0]}
+
+
+def _drop_buy_sync(user_id, drop_id, idx=0):
+    """One purchase of weapon number `idx` of a drop. The stock slot is claimed with ONE conditional update, so the last copy can never be sold twice."""
+    now = _utcnow()
+    cur = _drops().find_one({"_id": drop_id})
+    if cur is not None and "items" not in cur:
+        return _drop_buy_legacy_sync(user_id, drop_id)
+    drop = _drops().find_one_and_update(
+        {"_id": drop_id, "status": "active", "ends_at": {"$gt": now},
+         "items": {"$elemMatch": {"idx": idx, "stock_left": {"$gt": 0}, "buyers": {"$ne": int(user_id)}}}},
+        {"$inc": {"items.$.stock_left": -1}, "$push": {"items.$.buyers": int(user_id)}, "$set": {"dirty": True}},
+        return_document=True)
+    if drop is None:
+        if cur is None or cur.get("status") != "active" or _aware(cur["ends_at"]) <= now:
+            return {"status": "over"}
+        item = next((i for i in cur.get("items") or [] if i["idx"] == idx), None)
+        if item is None:
+            return {"status": "over"}
+        if int(user_id) in (item.get("buyers") or []):
+            return {"status": "already"}
+        return {"status": "soldout"}
+
+    def _release():
+        _drops().update_one({"_id": drop_id, "items.idx": idx},
+                            {"$inc": {"items.$.stock_left": 1}, "$pull": {"items.$.buyers": int(user_id)}, "$set": {"dirty": True}})
+
+    item = next(i for i in drop["items"] if i["idx"] == idx)
+    w = get_weapon(item["weapon_code"])
+    if w is None:
+        _release()
+        return {"status": "over"}
+    if not _user_exists(user_id):
+        _release()
+        return {"status": "nouser"}
+    price = int(item["price"])
+    if not _charge(user_id, price):
+        _release()
+        return {"status": "noberries", "need": price, "have": _balance(user_id)}
+    try:
+        add_user_weapon(user_id, w["_id"], 1)
+    except Exception:
+        _refund(user_id, price)
+        _release()
+        raise
+    return {"status": "ok", "drop": drop, "weapon": w, "price": price, "item": item, "owned": count_user_weapon(user_id, w["_id"]),
             "balance": _balance(user_id)}
 
 
@@ -4275,11 +5086,12 @@ async def wdrop_callback(update, context):
     if q is None or q.from_user is None:
         return
     parts = (q.data or "").split(":")
-    if len(parts) != 3 or parts[0] != "wdrop" or parts[1] != "buy":
+    if len(parts) not in (3, 4) or parts[0] != "wdrop" or parts[1] != "buy":
         await q.answer()
         return
     try:
-        res = await asyncio.to_thread(_drop_buy_sync, q.from_user.id, parts[2])
+        idx = int(parts[3]) if len(parts) == 4 else 0
+        res = await asyncio.to_thread(_drop_buy_sync, q.from_user.id, parts[2], idx)
     except Exception as e:
         logger.error("weapon drop buy failed: %s", e)
         await q.answer("❌ Purchase failed. Nothing was charged. Please try again.", show_alert=True)
@@ -4296,31 +5108,123 @@ async def wdrop_callback(update, context):
     elif s == "noberries":
         await q.answer(f"❌ Not enough Berries: need {res['need']:,}, you have {res['have']:,}.", show_alert=True)
     elif s == "ok":
-        w, drop = res["weapon"], res["drop"]
+        w, drop, item = res["weapon"], res["drop"], res["item"]
         await q.answer(f"✅ You bought {w['name']}! It is in /weapons.", show_alert=True)
         try:
             await context.bot.send_message(
                 chat_id=q.message.chat_id,
                 text=(f"🎉 {q.from_user.mention_html()} bought {w['name']}! "
-                      f"({max(int(drop['stock_left']), 0)}/{int(drop['stock_total'])} left)"),
+                      f"({max(int(item['stock_left']), 0)}/{int(item['stock_total'])} left)"),
                 parse_mode="HTML")
         except Exception:
             pass
-        if int(drop["stock_left"]) <= 0:
+        weapons = await asyncio.to_thread(_drop_weapons_sync, drop)
+        if _drop_all_sold(drop):
             final = await asyncio.to_thread(_finish_drop_sync, drop["_id"], "soldout")
             if final:
-                final["stock_left"] = 0
-                await _edit_drop_messages(context.bot, final, w, "soldout")
+                await _edit_drop_messages(context.bot, final, weapons, "soldout")
         else:
+            text, kb, has_photo = _drop_view(drop, weapons)
             try:
-                await q.edit_message_caption(caption=_drop_caption(drop, w), reply_markup=_drop_keyboard(drop)) \
-                    if q.message.photo else await q.edit_message_text(text=_drop_caption(drop, w), reply_markup=_drop_keyboard(drop))
+                await q.edit_message_caption(caption=text, reply_markup=kb) if has_photo else await q.edit_message_text(text=text, reply_markup=kb)
             except Exception as e:
                 if "not modified" not in str(e).lower():
                     logger.info("drop caption refresh skipped: %s", e)
 
 
-# ---------------------------------------------------------------- background tick (JobQueue or asyncio fallback)
+# ---------------------------------------------------------------- announcements (optional, off by default) and the background tick
+def _disc_key(w, t):
+    pct, until = _discount_of(w, t)
+    return f"{pct}:{_aware(until).isoformat() if until else 'x'}" if pct else None
+
+
+def _snapshot_announcements_sync():
+    """Marks the shop state and the shop discounts that run right now as already announced (used when announcements are switched on)."""
+    st = shop_status()
+    set_shop_settings(last_state="open" if st["open"] else "closed")
+    for w in all_weapons():
+        key = _disc_key(w, "s")
+        if key:
+            _col(WEAPONS_COL).update_one({"_id": w["_id"]}, {"$set": {"ann_shop": key}})
+
+
+async def _announce(bot, text):
+    settings = await asyncio.to_thread(get_settings)
+    for cid in await asyncio.to_thread(_drop_target_groups, settings):
+        try:
+            await bot.send_message(chat_id=cid, text=text)
+        except Exception as e:
+            logger.info("announcement to %s failed: %s", cid, e)
+        await asyncio.sleep(0.05)
+
+
+_ANN_STATE = {"at": 0.0}
+
+
+async def announce_tick(bot):
+    """Shop announcements: the shop opens / closes, a shop discount starts. Only when 📣 Announce is on (the shop state is tracked always)."""
+    now = time.monotonic()
+    if now - _ANN_STATE["at"] < 30:
+        return
+    _ANN_STATE["at"] = now
+    s = await asyncio.to_thread(get_shop_settings)
+    st = await asyncio.to_thread(shop_status, s)
+    state = "open" if st["open"] else "closed"
+    if s.get("last_state") != state:
+        await asyncio.to_thread(set_shop_settings, last_state=state)
+        if s["announce"] and s.get("last_state") is not None:
+            if st["open"]:
+                text = "🏪 The weapon shop is now open!" + (f" It closes at {_when_short(st['closes_at'])} IST." if st["closes_at"] else "") + "\nUse /weaponshop."
+            else:
+                text = "🏪 The weapon shop is now closed." + (f" It opens at {_when_short(st['opens_at'])} IST." if st["opens_at"] else "")
+            await _announce(bot, text)
+    if not s["announce"]:
+        return
+    for w in await asyncio.to_thread(all_weapons):
+        key = _disc_key(w, "s")
+        if key and key != w.get("ann_shop"):
+            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": w["_id"]}, {"$set": {"ann_shop": key}})
+            pct, until = _discount_of(w, "s")
+            await _announce(bot, f"🏷 SALE in the weapon shop!\n⚔️ {_weapon_label(w)}: -{pct}% (now {_shop_price(w):,} {BERRY}, was {int(w['shop_price']):,})"
+                                 + (f"\n⏳ Ends {_when_text(until)}" if until else "") + "\nUse /weaponshop.")
+        elif not key and w.get("ann_shop"):
+            await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": w["_id"]}, {"$unset": {"ann_shop": ""}})
+
+
+def _upcoming_fixed(settings, lead_min):
+    """(slot IST datetime, key) of a fixed drop time that starts within the next `lead_min` minutes, else (None, None)."""
+    now_ist = datetime.now(IST)
+    for hhmm in settings.get("fixed_times") or []:
+        try:
+            h, m = (int(x) for x in hhmm.split(":"))
+        except ValueError:
+            continue
+        slot = now_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+        if slot <= now_ist:
+            slot += timedelta(days=1)
+        if timedelta(0) < slot - now_ist <= timedelta(minutes=lead_min):
+            return slot, slot.strftime("%Y-%m-%d %H:%M")
+    return None, None
+
+
+async def _drop_heads_up(bot, settings):
+    """Optional '⚔️ A weapon drop starts in N minutes!' before a scheduled drop (📣 on the Timing page)."""
+    lead = int(settings.get("lead_min") or 10)
+    if settings.get("mode") == "fixed":
+        slot, key = _upcoming_fixed(settings, lead)
+        when = slot
+    else:
+        when = _aware(settings.get("next_at"))
+        key = when.isoformat() if when else None
+        if when and not (timedelta(0) < when - _utcnow() <= timedelta(minutes=lead)):
+            return
+    if not when or key == settings.get("heads_up_for"):
+        return
+    await asyncio.to_thread(set_settings, heads_up_for=key)
+    mins = max(1, int(((_aware(when) - _utcnow()).total_seconds() + 59) // 60))
+    await _announce(bot, f"⚔️ A weapon drop starts in about {mins} minute{'s' if mins != 1 else ''}! Be ready.")
+
+
 def _next_random_at(settings):
     lo, hi = _rand_range(settings)                 # minutes (older settings only hold hours)
     return _utcnow() + timedelta(minutes=random.randint(lo, max(lo, hi)))
@@ -4343,7 +5247,11 @@ def _due_fixed_key(settings):
 
 
 async def tick(bot):
-    """Runs every few seconds: finishes expired drops, refreshes stock text, starts scheduled drops."""
+    """Runs every few seconds: finishes expired drops, refreshes stock text, starts scheduled drops, sends the optional announcements."""
+    try:
+        await announce_tick(bot)
+    except Exception as e:
+        logger.error("shop announcement tick failed: %s", e)
     try:
         settings = await asyncio.to_thread(get_settings)
         active_id = settings.get("active_drop")
@@ -4353,23 +5261,25 @@ async def tick(bot):
                 await asyncio.to_thread(_col(SETTINGS_COL).update_one, {"_id": "drops", "active_drop": active_id},
                                         {"$set": {"active_drop": None}})
             else:
-                w = await asyncio.to_thread(get_weapon, drop["weapon_code"])
-                if w is None or _aware(drop["ends_at"]) <= _utcnow() or int(drop["stock_left"]) <= 0:
-                    state = "soldout" if int(drop["stock_left"]) <= 0 else "expired"
-                    final = await asyncio.to_thread(_finish_drop_sync, active_id, "soldout" if state == "soldout" else "ended")
-                    if final and w:
-                        await _edit_drop_messages(bot, final, w, state)
+                sold = _drop_all_sold(drop)
+                if sold or _aware(drop["ends_at"]) <= _utcnow():
+                    state = "soldout" if sold else "expired"
+                    final = await asyncio.to_thread(_finish_drop_sync, active_id, "soldout" if sold else "ended")
+                    if final:
+                        await _edit_drop_messages(bot, final, await asyncio.to_thread(_drop_weapons_sync, final), state)
                 elif drop.get("dirty"):
                     claimed = await asyncio.to_thread(_drops().find_one_and_update, {"_id": active_id, "dirty": True},
                                                       {"$set": {"dirty": False}}, return_document=True)
                     if claimed:
-                        await _edit_drop_messages(bot, claimed, w, "active")
+                        await _edit_drop_messages(bot, claimed, await asyncio.to_thread(_drop_weapons_sync, claimed), "active")
             return
         if not settings.get("enabled"):
             return
         pool = await asyncio.to_thread(_pool_sync)
         if not pool:
             return
+        if settings.get("announce_drop"):
+            await _drop_heads_up(bot, settings)
         if settings.get("mode") == "fixed":
             key = await asyncio.to_thread(_due_fixed_key, settings)
             if not key:
@@ -4383,7 +5293,7 @@ async def tick(bot):
             if _utcnow() < nxt:
                 return
             await asyncio.to_thread(set_settings, next_at=_next_random_at(settings))
-        ok, text = await start_drop(bot, random.choice(pool))
+        ok, text = await start_drop(bot, _pick_drop_weapons(pool, settings))
         logger.info("scheduled weapon drop: %s", text)
     except Exception as e:
         logger.error("weapon drop tick failed: %s", e)
@@ -4532,10 +5442,7 @@ def fmt_minutes(total):
 
 
 def _parse_hhmm(text):
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", str(text or "").strip())
-    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
-        return None
-    return f"{int(m.group(1)):02d}:{m.group(2)}"
+    return _parse_clock(text)                       # '6:30 PM', '6:30pm' and '18:30' all work; stored as 24-hour HH:MM
 
 
 def _rand_range(s):
@@ -4548,7 +5455,7 @@ def _rand_range(s):
 
 def _timing_text(s):
     if s["mode"] == "fixed":
-        times = ", ".join(s.get("fixed_times") or []) or "no times set"
+        times = ", ".join(_fmt12(t) for t in sorted(s.get("fixed_times") or [])) or "no times set"
         return f"Fixed times (IST): {times}"
     lo, hi = _rand_range(s)
     return f"Random: every {fmt_minutes(lo)}-{fmt_minutes(hi)}"
@@ -4559,27 +5466,32 @@ _CMD_GUIDE = (
     "📜 WEAPON COMMANDS (1/3): EVERYONE\n\n"
     "/weapons\nShows the weapons you own and how many of each. A weapon is used up in /evolve when an evolution needs it.\n\n"
     "/weaponshop\nOpens the weapon shop. Use ◀️ BACK and ▶️ NEXT to look through the weapons and 🛒 BUY to buy one. "
-    "The price is taken from your Berries.\n\n"
+    "The price is taken from your Berries. A weapon on sale shows the new price. The shop can be closed at times: it then tells you when it opens.\n\n"
     "/weaponlist\nLists every weapon with its code, anime, rarity and shop price. Owner and Executive also see "
     "if the weapon is in the drop pool, its drop stock and its drop price.",
 
     "📜 WEAPON COMMANDS (2/3): OWNER + EXECUTIVE\n\n"
-    "/addweapon\nPM only. Guided steps: name, anime, rarity, shop price, 4-digit code, photo. Send /cancel to stop.\n\n"
-    "/editweapon <code> <field> <value>\nChanges one thing of a weapon:\n"
+    "/addweapon\nPM only. Guided steps: name, anime, rarity, shop price, 4-digit code, photo. Send /cancel to stop. "
+    "(The Owner's ➕ Create Weapon button also asks for the weapon type.)\n\n"
+    "/editweapon <weapon code or name>\nStep by step: name, anime, type, rarity, shop price, photo. Each step shows the current value "
+    "and has ⏭ Skip to keep it. Send /cancel to stop.\n\n"
+    "/editweapon <code> <field> <value>\nChanges one thing at once:\n"
     "• name <new name>\n• anime <anime>\n• rarity <rarity>\n"
     "• price <berries> (shop price, 0 removes it from the shop)\n• photo (reply to a photo with /editweapon <code> photo)\n\n"
     "/evoweapon <evolution code> <weapon code> [stones]\nMakes an evolution need 1 of that weapon. "
     "Stones is optional (0 or more); leave it out to keep the current stones.\n\n"
-    "/evoweapon <evolution code> off [stones]\nRemoves the weapon requirement. The stones go back to at least 10.",
+    "/evoweapon <evolution code> off [stones]\nRemoves the weapon requirement. The stones go back to at least 10.\n\n"
+    "/addevo\nHas a third type, ⚔️ With Weapon: you send the character code, the weapon code and then the usual evolution steps. "
+    "The weapon is needed to evolve (stones can be 0).",
 
     "📜 WEAPON COMMANDS (3/3): OWNER ONLY\n\n"
-    "/weapondrops\nThis panel: ON/OFF, drop now, timing, duration, groups, weapons and the guides.\n\n"
-    "/dropnow [weapon]\nStarts a drop right now in every enabled group. Send a weapon code or name, or nothing for a random "
-    "weapon from the pool. Only one drop can run at a time.\n\n"
+    "/weapondrops\nThe drop panel: ON/OFF, drop now, timing, duration, groups, weapons per drop, weapons and the guides.\n\n"
+    "/dropnow [weapon]\nStarts a drop right now in every enabled group. Send a weapon code or name for that weapon, or nothing for "
+    "random weapons from the pool (as many as 📦 Per drop says). Only one drop can run at a time.\n\n"
     "/dropgroups\nChoose which groups get weapon drops.\n\n"
     "/dropconfig\nShortcuts for the panel:\n"
     "• random <min> <max> (e.g. 30m-2h; plain numbers are hours)\n"
-    "• fixed 18:00 22:00 (IST, up to 6 times)\n"
+    "• fixed 6:00 PM 10:00 PM (IST, up to 6 times; 18:00 also works)\n"
     "• duration <time> (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
     "• stock <code> <number or range> (1-1000, like 3-10; 0 = none)\n"
     "• price <code> <berries or range> (like 5000-20000; 0 = none)\n\n"
@@ -4588,32 +5500,36 @@ _CMD_GUIDE = (
     "The user must have started the bot.\n\n"
     "/delweapon <code> [confirm]\nDeletes a weapon and removes it from every player. The first send shows a warning; "
     "send it again with confirm. Blocked while an evolution still needs the weapon.\n\n"
-    "/cancel\nStops any typing step (✏️ buttons, /addweapon).",
+    "Rewards\nA weapon can be a reward in /addredeem, /addevent and /addquest (and /editquest): send the code like 0042 or 0042 x3.\n\n"
+    "/cancel\nStops any typing step.",
 )
 
 _BTN_GUIDE = (
-    "🔘 BUTTONS (1/3): MAIN PANEL\n\n"
+    "🔘 BUTTONS (1/6): DROP PANEL\n\n"
     "🟢 Turn ON / 🔴 Turn OFF\nStarts or stops the automatic drops. 🎁 Drop now and /dropnow still work while OFF.\n\n"
-    "🎁 Drop now\nStarts a drop right away with a random weapon from the pool, in every enabled group.\n\n"
-    "⏱ Timing\nWhen drops start: random gaps or fixed IST times.\n\n"
+    "🎁 Drop now\nStarts a drop right away with random weapons from the pool, in every enabled group. If nothing can drop, it tells you what each weapon lacks.\n\n"
+    "⏱ Timing\nWhen drops start: random gaps or fixed IST times. Also the 📣 heads-up.\n\n"
     "⌛ Duration\nHow long each drop stays open.\n\n"
     "👥 Groups\nWhich groups get drops.\n\n"
     "⚔️ Weapons\nStock, drop price and pool of each weapon.\n\n"
+    "📦 Per drop\nHow many weapons one drop message holds (1 to 5).\n\n"
     "📜 Commands / 🔘 Buttons\nThese two guides.\n\n"
     "⬅️ Back\nGoes back to the screen before.\n◀️ ▶️\nTurn pages.\n✅\nMarks the current choice.",
 
-    "🔘 BUTTONS (2/3): TIMING AND DURATION\n\n"
+    "🔘 BUTTONS (2/6): TIMING AND DURATION\n\n"
     "🎲 Random\nA drop starts after a random wait between a minimum and a maximum.\n"
     "1-3 h, 3-8 h, 6-12 h: quick ranges.\n"
     "✏️ Custom: type your own, like 30m-2h or 1h-3h (5 minutes to 168 hours).\n\n"
     "🕒 Fixed times\nDrops start at the same IST times every day, up to 6.\n"
-    "18:00 ❌: removes that time.\n"
-    "➕ Add time: type a time like 18:30 (IST, 24-hour).\n\n"
+    "6:00 PM ❌: removes that time.\n"
+    "➕ Add time: type a time like 6:30 PM (IST). 24-hour like 18:30 also works.\n\n"
+    "📣 Heads-up\nOff by default. When on, the groups get \"A weapon drop starts in about N minutes\" before each scheduled drop. "
+    "5, 10, 15 and 30 min choose how early. Drops you start by hand get no heads-up.\n\n"
     "15 min, 30 min, 1 hour, 2 hours\nQuick drop lengths.\n"
     "✏️ Custom: type 70m, 2h or 1h 10 (1 minute to 24 hours).\n\n"
-    "Time format: 70m = 70 minutes, 2h = 2 hours, 1h 10 = 1 hour 10 minutes.",
+    "📦 Per drop (1-5)\nThe drop message lists that many different weapons, each with its own 🛒 button. One of each per player.",
 
-    "🔘 BUTTONS (3/3): WEAPONS, GROUPS, DROP MESSAGE\n\n"
+    "🔘 BUTTONS (3/6): DROP WEAPONS, GROUPS, DROP MESSAGE\n\n"
     "⚔️ Weapons list\nTap a weapon to open it. ✅ = in the drop pool, ⬜ = not in the pool. Each line shows stock and drop price.\n\n"
     "Weapon page\n"
     "➖ ➕: change the stock by 1 (both ends of a range, 1-1000).\n"
@@ -4622,8 +5538,48 @@ _BTN_GUIDE = (
     "✅ In pool / ⬜ Not in pool: a weapon drops only when it is in the pool, has stock and has a drop price.\n\n"
     "👥 Groups\nTap a group to turn it ✅ or ⬜. ✅ Enable all and ⬜ Disable all change every group. "
     "Drops appear only in enabled, approved groups where the bot is ON.\n\n"
-    "In the group\n🛒 BUY FOR <price>: first come, first served, one per player, until the stock is gone or the time is over.\n\n"
+    "In the group\n🛒 BUY FOR <price>: first come, first served, one per player, until the stock is gone or the time is over. "
+    "A drop discount shows \"(was X, -40%)\". The message is pinned while the drop is open.\n\n"
     "Typing steps\nAfter a ✏️ button the bot waits for your next message. Send /cancel to stop.",
+
+    "🔘 BUTTONS (4/6): WEAPONS PAGE (OWNER, /help)\n\n"
+    "📜 Commands\nEvery weapon command.\n\n"
+    "➕ Create Weapon\nGuided: name, anime, type, rarity, shop price, code, photo. Each step explains what to send. "
+    "Then a preview with ✅ Save / ❌ Cancel.\n\n"
+    "💸 Discount\nSets a sale for a weapon (see page 6).\n\n"
+    "🛠 Weapon Manager\nEdit, delete and tune every weapon (see page 5).\n\n"
+    "🛒 Shop List\nEvery weapon that has a shop price: ✅ in the shop, ⬜ not in the shop. Tap one to list or unlist it. The price is kept.\n\n"
+    "🎁 Drop List\nEvery weapon with its drop pool state: ✅ in the pool, ⬜ not, ⚠️ in the pool but it cannot drop yet. "
+    "Tap one to open its drop settings.\n\n"
+    "🏪 Shop Hours\nOpening and closing times of the weapon shop (see page 6).\n\n"
+    "« Back\nGoes back to the Owner Commands list.",
+
+    "🔘 BUTTONS (5/6): WEAPON MANAGER\n\n"
+    "List\nTap a weapon. ◀️ ▶️ turn pages.\n"
+    "🧬 Evolution Weapon: asks the evolution code, then the weapon code (or off), then the stones (or skip).\n"
+    "🏪 Shop Hours: opens the shop hours.\n"
+    "ℹ️ Buttons: this guide.\n\n"
+    "Weapon page\n"
+    "✏️ Name, ✏️ Anime, ✏️ Type, ✏️ Rarity, ✏️ Shop price: each asks for the new value. Type can be any word, like Sword, Knife, Blade or Box (0 clears it). "
+    "Shop price 0 removes it from the shop.\n"
+    "🖼 Photo: send a new photo.\n"
+    "🛒 In shop ✅ / ⬜: lists or unlists the weapon in the shop. The price is kept.\n"
+    "🎁 Drop settings: its stock, drop price and pool.\n"
+    "🗑 Delete: asks 🗑 Remove / ↩️ Cancel. Blocked while an evolution needs the weapon.\n"
+    "⬅️ Back: the list.",
+
+    "🔘 BUTTONS (6/6): DISCOUNT AND SHOP HOURS\n\n"
+    "💸 Discount\nTap a weapon, then 🏪 Shop or ⚔️ Drop (each has its own percent). A discount is optional.\n"
+    "🖐 Manual: 🎲 Random (pick a range like 30-50%, the bot rolls one percent) or ✏️ Customise (type the percent), then how long: 30m, 2h, 1d or 0 for no end.\n"
+    "🕒 Automatic: 🕒 Starts at / 🕒 Ends at (like 6:00 PM), 📅 Days, then ✏️ Percent or 🎲 Random range (one percent per day). "
+    "It switches on and off by itself every day.\n"
+    "🗑 Remove Discount: removes the manual and the automatic discount of that target.\n"
+    "A running manual discount wins over the automatic one.\n\n"
+    "🏪 Shop Hours\n🖐 Manual / 🕒 Automatic: how the shop opens.\n"
+    "🟢 Open Now / 🔴 Close Now: at once (in Automatic, until the next scheduled change).\n"
+    "🕒 Opens at / 🕒 Closes at: IST times like 10:00 AM and 10:00 PM. 📅 Days: which days it is open.\n"
+    "📣 Announce: ⬜ Off by default. When ✅ On, the groups get a post when the shop opens, closes, and when a shop sale starts.\n"
+    "While it is closed, /weaponshop shows when it opens.",
 )
 
 
@@ -4645,12 +5601,21 @@ def _view_main():
                       f"Status: {'🟢 ON' if s['enabled'] else '🔴 OFF'}",
                       f"⏱ {_timing_text(s)}",
                       f"⌛ Each drop lasts {fmt_minutes(s['duration_min'])}",
+                      f"📦 Weapons per drop: {int(s.get('per_drop') or 1)}",
                       f"👥 Groups enabled: {len(s.get('groups') or [])}"]) + nxt + active
     rows = [[("🔴 Turn OFF" if s["enabled"] else "🟢 Turn ON", "wdp:master:0:0"), ("🎁 Drop now", "wdp:now:0:0")],
             [("⏱ Timing", "wdp:tim:0:0"), ("⌛ Duration", "wdp:dur:0:0")],
             [("👥 Groups", "wdp:grp:0:0"), ("⚔️ Weapons", "wdp:wlist:0:0")],
+            [(f"📦 Per drop: {int(s.get('per_drop') or 1)}", "wdp:per:0:0")],
             [("📜 Commands", "wdp:cmds:0:0"), ("🔘 Buttons", "wdp:btns:0:0")]]
     return text, _kb(rows)
+
+
+def _view_per_drop():
+    cur = int(get_settings().get("per_drop") or 1)
+    text = (f"📦 WEAPONS PER DROP\n\nNow: {cur}\nHow many different weapons one drop message holds (1 to 5). "
+            "With 2 or more, one message lists them all with a 🛒 button each. If the pool has fewer weapons, the drop uses what it has.")
+    return text, _kb([[((("✅ " if cur == n else "") + str(n)), f"wdp:pset:{n}:0") for n in range(1, 6)], BACK_ROW])
 
 
 def _view_timing():
@@ -4664,13 +5629,17 @@ def _view_timing():
     if fixed:
         times = sorted(set(s.get("fixed_times") or []))
         for i in range(0, len(times), 3):
-            rows.append([(f"{t} ❌", f"wdp:tdel:{t.replace(':', '')}:0") for t in times[i:i + 3]])
+            rows.append([(f"{_fmt12(t)} ❌", f"wdp:tdel:{t.replace(':', '')}:0") for t in times[i:i + 3]])
         if len(times) < MAX_FIXED_TIMES:
             rows.append([("➕ Add time", "wdi:time:0:0")])
     else:
         cur = _rand_range(s)
         rows.append([(("✅ " if cur == (lo, hi) else "") + label, f"wdp:trand:{lo}-{hi}:0") for lo, hi, label in RAND_PRESETS])
         rows.append([("✏️ Custom", "wdi:rand:0:0")])
+    ann, lead = bool(s.get("announce_drop")), int(s.get("lead_min") or 10)
+    text += f"\n\n📣 Heads-up before each scheduled drop: {'✅ On' if ann else '⬜ Off'}" + (f" ({lead} min before)" if ann else "")
+    rows.append([("📣 Heads-up: " + ("✅ On" if ann else "⬜ Off"), "wdp:dann:0:0")])
+    rows.append([((("✅ " if lead == m else "") + f"{m} min"), f"wdp:dlead:{m}:0") for m in (5, 10, 15, 30)])
     rows.append(BACK_ROW)
     return text, _kb(rows)
 
@@ -4712,6 +5681,9 @@ def _view_wpage(code, page):
              "🪙 Drop price: " + (f"{_wd_text(w, 'price', True)} {BERRY}" if price else "not set")
              + (" (random each drop)" if _wd_bounds(w, "price")[0] != price else ""),
              f"🎁 Pool: {'✅ In pool' if on else '⬜ Not in pool'}"]
+    pct, until = _discount_of(w, "d")
+    if pct:
+        lines.append(f"💸 Drop discount: -{pct}%" + (f" (ends {_when_text(until)})" if until else "") + " (applied to the drop price)")
     if on and (stock <= 0 or price <= 0):
         lines += ["", "⚠️ It will not drop until it has stock and a drop price."]
     rows = [[("➖", f"wdp:wminus:{code}:{page}"), ("➕", f"wdp:wplus:{code}:{page}")],
@@ -4721,12 +5693,12 @@ def _view_wpage(code, page):
     return "\n".join(lines), _kb(rows)
 
 
-def _view_guide(action, page, from_help=False, uid=0):
-    """Guide pages. Opened from /weapondrops (arg 0) ⬅️ Back returns to the drop panel; opened from /help (arg h) it returns to the Weapons help page."""
+def _view_guide(action, page, origin="0", uid=0):
+    """Guide pages. Opened from /weapondrops (arg 0) ⬅️ Back returns to the drop panel; from /help (arg h) to the Weapons help page; from the Weapon Manager (arg m) to its list."""
     pages = _CMD_GUIDE if action == "cmds" else _BTN_GUIDE
     page = max(0, min(int(page), len(pages) - 1))
-    flag = "h" if from_help and uid else "0"
-    back = [("⬅️ Back", f"help:{uid}:owner:weapons")] if flag == "h" else BACK_ROW
+    flag = origin if (origin == "m" or (origin == "h" and uid)) else "0"
+    back = {"h": [("⬅️ Back", f"help:{uid}:owner:weapons")], "m": [("⬅️ Back", "wm:list:0")]}.get(flag, BACK_ROW)
     rows = [[("◀️", f"wdp:{action}:{flag}:{(page - 1) % len(pages)}"), (f"{page + 1}/{len(pages)}", f"wdp:{action}:{flag}:{page}"),
              ("▶️", f"wdp:{action}:{flag}:{(page + 1) % len(pages)}")], back]
     return pages[page], _kb(rows)
@@ -4738,12 +5710,14 @@ def _view_sync(view, arg="0", page=0, uid=0):
         return _view_timing()
     if view == "dur":
         return _view_duration()
+    if view == "per":
+        return _view_per_drop()
     if view == "wlist":
         return _view_wlist(page)
     if view == "wpage":
         return _view_wpage(arg, page)
     if view in ("cmds", "btns"):
-        return _view_guide(view, page, arg == "h", uid)
+        return _view_guide(view, page, arg, uid)
     return _view_main()
 
 
@@ -4822,11 +5796,25 @@ async def wdp_callback(update, context):
     elif action == "now":
         pool = await asyncio.to_thread(_pool_sync)
         if not pool:
-            await q.answer("❌ No weapon in the pool has stock and a drop price.", show_alert=True)
+            await q.answer(_no_pool_text(await asyncio.to_thread(_pool_diagnosis_sync), short=True)[:195], show_alert=True)
             return
-        _ok, text = await start_drop(context.bot, random.choice(pool), "owner")
+        _ok, text = await start_drop(context.bot, _pick_drop_weapons(pool, await asyncio.to_thread(get_settings)), "owner")
         await q.answer(text[:190], show_alert=True)
         return
+    elif action == "pset":                                 # 📦 weapons per drop
+        n = _parse_int(arg)
+        if n is not None and 1 <= n <= 5:
+            await asyncio.to_thread(set_settings, per_drop=n)
+        view = "per"
+    elif action == "dann":                                 # 📣 heads-up before each drop
+        s = await asyncio.to_thread(get_settings)
+        await asyncio.to_thread(set_settings, announce_drop=not s.get("announce_drop"), heads_up_for=None)
+        view = "tim"
+    elif action == "dlead":
+        n = _parse_int(arg)
+        if n in (5, 10, 15, 30):
+            await asyncio.to_thread(set_settings, lead_min=n, heads_up_for=None)
+        view = "tim"
     elif action == "grp":
         await q.answer()
         text, kb = await _dropgroups_view(context.bot, 0)
@@ -4871,7 +5859,7 @@ async def wdp_callback(update, context):
             if not w.get("drop_enabled") and (int(w.get("drop_price") or 0) <= 0 or int(w.get("drop_stock") or 0) <= 0):
                 note = "⚠️ It needs stock and a drop price before it can drop."
         view = "wpage"
-    elif action not in ("tim", "dur", "wlist", "wpage", "cmds", "btns"):
+    elif action not in ("tim", "dur", "per", "wlist", "wpage", "cmds", "btns"):
         await q.answer()
         return
     await q.answer(note[:190] if note else None, show_alert=bool(note and note.startswith("⚠️")))
@@ -4884,7 +5872,7 @@ async def wdp_callback(update, context):
 _WDI_PROMPTS = {
     "dur": "⌛ Send the duration, for example 45m, 2h or 1h 10 (1m-24h). A plain number is minutes.",
     "rand": "🎲 Send the minimum and maximum wait, for example 30m-2h or 1h-3h (5m-168h). Plain numbers are hours.",
-    "time": "🕒 Send the time in IST, 24-hour, for example 18:30:",
+    "time": "🕒 Send the time in IST, like 6:30 PM (24-hour like 18:30 also works):",
 }
 
 
@@ -4965,17 +5953,17 @@ async def wdi_text(update, context):
     elif kind == "time":
         hhmm = _parse_hhmm(text)
         if hhmm is None:
-            await _reply(msg, "❌ Send the time like 18:30 (IST, 24-hour).")
+            await _reply(msg, "❌ Send the time like 6:30 PM (IST). 24-hour like 18:30 also works.")
             return WD_INPUT
         res = await asyncio.to_thread(_add_fixed_time_sync, hhmm)
         if res == "dup":
-            await _reply(msg, f"❌ {hhmm} is already in the list. Send another time or /cancel.")
+            await _reply(msg, f"❌ {_fmt12(hhmm)} is already in the list. Send another time or /cancel.")
             return WD_INPUT
         if res == "full":
             await _reply(msg, f"❌ You can set up to {MAX_FIXED_TIMES} times. Remove one first.")
             context.user_data.pop("wdi", None)
             return -1
-        done = f"✅ Added {hhmm} IST."
+        done = f"✅ Added {_fmt12(hhmm)} IST."
     else:                                          # stock / price of one weapon
         code = pend["arg"]
         limit = MAX_STOCK if kind == "stock" else MAX_PRICE
@@ -5012,7 +6000,7 @@ async def wdi_cancel(update, context):
 
 
 CONFIG_USAGE = ("Usage:\n/dropconfig random <min> <max>  (e.g. 30m-2h or 1h-3h; plain numbers are hours)\n"
-                "/dropconfig fixed 18:00 22:00 (IST, up to 6 times)\n"
+                "/dropconfig fixed 6:00 PM 10:00 PM (IST, up to 6 times)\n"
                 "/dropconfig duration <time>  (e.g. 45m, 2h, 1h 10; a plain number is minutes)\n"
                 "/dropconfig stock <weapon code> <number or range like 3-10, 0 = none>\n"
                 "/dropconfig price <weapon code> <berries or range like 5000-20000, 0 = none>\n\nTip: /weapondrops has buttons for all of this.")
@@ -5037,16 +6025,16 @@ async def dropconfig_command(update, context):
             return
         await asyncio.to_thread(set_settings, mode="random", min_minutes=rng[0], max_minutes=rng[1], next_at=None)
         await _reply(msg, f"✅ Random drops: every {fmt_minutes(rng[0])}-{fmt_minutes(rng[1])}.")
-    elif cmd == "fixed" and 2 <= len(args) <= MAX_FIXED_TIMES + 1:
+    elif cmd == "fixed" and 1 <= len(_merge_clock_tokens(args[1:])) <= MAX_FIXED_TIMES:
         times = []
-        for t in args[1:]:
+        for t in _merge_clock_tokens(args[1:]):
             hhmm = _parse_hhmm(t)
             if hhmm is None:
-                await _reply(msg, f"❌ '{t}' is not a valid time. Use HH:MM (24-hour, IST).")
+                await _reply(msg, f"❌ '{t}' is not a valid time. Use a time like 6:30 PM (IST) or 18:30.")
                 return
             times.append(hhmm)
         await asyncio.to_thread(set_settings, mode="fixed", fixed_times=sorted(set(times)), last_fixed=None)
-        await _reply(msg, "✅ Fixed drops at " + ", ".join(sorted(set(times))) + " IST.")
+        await _reply(msg, "✅ Fixed drops at " + ", ".join(_fmt12(t) for t in sorted(set(times))) + " IST.")
     elif cmd == "duration" and len(args) >= 2:
         minutes = parse_duration(" ".join(args[1:]), "m")
         if minutes is None or not (DUR_MIN <= minutes <= DUR_MAX):
@@ -5092,9 +6080,9 @@ async def dropnow_command(update, context):
     else:
         pool = await asyncio.to_thread(_pool_sync)
         if not pool:
-            await _reply(msg, "❌ No weapon in the drop pool has stock and a drop price. Use /weapondrops.")
+            await _reply(msg, _no_pool_text(await asyncio.to_thread(_pool_diagnosis_sync)))
             return
-        w = random.choice(pool)
+        w = _pick_drop_weapons(pool, await asyncio.to_thread(get_settings))
     ok, text = await start_drop(context.bot, w, "owner")
     await _reply(msg, text)
     if ok:
@@ -5106,7 +6094,7 @@ def weapon_help_module():
     """(key, button label, page text) for the Owner /help menu, next to Invites and Security (see bot.py HELP_MODULES)."""
     entries = [
         ("/addweapon", "Add a weapon (guided, PM only)"),
-        ("/editweapon <code> <name|anime|rarity|price|photo>", "Edit a weapon"),
+        ("/editweapon <code or name>", "Edit a weapon step by step (⏭ Skip keeps a value)"),
         ("/weaponlist", "List all weapons"),
         ("/evoweapon <evolution code> <weapon code|off> [stones]", "Set the weapon an evolution needs"),
         ("/gift w<code>", "Give 1 weapon: reply to a player (group) or /gift w0042 <user_id> (DM)"),
@@ -5163,6 +6151,13 @@ def _register_weapons(app):
         allow_reentry=True,
         conversation_timeout=_deps["conv_timeout"],
     ))
+    app.add_handler(ConversationHandler(            # /editweapon <code or name>: step by step with ⏭ Skip (the one-line form still works)
+        entry_points=[CommandHandler("editweapon", editweapon_start)],
+        states={EW_INPUT: [MessageHandler(text | filters.PHOTO, editweapon_step), CommandHandler("skip", editweapon_step)]},
+        fallbacks=[CommandHandler("cancel", editweapon_cancel)],
+        allow_reentry=True,
+        conversation_timeout=_deps["conv_timeout"],
+    ))
     app.add_handler(ConversationHandler(            # ✏️ buttons of the /weapondrops panel (typed value, /cancel stops)
         entry_points=[CallbackQueryHandler(wdi_start, pattern=r"^wdi:")],
         states={WD_INPUT: [MessageHandler(text, wdi_text)]},
@@ -5171,22 +6166,22 @@ def _register_weapons(app):
         conversation_timeout=_deps["conv_timeout"],
     ))
     app.add_handler(ConversationHandler(            # ⚔️ Weapon Manager typed steps (create, edit, discount, evolution weapon; /cancel stops)
-        entry_points=[CallbackQueryHandler(wm_entry, pattern=r"^wm:(new|evo|e:\d{4}:(name|anime|type|rarity|price|photo)|dx:\d{4}:\d+|dcr:\d{4}:\d+|dp:\d{4}:\d{1,2}-\d{1,2}:\d+)$")],
+        entry_points=[CallbackQueryHandler(wm_entry, pattern=r"^wm:(new|evo|e:\d{4}:(name|anime|type|rarity|price|photo)|dx:\d{4}:\d+:[sd]|dcr:\d{4}:\d+:[sd]|dp:\d{4}:\d{1,2}-\d{1,2}:\d+:[sd]|at:\d{4}:\d+:[sd]:(st|en|pc|rg)|sht:[hm]:[oc])$")],
         states={WM_INPUT: [MessageHandler(text | filters.PHOTO, wm_input)]},
         fallbacks=[CommandHandler("cancel", wm_cancel)],
         allow_reentry=True,
         conversation_timeout=_deps["conv_timeout"],
     ))
-    app.add_handler(CallbackQueryHandler(wm_callback, pattern=r"^wm:(list:\d+|w:\d{4}:\d+|dl:\d{4}:\d+|dy:\d{4}:\d+|dc:\d+|dw:\d{4}:\d+|dr:\d{4}:\d+|dd:\d{4}:\d+|sv|cx)$"))
+    app.add_handler(CallbackQueryHandler(wm_callback, pattern=r"^wm:(list:\d+|w:\d{4}:\d+|dl:\d{4}:\d+|dy:\d{4}:\d+|sl:\d+|pl:\d+|dc:\d+|st:\d{4}:\d+:[ws]|dw:\d{4}:\d+|(dt|dm|dr|da|ad|dd):\d{4}:\d+:[sd]|az:\d{4}:\d+:[sd]:[0-6x]|sh:[hm]|sho:[hm]|shc:[hm]|sha:[hm]|shd:[hm]|shm:[hm]:[ma]|shz:[hm]:[0-6x]|sv|cx)$"))
     for name, fn in (("weapons", weapons_command), ("weaponshop", weaponshop_command),
-                     ("weaponlist", weaponlist_command), ("editweapon", editweapon_command),
+                     ("weaponlist", weaponlist_command),
                      ("delweapon", delweapon_command), ("giveweapon", giveweapon_command),
                      ("evoweapon", evoweapon_command), ("dropgroups", dropgroups_command),
                      ("weapondrops", weapondrops_command), ("dropconfig", dropconfig_command),
                      ("dropnow", dropnow_command)):
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(wshop_callback, pattern=r"^wshop:"))
-    app.add_handler(CallbackQueryHandler(wdrop_callback, pattern=r"^wdrop:buy:[0-9a-f]{8}$"))
+    app.add_handler(CallbackQueryHandler(wdrop_callback, pattern=r"^wdrop:buy:[0-9a-f]{8}(:\d)?$"))
     app.add_handler(CallbackQueryHandler(dropgroups_callback, pattern=r"^wdg:"))
     app.add_handler(CallbackQueryHandler(wdp_callback, pattern=r"^wdp:"))
     if app.job_queue is not None:
