@@ -48,6 +48,7 @@ import time
 from collections import namedtuple
 from datetime import datetime, timedelta, timezone
 
+import channel  # character channel posts (all logic lives in channel.py)
 import mongo_db
 import rewards  # Mystery Box lines for /item (rewards.item_lines)
 
@@ -674,6 +675,17 @@ def _ingredient_text(recipe):
     for code, qty in recipe_ingredients(recipe):
         row = _row(code)
         parts.append(f"{qty}× {row[1] if row else '?'} [{code}]")
+    return " + ".join(parts)
+
+
+def _plain_recipe(recipe, weapon=None):
+    """'1× Kisuke Urahara + 1× Benihime' - names only (no codes, no 🌟/💫 marks) for the character channel."""
+    parts = []
+    for code, qty in recipe_ingredients(recipe):
+        row = _row(code)
+        parts.append(f"{qty}× {mongo_db.strip_evo_mark(row[1]) if row else '?'}")
+    if weapon:
+        parts.append(f"1× ⚔️ {weapon['name']}")
     return " + ".join(parts)
 
 
@@ -1458,6 +1470,10 @@ async def addevo_photo(update, context):
             _deps["mark_success"](update)
     except Exception as e:
         logger.info("addevo notification skipped: %s", e)
+    await channel.post(context, "evo_new", actor=user, photo=photo_id,
+                       new={"name": d["evo_name"], "code": d["evo_code"], "tier": d["evo_rarity"], "series": d["evo_anime"],
+                            "worth": d["evo_worth"], "recipe": _plain_recipe(recipe, weapon), "stones": d["evo_stones"],
+                            "berries": d["evo_berries"]})
     return -1
 
 
@@ -2160,6 +2176,7 @@ async def editevo_berries(update, context):
               "stones": d["eevo_stones"], "berries": d["eevo_berries"]}
     if pair:
         values.update({"second": d["eevo_second"], "qty2": d["eevo_qty2"]})
+    old_row, old_recipe = d.get("eevo_row"), d.get("eevo_recipe")      # kept for the character-channel post (_clear_x wipes them)
     try:
         res = await asyncio.to_thread(edit_evolution_sync, code0, values, user.id)
     except Exception as e:
@@ -2203,6 +2220,24 @@ async def editevo_berries(update, context):
             _deps["mark_success"](update)
     except Exception as e:
         logger.info("editevo notification skipped: %s", e)
+    try:
+        wslot = (old_recipe or {}).get("weapon_code")
+        weapon_now = await asyncio.to_thread(get_weapon, wslot) if wslot else None
+        old_photo = old_row[5] if old_row is not None and len(old_row) > 5 else None
+        old_view = {}
+        if old_row is not None:
+            old_view.update({"name": mongo_db.strip_evo_mark(old_row[1]), "code": code0, "tier": old_row[3],
+                             "series": old_row[2], "worth": old_row[4], "photo": old_photo})
+        if old_recipe:
+            old_view.update({"recipe": _plain_recipe(old_recipe, weapon_now), "stones": old_recipe["stones"],
+                             "berries": old_recipe["berries"]})
+        await channel.post(context, "evo_edit", actor=user, photo=values["photo"] or old_photo, old=old_view,
+                           new={"name": values["name"], "code": values["code"], "tier": values["rarity"],
+                                "series": values["anime"], "worth": values["worth"],
+                                "recipe": _plain_recipe(recipe_now, weapon_now), "stones": values["stones"],
+                                "berries": values["berries"], "photo": values["photo"] or old_photo})
+    except Exception as e:
+        logger.info("editevo channel post skipped: %s", e)
     return -1
 
 
@@ -3359,6 +3394,7 @@ async def addweapon_photo(update, context):
                            f"💰 Shop Price: {price}\n"
                            f"📷 Photo: Added\n"
                            f"👤 By: {_by(user)}", user)
+    await channel.post(context, "weapon_new", new=doc, actor=user)
     _success(update)
     return -1
 
@@ -3431,10 +3467,12 @@ async def editweapon_command(update, context):
     else:
         await _reply(msg, EDIT_USAGE)
         return
+    old_w = w
     await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": code}, {"$set": upd})
     w = await asyncio.to_thread(get_weapon, code)
     await _reply(msg, f"✅ Weapon updated: {_weapon_label(w)} ({field})")
     await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {field}\n👤 By: {_by(user)}", user)
+    await channel.post(context, "weapon_edit", old=old_w, new=w, actor=user)
     _success(update)
 
 
@@ -3523,11 +3561,13 @@ async def editweapon_step(update, context):
     if not st["changes"]:
         await _reply(msg, "ℹ️ Nothing was changed.", reply_markup=ReplyKeyboardRemove())
         return -1
+    old_w = w
     await asyncio.to_thread(_col(WEAPONS_COL).update_one, {"_id": st["code"]}, {"$set": st["changes"]})
     w = await asyncio.to_thread(get_weapon, st["code"])
     changed = ", ".join(sorted({"shop_price": "price", "shop_enabled": "price"}.get(k, k) for k in st["changes"]))
     await _reply(msg, "✅ Weapon updated.\n\n" + _wm_weapon_text(w), reply_markup=ReplyKeyboardRemove())
     await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {changed}\n👤 By: {_by(user)}", user)
+    await channel.post(context, "weapon_edit", old=old_w, new=w, actor=user)
     _success(update)
     return -1
 
@@ -4262,6 +4302,7 @@ async def wm_callback(update, context):
                                          reply_markup=_kb([[("⚔️ Open Weapon", f"wm:w:{doc['_id']}:0")]]))
             await _notify(context, f"⚔️ NEW WEAPON ADDED\n⚔️ {doc['name']} [{doc['code']}]\n📺 Anime: {doc['anime']}\n🗡 Type: {doc['type'] or 'Not set'}\n"
                                    f"{_rarity_text(doc['rarity'])}\n💰 Shop Price: {price}\n📷 Photo: Added\n👤 By: {_by(q.from_user)}", q.from_user)
+            await channel.post(context, "weapon_new", new=doc, actor=q.from_user)
             return
         if action == "dy":                                               # confirmed delete
             w, owners = await asyncio.to_thread(_wm_delete_sync, a1)
@@ -4488,6 +4529,7 @@ async def wm_input(update, context):
         text, kb = await asyncio.to_thread(_wm_weapon_view, code, st["page"])
         await _reply(msg, "✅ Saved.\n\n" + text, reply_markup=kb)
         await _notify(context, f"✏️ WEAPON UPDATED\n⚔️ {_weapon_label(w)}\n🔧 Changed: {field}\n👤 By: {_by(user)}", user)
+        await channel.post(context, "weapon_edit", old=w, new={**w, **upd}, actor=user)
         _success(update)
         return -1
     # ---------------- 💸 manual discount: percent (customise or rolled from a range), then how long
