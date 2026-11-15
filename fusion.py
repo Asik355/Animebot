@@ -994,7 +994,7 @@ def _resolve_recipe_sync(query):
         producing = get_recipe_sync(row[0])
         recipes = [producing] if producing else []
     if not recipes:
-        return [], "❌ There is no evolution recipe for that character. See /evolution."
+        return [], f"❌ No fusion is available for {row[1]} [{row[0]}]. See /evolution for every recipe."
     return recipes, None
 
 
@@ -1105,12 +1105,8 @@ async def evolve_command(update, context):
         return
     query = " ".join(getattr(context, "args", None) or []).strip()
     if not query:
-        kb = await asyncio.to_thread(_pick_keyboard_sync, user.id)
-        if kb is None:
-            await _reply(msg, "You don't own a character that can evolve right now.\nSee /evolution for every recipe, "
-                              "or use /evolve <code or name>.")
-        else:
-            await _reply(msg, "Choose what to evolve:", reply_markup=kb)
+        await _reply(msg, "🧬 Use /evolve followed by the 4-digit code of the character, for example /evolve 0001.\n"
+                          "I will show the fusions available for it.\n\nSee /evolution for every recipe.")
         return
     recipes, err = await asyncio.to_thread(_resolve_recipe_sync, query)
     if err:
@@ -1118,7 +1114,7 @@ async def evolve_command(update, context):
         return
     if len(recipes) > 1:
         kb = await asyncio.to_thread(_recipe_buttons_sync, user.id, recipes)
-        await _reply(msg, "Several evolutions use this card. Choose one:", reply_markup=kb)
+        await _reply(msg, "Several fusions are available for this character. Choose one:", reply_markup=kb)
         return
     recipe = recipes[0]
     card = await asyncio.to_thread(build_card_sync, user.id, recipe)
@@ -4919,6 +4915,23 @@ def _pick_drop_weapons(pool, settings):
     return random.sample(pool, min(per, len(pool)))
 
 
+def _old_drop_messages_sync():
+    """Messages of finished drops that are still in the groups: [(drop_id, chat_id, message_id)]. Only the last 7 days are looked at."""
+    since = _utcnow() - timedelta(days=7)
+    out = []
+    for d in _drops().find({"status": {"$ne": "active"}, "cleaned": {"$ne": True}, "created_at": {"$gt": since}}):
+        for m in d.get("messages") or []:
+            out.append((d["_id"], m["chat_id"], m["message_id"]))
+    return out
+
+
+async def _delete_drop_message(bot, chat_id, message_id):
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:                           # no delete right, already gone, too old: the old post just stays
+        logger.info("old drop message delete in %s skipped: %s", chat_id, e)
+
+
 async def start_drop(bot, weapons, source="auto"):
     """Starts a drop of one weapon (dict) or several (list) in every enabled group. Returns (ok, text)."""
     weapons = [weapons] if isinstance(weapons, dict) else list(weapons)
@@ -4934,8 +4947,11 @@ async def start_drop(bot, weapons, source="auto"):
         return False, "❌ A weapon drop is already running."
     wmap = {w["_id"]: w for w in weapons}
     text, kb, has_photo = _drop_view(drop, wmap)
+    old = await asyncio.to_thread(_old_drop_messages_sync)       # the previous drop's post (ended / sold out) is removed when a new drop appears
     sent = 0
     for cid in groups:
+        for _did, ocid, omid in [x for x in old if x[1] == cid]:
+            await _delete_drop_message(bot, ocid, omid)
         try:
             if has_photo:
                 m = await bot.send_photo(chat_id=cid, photo=weapons[0]["photo"], caption=text, reply_markup=kb)
@@ -4956,6 +4972,10 @@ async def start_drop(bot, weapons, source="auto"):
     if sent == 0:                                   # nobody could receive it: do not keep a dead drop alive
         await asyncio.to_thread(_finish_drop_sync, drop["_id"], "ended")
         return False, "❌ The drop could not be sent to any group (is the bot still in them?)."
+    for _did, ocid, omid in [x for x in old if x[1] not in groups]:     # groups that are no longer enabled
+        await _delete_drop_message(bot, ocid, omid)
+    for did in {x[0] for x in old}:
+        await asyncio.to_thread(_drops().update_one, {"_id": did}, {"$set": {"cleaned": True}})
     return True, f"✅ Weapon drop started: {', '.join(w['name'] for w in weapons)} in {sent} group(s)."
 
 
