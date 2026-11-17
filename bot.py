@@ -2485,6 +2485,8 @@ RANGE_HELP_TEXT = (
     "📌 Overview\n"
     "Give every anime its own block of 4-digit codes (Naruto 0001-0200, Bleach 0201-0400), see which codes are "
     "used or free, and find the next free code.\n\n"
+    "Weapons have their own ranges, one per series (anime): put the word weapon after the command "
+    "(/setrange weapon Bleach 0001 0100), or tap ⚔️ Weapons in the Range Panel.\n\n"
     "Tap Range Commands for the command list, or Range Panel to do everything with buttons - no typing commands."
 )
 RANGE_COMMANDS_TEXT = (
@@ -2494,8 +2496,16 @@ RANGE_COMMANDS_TEXT = (
     "3. /range - show all ranges, or /range <anime> for one anime\n"
     "4. /freecode - show used and free codes (all anime, or one)\n"
     "5. /nextcode - show the next free code (all anime, or one)\n"
-    "6. /fillranges - move every character into the range of its anime\n"
-    "7. /undocodes - undo the last /fillranges or range shift"
+    "6. /fillranges - move every character (Evolution characters too) into the range of its anime\n"
+    "7. /undocodes - undo the last /fillranges or range shift\n"
+    "8. /editrange - make a range bigger (/editrange Naruto 1000 1400); the ranges after it shift up\n\n"
+    "⚔️ Weapon ranges (a range of weapon codes per series; the character ranges are not touched)\n"
+    "9. /setrange weapon <series> <start> <end> - set or update a series' weapon range\n"
+    "10. /delrange weapon <series> - delete a series' weapon range\n"
+    "11. /range weapon - show all weapon ranges, or /range weapon <series> for one series\n"
+    "12. /freecode weapon - show used and free weapon codes (all series, or one)\n"
+    "13. /nextcode weapon - show the next free weapon code (all series, or one)\n"
+    "The Range Panel has the same screens under ⚔️ Weapons."
 )
 HELP_MODULES["owner"].append(("range", "📏 Range", RANGE_HELP_TEXT))
 HELP_MODULES["executive"].append(("range", "📏 Range", RANGE_HELP_TEXT))
@@ -3902,7 +3912,7 @@ RANGE_PANEL_TTL = 300                 # a panel flow expires after 5 minutes wit
 RANGE_MSG_LIMIT = 3800                # a longer answer is split into several messages
 RANGE_MAX_NEXT = 50                   # /nextcode <anime> <count> maximum
 _rg_state = {}                        # user id -> panel flow state {role, step, anime, start, end, chat, msg, exp}
-_RG_TEXT_STEPS = ("sa", "ss", "se", "q")      # panel steps that wait for a typed message
+_RG_TEXT_STEPS = ("sa", "ss", "se", "q", "ee")      # panel steps that wait for a typed message
 
 
 def _rg_allowed(user_id):
@@ -4246,11 +4256,12 @@ async def rg_code_problem(anime, code, exclude_code=None):
     return None
 
 
-async def rg_free_codes_markup(user_id, anime):
-    """The '🔢 Show Free Codes' button of the Add Character flow (only when the anime has a range)."""
+async def rg_free_codes_markup(user_id, anime, flow="a"):
+    """The '🔢 Show Free Codes' button of the Add Character flow (only when the anime has a range).
+    flow: a = /addcharacter, e = /addevo, x = /editevo (tells the button which flow's anime to look up)."""
     if not (anime or "").strip() or await asyncio.to_thread(mongo_db.get_range, anime) is None:
         return None
-    return InlineKeyboardMarkup([[_rg_btn("🔢 Show Free Codes", f"rg:{user_id}:fa:a")]])
+    return InlineKeyboardMarkup([[_rg_btn("🔢 Show Free Codes", f"rg:{user_id}:fa:{flow}")]])
 
 
 # ---- sending ------------------------------------------------------------------------------------------
@@ -4299,6 +4310,8 @@ async def range_command(update, context):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not _rg_allowed(user.id):
         return
+    if await rw_dispatch(update, context, "range"):                # /range weapon [series]
+        return
     query = " ".join(context.args or []).strip()
     if not query:
         text, markup = await rg_list_view("r", 0, user.id)
@@ -4313,6 +4326,8 @@ async def freecode_command(update, context):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not _rg_allowed(user.id):
         return
+    if await rw_dispatch(update, context, "freecode"):             # /freecode weapon [series]
+        return
     query = " ".join(context.args or []).strip()
     if not query:
         text, markup = await rg_list_view("f", 0, user.id)
@@ -4326,6 +4341,8 @@ async def nextcode_command(update, context):
     """/nextcode [anime] [count]."""
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not _rg_allowed(user.id):
+        return
+    if await rw_dispatch(update, context, "nextcode"):             # /nextcode weapon [series] [count]
         return
     args = list(context.args or [])
     if not args:
@@ -4346,6 +4363,8 @@ async def setrange_command(update, context):
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not _rg_allowed(user.id):
         return
+    if await rw_dispatch(update, context, "setrange"):             # /setrange weapon <series> <start> <end>
+        return
     args = list(context.args or [])
     usage = "Usage: /setrange <anime> <start> <end>\nExample: /setrange Naruto 0001 0200"
     if len(args) < 3:
@@ -4361,6 +4380,8 @@ async def delrange_command(update, context):
     """/delrange <anime> - delete a range (asks for confirmation first)."""
     msg, user = update.effective_message, update.effective_user
     if not msg or not user or not _rg_allowed(user.id):
+        return
+    if await rw_dispatch(update, context, "delrange"):             # /delrange weapon <series>
         return
     query = " ".join(context.args or []).strip()
     if not query:
@@ -4388,6 +4409,8 @@ async def rg_fill_view(uid, context, only_name=None, back=None):
         lines.append("✅ Nothing to move: every character is already inside its anime's range.")
     else:
         lines.append(f"Characters to move into their anime's range: {plan['moving']}")
+        if plan["evolution"]:
+            lines.append(f"Of these, Evolution characters: {plan['evolution']}")
         lines.append(f"Already inside their range (they keep their codes): {plan['inside']}")
     lines.append("")
     n = 0
@@ -4403,8 +4426,6 @@ async def rg_fill_view(uid, context, only_name=None, back=None):
     if plan["samples"]:
         lines += ["", "Examples:"] + [f"{_rg_fc(o)} → {_rg_fc(nw)}  {nm}" for o, nw, nm in plan["samples"]]
     notes = []
-    if plan["evolution"]:
-        notes.append(f"{plan['evolution']} Evolution character(s) (use /editevo)")
     if plan["unranged"]:
         notes.append(f"{sum(plan['unranged'].values())} character(s) of anime without a range ("
                      + ", ".join(list(plan["unranged"])[:5]) + (", …" if len(plan["unranged"]) > 5 else "") + ")")
@@ -4479,7 +4500,8 @@ async def rg_extend_offer(uid, name, start, end):
     head = f"❌ {cur['anime_name']} {_rg_span(s_, e_)} runs into the next range."
     if not plan["ok"]:
         return head + "\n⚠️ " + plan["error"], None
-    lines = [head, "Shift the following ranges up so everything still fits? Their characters keep their position:"]
+    head = f"{cur['anime_name']} grows: {_rg_span(cur['start_code'], cur['end_code'])} → {_rg_span(s_, e_)}"
+    lines = [head, "These ranges move up so everything still fits (their characters keep their position):"]
     for i, sh in enumerate(plan["shifts"], 1):
         lines.append(f"{i}. {sh['name']}: {_rg_span(*sh['old'])} → {_rg_span(*sh['new'])} (+{sh['shift']}, {sh['chars']} characters)")
     lines.append(f"Characters to move: {plan['moving']}")
@@ -4542,6 +4564,87 @@ async def fillranges_command(update, context):
         only = res["name"]
     chunks, rows = await rg_fill_view(user.id, context, only)
     await rg_reply(msg, chunks, rows)
+
+
+async def rg_edit_range_offer(context, user, chat, name, new_end):
+    """/editrange and the panel's ✏️ Edit Range: grow an anime's range to `new_end` (the start stays). When it runs into
+    the following ranges the shift is offered (✅ Shift & move); otherwise the range is simply extended.
+    Returns (text, rows)."""
+    cur = await asyncio.to_thread(mongo_db.get_range, name)
+    if cur is None:
+        return f"No range set for {name}. Create it with /setrange.", None
+    if new_end <= cur["end_code"]:
+        return (f"❌ The new ending code must be bigger than the current one ({_rg_fc(cur['end_code'])}).\n"
+                f"Use /setrange to shrink or move a range."), None
+    plan = await asyncio.to_thread(mongo_db.plan_range_extend, name, cur["start_code"], new_end, _rg_spawned(context))
+    if plan["ok"] and not plan["shifts"]:
+        ok, text, rows = await rg_do_set(context, user, chat, name, cur["start_code"], new_end)
+        return text, rows
+    offer = await rg_extend_offer(user.id, name, cur["start_code"], new_end)
+    if offer:
+        return offer[0], offer[1]
+    return "❌ " + (plan.get("error") or "The range could not be extended.") + "\nNothing was changed.", None
+
+
+async def rg_edit_range_info(name):
+    st = await asyncio.to_thread(mongo_db.range_status, name)
+    if st is None:
+        return None
+    return (f"✏️ Edit Range — {st['name']}\nRange: {_rg_span_sp(st['start'], st['end'])}\n"
+            f"Used: {st['used_count']} | Free: {st['free_count']} | Total: {st['total']}\n\n"
+            f"Send the new ending code (bigger than {_rg_fc(st['end'])}). The ranges after it move up if they are in the way, "
+            "with their characters. Send /cancel to stop.")
+
+
+async def editrange_command(update, context):
+    """/editrange <anime> [new end] - make an anime's range bigger; the ranges after it shift up when needed (PM only)."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not _rg_allowed(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /editrange can only be used in the bot's PM (private chat).")
+        return
+    args = list(context.args or [])
+    if not args:
+        await safe_reply_text(msg, "Usage: /editrange <anime> [start] <new end>\nExample: /editrange Naruto 1000 1400")
+        return
+    query, new_end, given_start = " ".join(args), None, None
+    if (len(args) >= 3 and mongo_db.parse_code(args[-1]) is not None and mongo_db.parse_code(args[-2]) is not None
+            and (await asyncio.to_thread(mongo_db.resolve_anime, " ".join(args[:-2])))["status"] != "none"):
+        query, given_start, new_end = " ".join(args[:-2]), mongo_db.parse_code(args[-2]), mongo_db.parse_code(args[-1])
+    elif len(args) >= 2 and mongo_db.parse_code(args[-1]) is not None:
+        name_part = " ".join(args[:-1])
+        if (await asyncio.to_thread(mongo_db.resolve_anime, name_part))["status"] != "none":
+            query, new_end = name_part, mongo_db.parse_code(args[-1])
+    res = await asyncio.to_thread(mongo_db.resolve_anime, query)
+    if res["status"] not in ("exact", "one"):
+        chunks, rows = await rg_lookup_view("r", query, user.id)
+        await rg_reply(msg, chunks, rows)
+        return
+    name = res["name"]
+    if given_start is not None:
+        cur = await asyncio.to_thread(mongo_db.get_range, name)
+        if cur is None:
+            await safe_reply_text(msg, f"No range set for {name}. Create it with /setrange.")
+            return
+        if given_start != cur["start_code"]:
+            await safe_reply_text(msg, f"❌ {name} starts at {_rg_fc(cur['start_code'])}, not {_rg_fc(given_start)}. /editrange only "
+                                       f"changes the end (it keeps the start). Use /editrange {name} {_rg_fc(cur['start_code'])} "
+                                       f"{_rg_fc(new_end)}, or /setrange to move the start.")
+            return
+    if new_end is None:
+        info = await rg_edit_range_info(name)
+        if info is None:
+            await safe_reply_text(msg, f"No range set for {name}. Create it with /setrange.")
+            return
+        st = {"role": "o" if is_owner(user.id) else "e", "step": "ee", "anime": name, "start": None, "end": None,
+              "chat": msg.chat_id, "msg": msg.message_id}
+        _rg_touch(st)
+        _rg_state[user.id] = st
+        await safe_reply_text(msg, info)
+        return
+    text, rows = await rg_edit_range_offer(context, user, update.effective_chat, name, new_end)
+    await safe_reply_text(msg, text, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 
 async def rg_undo_view(uid, back=None):
@@ -4972,8 +5075,11 @@ async def editcode_command(update, context):
     except Exception:
         recruits_now = []
     shown = {"name": name, "tier": character[3], "series": anime, "worth": character[4], "recruits": recruits_now}
-    await channel.post(context, "char_edit", actor=user, photo=character[5] if len(character) > 5 else None,
-                       old={**shown, "code": old_code}, new={**shown, "code": new_code})
+    try:
+        await channel.post(context, "char_edit", actor=user, photo=character[5] if len(character) > 5 else None,
+                           old={**shown, "code": old_code}, new={**shown, "code": new_code})
+    except Exception as e:
+        print("Character channel post error (editcode):", repr(e))
     mark_success(update)
 
 
@@ -4994,11 +5100,13 @@ def _rg_panel_state(query):
 def _rg_home_view(uid, st):
     role = "owner" if st["role"] == "o" else "executive"
     st["step"] = None
+    st["wk"] = False
     text = "📏 Range Panel\n\nPick an action. Everything happens in this one message."
     buttons = [_rg_btn("➕ Set Range", f"rg:{uid}:sa:0"), _rg_btn("🗑 Delete Range", f"rg:{uid}:dl:0"),
                _rg_btn("📋 View Ranges", f"rg:{uid}:l:r:0"), _rg_btn("🔍 Search Anime", f"rg:{uid}:q"),
                _rg_btn("🆓 Free Codes", f"rg:{uid}:fl:0"), _rg_btn("➡️ Next Code", f"rg:{uid}:nl:0"),
-               _rg_btn("🧩 Fill Ranges", f"rg:{uid}:fv"), _rg_btn("↩ Undo Moves", f"rg:{uid}:uv")]
+               _rg_btn("🧩 Fill Ranges", f"rg:{uid}:fv"), _rg_btn("↩ Undo Moves", f"rg:{uid}:uv"),
+               _rg_btn("⚔️ Weapons", f"rg:{uid}:wp"), _rg_btn("✏️ Edit Range", f"rg:{uid}:er:0")]
     rows = _rg_grid(buttons, 4)
     rows.append(_rg_nav_row(uid, f"help:{uid}:{role}:range"))
     return text, rows
@@ -5016,10 +5124,10 @@ async def rg_picker_view(kind, page, uid, st):
         ranges = await asyncio.to_thread(mongo_db.get_ranges)
         names = sorted((r["anime_name"] for r in ranges), key=lambda n: n.casefold())
         title = {"dl": "🗑 Delete Range\n\nPick the anime:", "fl": "🆓 Free Codes\n\nPick the anime:",
-                 "nl": "➡️ Next Code\n\nPick the anime:"}[kind]
-        mode = {"dl": "d", "fl": "f", "nl": "n"}[kind]
+                 "nl": "➡️ Next Code\n\nPick the anime:", "er": "✏️ Edit Range\n\nPick the anime whose range grows:"}[kind]
+        mode = {"dl": "d", "fl": "f", "nl": "n", "er": "r"}[kind]
         st["step"] = None
-        pick = lambda h, mode=mode: f"rg:{uid}:v:{mode}:{h}:1"
+        pick = (lambda h: f"rg:{uid}:ep:{h}") if kind == "er" else (lambda h, mode=mode: f"rg:{uid}:v:{mode}:{h}:1")
     rows = []
     if not names:
         title += "\n\n" + ("No anime found yet." if kind == "sa" else "No ranges are set yet.")
@@ -5063,12 +5171,13 @@ async def rg_start_set_flow(query, uid, st, anime):
     await _rg_edit(query, text, rows)
 
 
-async def _rg_free_codes_in_flow(query, context, uid):
-    """'🔢 Show Free Codes' inside /addcharacter: the free codes of the anime chosen in this flow."""
+async def _rg_free_codes_in_flow(query, context, uid, flow="a"):
+    """'🔢 Show Free Codes' inside /addcharacter, /addevo and /editevo: the free codes of the anime chosen in this flow."""
     if not await asyncio.to_thread(can_manage_characters, uid):
         await deny_callback(query)
         return
-    anime = (context.user_data.get("anime") or "").strip()
+    key = {"a": "anime", "e": "evo_anime", "x": "eevo_anime"}.get(flow, "anime")
+    anime = (context.user_data.get(key) or "").strip()
     if not anime:
         await query.answer("No anime is chosen in this flow.", show_alert=True)
         return
@@ -5094,14 +5203,17 @@ async def range_callback(update, context):
         if act == "noop":
             await query.answer()
             return
-        if act == "fa":                                          # Add Character flow button (not a range feature)
-            await _rg_free_codes_in_flow(query, context, uid)
+        if act == "fa":                                          # Add Character / Evolution flow button (not a range feature)
+            await _rg_free_codes_in_flow(query, context, uid, parts[3] if len(parts) > 3 else "a")
             return
         if not _rg_allowed(uid):
             await deny_callback(query)
             return
         chat = query.message.chat if query.message else None
         arg = parts[3] if len(parts) > 3 else ""
+        if act.startswith("w"):                                  # ⚔️ weapon ranges: the same screens on the weapon list
+            await rw_callback(query, context, user, chat, uid, act[1:], parts)
+            return
 
         if act == "p":                                           # open the Range Panel
             if chat is None or chat.type != "private":
@@ -5138,13 +5250,21 @@ async def range_callback(update, context):
             await rg_start_set_flow(query, uid, st, name)
             return
 
-        if act in ("sa", "sp", "ss", "se", "sy", "q", "dl", "fl", "nl"):     # steps that need a live panel
+        if act in ("sa", "sp", "ss", "se", "sy", "q", "dl", "fl", "nl", "er", "ep"):     # steps that need a live panel
             st = _rg_panel_state(query)
             if st is None:
                 await query.answer("⌛ This panel expired or was replaced. Open it again from /help → Range.", show_alert=True)
                 return
             await query.answer()
-            if act in ("sa", "dl", "fl", "nl"):
+            if act == "ep":                                      # Edit Range: anime picked, now ask for the new end
+                name = await asyncio.to_thread(mongo_db.anime_by_hash, arg)
+                info = await rg_edit_range_info(name) if name else None
+                if info is None:
+                    await _rg_edit(query, "That range no longer exists.", [_rg_nav_row(uid, f"rg:{uid}:er:0")])
+                    return
+                st["anime"], st["step"] = name, "ee"
+                await _rg_edit(query, info, [_rg_nav_row(uid, f"rg:{uid}:er:0")])
+            elif act in ("sa", "dl", "fl", "nl", "er"):
                 text, rows = await rg_picker_view(act, int(arg) if arg.isdigit() else 0, uid, st)
                 await _rg_edit(query, text, rows)
             elif act == "sp":
@@ -5282,8 +5402,19 @@ async def range_panel_input(update, context):
     uid, step = user.id, st["step"]
     _rg_touch(st)
     text = " ".join((msg.text or "").split())
+    if step == "ee":                                               # /editrange <anime>: the new ending code
+        code = mongo_db.parse_code(text)
+        if code is None:
+            await safe_reply_text(msg, "⚠️ Send a code from 0001 to 9999, or /cancel.")
+            return
+        _rg_state.pop(uid, None)
+        out, rows = await rg_edit_range_offer(context, user, update.effective_chat, st["anime"], code)
+        await safe_reply_text(msg, out, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+        return
     warn, view = "", None
-    if step == "sa":
+    if st.get("wk"):                                               # ⚔️ weapon panel: same steps on the weapon ranges
+        warn, view = await rw_panel_text(step, text, st, uid)
+    elif step == "sa":
         if not text or len(text) > 60:
             warn, view = "⚠️ Send an anime name (up to 60 characters).", await rg_picker_view("sa", 0, uid, st)
         else:
@@ -5338,6 +5469,464 @@ async def range_panel_input(update, context):
             sent = await safe_reply_text(msg, view[0], reply_markup=InlineKeyboardMarkup(view[1]) if view[1] else None)
             if sent is not None and getattr(sent, "message_id", None):
                 st["msg"] = sent.message_id
+
+
+# ---------------------------------------------------------------------------------------------------
+# WEAPON CODE RANGES (Owner + Executive). The same commands, screens and rules as the character ranges above, on the
+# weapon list: /setrange weapon <series> <start> <end>, /range weapon, /freecode weapon, /nextcode weapon,
+# /delrange weapon <series>, and the ⚔️ Weapons button of the Range Panel. A weapon range belongs to a series (anime)
+# and lives in its own collection (mongo_db.weapon_ranges): the character ranges are never touched, and weapons are never
+# renumbered. Without the word "weapon" every command works on characters exactly as before.
+# Callback data: rg:<user_id>:w<action>[:args] - the actions of the character panel with a leading w:
+#   wp open the weapon panel   wl:<kind>:<page> numbered lists   wv:<mode>:<hash>:<count> one series (r / f / n / d)
+#   wsa/wsp/wss/wse/wsy set-range flow   wdl/wfl/wnl pickers   wq search   wdd confirmed delete   wsr set range
+# ---------------------------------------------------------------------------------------------------
+RW_WORDS = ("weapon", "weapons")
+
+
+def _rw(uid, act):
+    return f"rg:{uid}:w{act}"
+
+
+async def rw_code_problem(series, code, exclude_code=None):
+    """Add validation of a weapon code against the series' weapon range: the error text (same messages as
+    rg_code_problem), or None when the code is fine (also when the series has no weapon range - nothing is enforced)."""
+    chk = await asyncio.to_thread(mongo_db.check_weapon_code_for_series, series, code, exclude_code)
+    if chk["status"] == "outside":
+        return f"❌ Code {code} is outside {chk['name']}'s weapon range ({_rg_span(chk['start'], chk['end'])})."
+    if chk["status"] == "taken":
+        if chk["suggestions"]:
+            tail = "Next free codes: " + ", ".join(_rg_fc(c) for c in chk["suggestions"]) + "."
+        else:
+            tail = (f"{chk['name']}'s weapon range is full ({_rg_span(chk['start'], chk['end'])}). "
+                    "Extend it with /setrange weapon.")
+        return f"❌ Code {code} is already used by {chk['owner']}.\n{tail}"
+    return None
+
+
+async def rw_code_hint(series):
+    """The line shown at the code step of ➕ Create Weapon and /addweapon: the next free weapon code of the series
+    ('' when the series has no weapon range). It starts with a line break."""
+    if not (series or "").strip():
+        return ""
+    info = await asyncio.to_thread(mongo_db.next_free_weapon_codes, series, 1)
+    if info is None:
+        return ""
+    span = _rg_span(info["start"], info["end"])
+    if info["full"]:
+        return (f"\n⚠️ {info['name']}'s weapon range is full ({span}). "
+                f"Extend it with /setrange weapon {info['name']} {_rg_fc(info['start'])} <new end>.")
+    return f"\n➡️ Next free code in {info['name']}'s weapon range ({span}): {_rg_fc(info['codes'][0])}"
+
+
+# ---- views shared by the typed commands and the weapon panel -------------------------------------------
+async def rw_list_view(kind, page, uid, back=None):
+    """(text, markup) of the numbered list: kind r = /range weapon, f = /freecode weapon, n = /nextcode weapon."""
+    if kind == "r":
+        rows = await asyncio.to_thread(mongo_db.get_weapon_ranges)
+        lines_all = [f"{r['anime_name']}: {_rg_span_sp(r['start_code'], r['end_code'])}" for r in rows]
+        title = "⚔️ Weapon code ranges"
+    else:
+        sts = await asyncio.to_thread(mongo_db.all_weapon_range_status)
+        lines_all = []
+        for st in sts:
+            if kind == "f":
+                if st["free_count"] == 0:
+                    lines_all.append(f"{st['name']}: full ({_rg_span(st['start'], st['end'])})")
+                else:
+                    runs = st["free_runs"]
+                    shown = mongo_db.format_runs(runs[:3]) + (", …" if len(runs) > 3 else "")
+                    lines_all.append(f"{st['name']}: {st['free_count']} free ({shown})")
+            else:
+                lines_all.append(f"{st['name']}: " + (_rg_fc(st["free_runs"][0][0]) if st["free_count"] else "range is full"))
+        title = "⚔️ Free weapon codes" if kind == "f" else "⚔️ Next free weapon codes"
+    markup_rows = []
+    if not lines_all:
+        text = f"{title}\n\nNo weapon ranges are set yet.\nUse /setrange weapon <series> <start> <end>, or the Range Panel."
+    else:
+        part, page, pages, offset = _rg_slice(lines_all, page)
+        body = "\n".join(f"{offset + i}. {line}" for i, line in enumerate(part, 1))
+        text = f"{title} ({len(lines_all)})\n\n{body}"
+        if pages > 1:
+            markup_rows.append(_rg_page_row(uid, _rw(uid, f"l:{kind}"), page, pages))
+    if back:
+        markup_rows.append(_rg_nav_row(uid, back))
+    return text, (InlineKeyboardMarkup(markup_rows) if markup_rows else None)
+
+
+async def rw_detail_view(mode, name, uid, count=1, back=None):
+    """([message texts], [button rows]) for ONE series. mode r = /range weapon <series>, f = /freecode weapon <series>,
+    n = /nextcode weapon <series> [count], d = the delete confirmation."""
+    h = mongo_db.anime_hash(name)
+    if mode == "n":
+        info = await asyncio.to_thread(mongo_db.next_free_weapon_codes, name, count)
+        st = None if info is None else {"name": info["name"], "start": info["start"], "end": info["end"]}
+    else:
+        st = await asyncio.to_thread(mongo_db.weapon_range_status, name)
+    rows = []
+    if st is None:
+        chunks = [f"No weapon range set for {name}"]
+        rows.append([_rg_btn("📏 Set Range", _rw(uid, f"sr:{h}"))])
+    elif mode == "r":
+        lines = [st["name"], f"Weapon range: {_rg_span_sp(st['start'], st['end'])}",
+                 f"Used: {st['used_count']} | Free: {st['free_count']} | Total: {st['total']}",
+                 "Used codes: " + (mongo_db.format_runs(st["used_runs"]) or "none"),
+                 "Free codes: " + (mongo_db.format_runs(st["free_runs"]) or "none")]
+        chunks = rg_chunks(lines)
+        rows.append([_rg_btn("🆓 Free", _rw(uid, f"v:f:{h}:1")), _rg_btn("➡️ Next", _rw(uid, f"v:n:{h}:1")),
+                     _rg_btn("📋 All", _rw(uid, "l:r:0"))])
+    elif mode == "f":
+        lines = [st["name"], f"Weapon range: {_rg_span_sp(st['start'], st['end'])}",
+                 f"Used: {st['used_count']} | Free: {st['free_count']} | Total: {st['total']}",
+                 "Free codes: " + (mongo_db.format_runs(st["free_runs"]) or "none (the range is full)")]
+        chunks = rg_chunks(lines)
+        rows.append([_rg_btn("📏 Range", _rw(uid, f"v:r:{h}:1")), _rg_btn("➡️ Next", _rw(uid, f"v:n:{h}:1")),
+                     _rg_btn("📋 All", _rw(uid, "l:f:0"))])
+    elif mode == "n":
+        span = _rg_span(info["start"], info["end"])
+        if info["full"]:
+            chunks = [f"{info['name']} weapon range is full ({span})\n"
+                      f"Extend it with /setrange weapon {info['name']} {_rg_fc(info['start'])} <new end>"]
+        elif count <= 1:
+            chunks = [f"{info['name']}: next free weapon code is {_rg_fc(info['codes'][0])} (range {span})"]
+        else:
+            codes = ", ".join(_rg_fc(c) for c in info["codes"])
+            text = f"{info['name']}: next {len(info['codes'])} free weapon codes: {codes} (range {span})"
+            if len(info["codes"]) < count:
+                text += f"\nOnly {len(info['codes'])} free code(s) are left in this range."
+            chunks = rg_chunks([text])
+        rows.append([_rg_btn("📏 Range", _rw(uid, f"v:r:{h}:1")), _rg_btn("🆓 Free", _rw(uid, f"v:f:{h}:1")),
+                     _rg_btn("📋 All", _rw(uid, "l:n:0"))])
+    else:                                                      # d: delete confirmation
+        chunks = [f"🗑 Delete the weapon range of {st['name']}?\n\n{st['name']}: {_rg_span_sp(st['start'], st['end'])}\n"
+                  f"{st['used_count']} weapon(s) use codes in it. Weapons are never deleted or changed; "
+                  "only the reserved range is removed."]
+        middle = _rg_btn("⬅ Back", back) if back else _rg_btn("📏 Range", _rw(uid, f"v:r:{h}:1"))
+        rows.append([_rg_btn("✅ Delete", _rw(uid, f"dd:{h}")), middle, _rg_btn("❌ Cancel", f"rg:{uid}:x")])
+        return chunks, rows
+    if back:
+        rows.append(_rg_nav_row(uid, back))
+    return chunks, rows
+
+
+async def rw_lookup_view(mode, query, uid, count=1, back=None):
+    """Name matching shared by every weapon range command and button (same rules as rg_lookup_view)."""
+    res = await asyncio.to_thread(mongo_db.resolve_series, query)
+    if res["status"] in ("exact", "one"):
+        return await rw_detail_view(mode, res["name"], uid, count, back)
+    if res["status"] == "multi":
+        names = res["names"]
+        buttons = [_rg_btn(n, _rw(uid, f"v:{mode}:{mongo_db.anime_hash(n)}:{count}")) for n in names[:RANGE_PICK_MAX]]
+        text = f"'{query}' matches {len(names)} series. Pick one:"
+        if len(names) > RANGE_PICK_MAX:
+            text += f"\n(Showing the first {RANGE_PICK_MAX}. Type more of the name to narrow it down.)"
+    else:
+        names = res["closest"]
+        buttons = [_rg_btn(n, _rw(uid, f"v:{mode}:{mongo_db.anime_hash(n)}:{count}")) for n in names]
+        text = f"No weapon range found for '{query}'" + ("\nDid you mean:" if buttons else "")
+    rows = _rg_grid(buttons, 3)
+    if back:
+        rows.append(_rg_nav_row(uid, back))
+    return [text], rows
+
+
+async def rw_do_set(context, user, chat, name, start, end):
+    """Create/update a weapon range (typed /setrange weapon and the panel's Confirm). Returns (ok, text)."""
+    result = await asyncio.to_thread(mongo_db.set_weapon_range, name, start, end, user.id)
+    if not result["ok"]:
+        return False, "❌ " + result["message"]
+    r, prev = result["range"], result["previous"]
+    series = r["anime_name"]
+    span = _rg_span_sp(r["start_code"], r["end_code"])
+    total = r["end_code"] - r["start_code"] + 1
+    if prev is None:
+        text = f"✅ Weapon range created\n{series}: {span} ({total} codes)"
+    else:
+        text = (f"✅ Weapon range updated\n{series}: {_rg_span_sp(prev['start_code'], prev['end_code'])} → {span} "
+                f"({total} codes)")
+    try:
+        outside = await asyncio.to_thread(mongo_db.weapon_outside_count, series)
+        if outside:
+            text += f"\n⚠️ {outside} existing {series} weapon(s) have codes outside this range."
+    except Exception as e:
+        print("Weapon range check error:", repr(e))
+    await log_range_change(context, user, chat, "setrange", f"weapon {series} {_rg_fc(r['start_code'])} {_rg_fc(r['end_code'])}")
+    return True, text
+
+
+async def rw_do_delete(context, user, chat, name):
+    """Delete a weapon range (typed /delrange weapon after Confirm, and the panel). Returns text."""
+    old = await asyncio.to_thread(mongo_db.get_weapon_range, name)
+    if old is None or not await asyncio.to_thread(mongo_db.delete_weapon_range, name):
+        return f"No weapon range set for {name}"
+    await log_range_change(context, user, chat, "delrange", f"weapon {old['anime_name']}")
+    return f"✅ Weapon range deleted\n{old['anime_name']}: {_rg_span_sp(old['start_code'], old['end_code'])}"
+
+
+# ---- typed commands: /setrange /delrange /range /freecode /nextcode followed by the word "weapon" -----------
+async def rw_dispatch(update, context, command):
+    """Called by the five range commands after their role check. When the first word is 'weapon', runs the same command
+    on the weapon ranges and returns True; otherwise returns False and the command goes on with characters, unchanged."""
+    args = list(context.args or [])
+    if not args or args[0].casefold() not in RW_WORDS:
+        return False
+    msg, user = update.effective_message, update.effective_user
+    rest = args[1:]
+    query = " ".join(rest).strip()
+    if command in ("range", "freecode"):
+        kind = "r" if command == "range" else "f"
+        if not query:
+            text, markup = await rw_list_view(kind, 0, user.id)
+            await safe_reply_text(msg, text, reply_markup=markup)
+        else:
+            chunks, rows = await rw_lookup_view(kind, query, user.id)
+            await rg_reply(msg, chunks, rows)
+    elif command == "nextcode":
+        if not rest:
+            text, markup = await rw_list_view("n", 0, user.id)
+            await safe_reply_text(msg, text, reply_markup=markup)
+            return True
+        count = 1
+        if len(rest) >= 2 and rest[-1].isdigit():                  # /nextcode weapon Bleach 5
+            name_part = " ".join(rest[:-1])
+            if (await asyncio.to_thread(mongo_db.resolve_series, name_part))["status"] != "none":
+                query, count = name_part, max(1, min(int(rest[-1]), RANGE_MAX_NEXT))
+        chunks, rows = await rw_lookup_view("n", query, user.id, count)
+        await rg_reply(msg, chunks, rows)
+    elif command == "setrange":
+        usage = "Usage: /setrange weapon <series> <start> <end>\nExample: /setrange weapon Bleach 0001 0100"
+        if len(rest) < 3:
+            await safe_reply_text(msg, usage)
+            return True
+        ok, text = await rw_do_set(context, user, update.effective_chat, " ".join(rest[:-2]), rest[-2], rest[-1])
+        await safe_reply_text(msg, text if ok else text + "\n\n" + usage)
+    else:                                                          # delrange (asks for confirmation first)
+        if not query:
+            await safe_reply_text(msg, "Usage: /delrange weapon <series>\nExample: /delrange weapon Bleach")
+            return True
+        chunks, rows = await rw_lookup_view("d", query, user.id)
+        await rg_reply(msg, chunks, rows)
+    return True
+
+
+# ---- the ⚔️ Weapons screens of the Range Panel ---------------------------------------------------------
+def _rw_home_view(uid, st):
+    st["step"] = None
+    st["wk"] = True
+    text = "⚔️ Weapon Range Panel\n\nPick an action. Everything happens in this one message."
+    buttons = [_rg_btn("➕ Set Range", _rw(uid, "sa:0")), _rg_btn("🗑 Delete Range", _rw(uid, "dl:0")),
+               _rg_btn("📋 View Ranges", _rw(uid, "l:r:0")), _rg_btn("🔍 Search Series", _rw(uid, "q")),
+               _rg_btn("🆓 Free Codes", _rw(uid, "fl:0")), _rg_btn("➡️ Next Code", _rw(uid, "nl:0"))]
+    rows = _rg_grid(buttons, 3)
+    rows.append(_rg_nav_row(uid, f"rg:{uid}:p:{st['role']}"))
+    return text, rows
+
+
+async def rw_picker_view(kind, page, uid, st):
+    """Series buttons (3 per row, paginated): sa = every series for Set Range, dl/fl/nl = series that have a weapon range."""
+    home = _rw(uid, "p")
+    if kind == "sa":
+        names = await asyncio.to_thread(mongo_db.all_series_names)
+        title = "➕ Set Weapon Range\n\nStep 1/3: Which series (anime)?\nPick one below, or send the name."
+        st["step"] = "sa"
+        pick = lambda h: _rw(uid, f"sp:{h}")
+    else:
+        ranges = await asyncio.to_thread(mongo_db.get_weapon_ranges)
+        names = sorted((r["anime_name"] for r in ranges), key=lambda n: n.casefold())
+        title = {"dl": "🗑 Delete Weapon Range\n\nPick the series:", "fl": "🆓 Free Weapon Codes\n\nPick the series:",
+                 "nl": "➡️ Next Weapon Code\n\nPick the series:"}[kind]
+        mode = {"dl": "d", "fl": "f", "nl": "n"}[kind]
+        st["step"] = None
+        pick = lambda h, mode=mode: _rw(uid, f"v:{mode}:{h}:1")
+    rows = []
+    if not names:
+        title += "\n\n" + ("No series found yet." if kind == "sa" else "No weapon ranges are set yet.")
+    else:
+        part, page, pages, _off = _rg_slice(names, page)
+        rows = _rg_grid([_rg_btn(n, pick(mongo_db.anime_hash(n))) for n in part], 3)
+        if pages > 1:
+            rows.append(_rg_page_row(uid, _rw(uid, kind), page, pages))
+    rows.append(_rg_nav_row(uid, home))
+    return title, rows
+
+
+async def rw_step_view(step, st, uid, warn=""):
+    """(text, rows) of the Set Weapon Range steps: ss = starting code, se = ending code, sk = confirmation."""
+    series = st["anime"]
+    if step == "ss":
+        cur = await asyncio.to_thread(mongo_db.get_weapon_range, series)
+        cur_line = (f"Current weapon range: {_rg_span_sp(cur['start_code'], cur['end_code'])}\n" if cur
+                    else "No weapon range set yet.\n")
+        text = f"➕ Set Weapon Range — {series}\n{cur_line}\nStep 2/3: Send the starting code (0001-9999)."
+        back = _rw(uid, "sa:0")
+    elif step == "se":
+        text = f"➕ Set Weapon Range — {series}\nStarting code: {_rg_fc(st['start'])}\n\nStep 3/3: Send the ending code."
+        back = _rw(uid, "ss")
+    else:
+        total = st["end"] - st["start"] + 1
+        text = f"➕ Set Weapon Range — please confirm\n\n{series}: {_rg_span_sp(st['start'], st['end'])}\n({total} codes)"
+        st["step"] = None
+        if warn:
+            text = f"{warn}\n\n{text}"
+        return text, [[_rg_btn("✅ Confirm", _rw(uid, "sy")), _rg_btn("⬅ Back", _rw(uid, "se")),
+                       _rg_btn("❌ Cancel", f"rg:{uid}:x")]]
+    st["step"] = step
+    if warn:
+        text = f"{warn}\n\n{text}"
+    return text, [_rg_nav_row(uid, back)]
+
+
+async def rw_start_set_flow(query, uid, st, series):
+    st["anime"] = series
+    text, rows = await rw_step_view("ss", st, uid)
+    await _rg_edit(query, text, rows)
+
+
+async def rw_panel_text(step, text, st, uid):
+    """A typed message while the weapon panel waits for one (series name, starting code, ending code, search).
+    Returns (warning, view) like range_panel_input builds them for characters."""
+    warn, view = "", None
+    if step == "sa":
+        if not text or len(text) > 60:
+            warn, view = "⚠️ Send a series (anime) name (up to 60 characters).", await rw_picker_view("sa", 0, uid, st)
+        else:
+            st["anime"] = await asyncio.to_thread(mongo_db.canonical_series_name, text)
+            view = await rw_step_view("ss", st, uid)
+    elif step == "ss":
+        code = mongo_db.parse_code(text)
+        if code is None:
+            view = await rw_step_view("ss", st, uid, "⚠️ Send a code from 0001 to 9999.")
+        else:
+            st["start"] = code
+            view = await rw_step_view("se", st, uid)
+    elif step == "se":
+        code = mongo_db.parse_code(text)
+        if code is None:
+            view = await rw_step_view("se", st, uid, "⚠️ Send a code from 0001 to 9999.")
+        elif code < st["start"]:
+            view = await rw_step_view("se", st, uid, f"⚠️ The ending code must not be smaller than {_rg_fc(st['start'])}.")
+        else:
+            other = await asyncio.to_thread(mongo_db.find_weapon_overlap, st["anime"], st["start"], code)
+            if other:
+                view = await rw_step_view("se", st, uid,
+                                          f"⚠️ {_rg_span(st['start'], code)} overlaps with {other['anime_name']} "
+                                          f"({_rg_span(other['start_code'], other['end_code'])}) in the weapon ranges.")
+            else:
+                st["end"] = code
+                view = await rw_step_view("sk", st, uid)
+    else:                                                          # q: search
+        if text:
+            st["step"] = None
+            chunks, rows = await rw_lookup_view("r", text, uid, 1, _rw(uid, "q"))
+            view = ("\n".join(chunks), rows)
+            st["step"] = "q"
+    return warn, view
+
+
+async def rw_callback(query, context, user, chat, uid, act, parts):
+    """Every ⚔️ weapon range button (called by range_callback after its user and role checks). `act` has no leading w."""
+    arg = parts[3] if len(parts) > 3 else ""
+    if act == "p":                                           # open the weapon panel
+        if chat is None or chat.type != "private":
+            await query.answer("Open the Range Panel in a private chat with the bot.", show_alert=True)
+            return
+        st = {"role": "o" if is_owner(uid) else "e", "step": None, "anime": "", "start": None, "end": None,
+              "chat": chat.id, "msg": query.message.message_id, "wk": True}
+        _rg_touch(st)
+        _rg_state[uid] = st
+        await query.answer()
+        text, rows = _rw_home_view(uid, st)
+        await _rg_edit(query, text, rows)
+        return
+
+    if act == "sr":                                          # 'Set Range' button under 'No weapon range set for X'
+        if chat is None or chat.type != "private":
+            await query.answer("Use the Range Panel in a private chat with the bot to set a range.", show_alert=True)
+            return
+        name = await asyncio.to_thread(mongo_db.series_by_hash, arg)
+        if name is None:
+            await query.answer("That series no longer exists.", show_alert=True)
+            return
+        st = {"role": "o" if is_owner(uid) else "e", "step": None, "anime": name, "start": None, "end": None,
+              "chat": chat.id, "msg": query.message.message_id, "wk": True}
+        _rg_touch(st)
+        _rg_state[uid] = st
+        await query.answer()
+        await rw_start_set_flow(query, uid, st, name)
+        return
+
+    if act in ("sa", "sp", "ss", "se", "sy", "q", "dl", "fl", "nl"):     # steps that need a live weapon panel
+        st = _rg_panel_state(query)
+        if st is None or not st.get("wk"):
+            await query.answer("⌛ This panel expired or was replaced. Open it again from /help → Range.", show_alert=True)
+            return
+        await query.answer()
+        if act in ("sa", "dl", "fl", "nl"):
+            text, rows = await rw_picker_view(act, int(arg) if arg.isdigit() else 0, uid, st)
+            await _rg_edit(query, text, rows)
+        elif act == "sp":
+            name = await asyncio.to_thread(mongo_db.series_by_hash, arg)
+            if name is None:
+                await _rg_edit(query, "That series no longer exists.", [_rg_nav_row(uid, _rw(uid, "sa:0"))])
+                return
+            await rw_start_set_flow(query, uid, st, name)
+        elif act in ("ss", "se"):
+            if act == "se" and st.get("start") is None:
+                act = "ss"
+            text, rows = await rw_step_view(act, st, uid)
+            await _rg_edit(query, text, rows)
+        elif act == "q":
+            st["step"] = "q"
+            await _rg_edit(query, "🔍 Search Series\n\nSend the series (anime) name (or part of it).",
+                           [_rg_nav_row(uid, _rw(uid, "p"))])
+        else:                                                # sy: confirm
+            if not (st.get("anime") and st.get("start") and st.get("end")):
+                await _rg_edit(query, "⚠️ Something is missing. Please start again.", [_rg_nav_row(uid, _rw(uid, "sa:0"))])
+                return
+            ok, text = await rw_do_set(context, user, chat, st["anime"], st["start"], st["end"])
+            if ok:
+                st["step"] = None
+                await _rg_edit(query, text, [[_rg_btn("⚔️ Panel", _rw(uid, "p"))]])
+            else:
+                await _rg_edit(query, text, [_rg_nav_row(uid, _rw(uid, "se"))])
+        return
+
+    st = _rg_panel_state(query)
+    live = st if (st and st.get("wk")) else None
+    if act == "l":                                           # numbered list page: wl:<kind>:<page>
+        kind = arg if arg in ("r", "f", "n") else "r"
+        page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
+        text, markup = await rw_list_view(kind, page, uid, _rw(uid, "p") if live else None)
+        await query.answer()
+        await _rg_edit(query, text, [list(r) for r in markup.inline_keyboard] if markup else None)
+        return
+
+    if act == "v":                                           # one series: wv:<mode>:<hash>:<count>
+        mode = arg if arg in ("r", "f", "n", "d") else "r"
+        name = await asyncio.to_thread(mongo_db.series_by_hash, parts[4] if len(parts) > 4 else "")
+        if name is None:
+            await query.answer("That series no longer exists.", show_alert=True)
+            return
+        count = int(parts[5]) if len(parts) > 5 and parts[5].isdigit() else 1
+        back = None
+        if live:
+            back = {"f": _rw(uid, "fl:0"), "n": _rw(uid, "nl:0"), "d": _rw(uid, "dl:0"), "r": _rw(uid, "q")}[mode]
+        chunks, rows = await rw_detail_view(mode, name, uid, count, back)
+        await query.answer()
+        await rg_show(query, context, chunks, rows)
+        return
+
+    if act == "dd":                                          # confirmed delete: wdd:<hash>
+        name = await asyncio.to_thread(mongo_db.series_by_hash, arg)
+        if name is None:
+            await query.answer("That series no longer exists.", show_alert=True)
+            return
+        text = await rw_do_delete(context, user, chat, name)
+        await query.answer()
+        await _rg_edit(query, text, [[_rg_btn("⬅ Back", _rw(uid, "dl:0"))]] if live else None)
+        return
+
+    await query.answer(HELP_STALE_TEXT, show_alert=True)
 
 
 async def _cw_hub(role, uid):
@@ -9828,9 +10417,12 @@ async def addcharacter_photo(update, context):
     except Exception as e:
         print("Character add notification error:", e)
 
-    await channel.post(context, "char_new", actor=update.effective_user, photo=photo_id,
-                       new={"name": d["name"], "code": d["code"], "tier": d["rarity"], "series": d.get("anime"),
-                            "worth": d["worth"], "recruits": d.get("recruit_names", [])})
+    try:
+        await channel.post(context, "char_new", actor=update.effective_user, photo=photo_id,
+                           new={"name": d["name"], "code": d["code"], "tier": d["rarity"], "series": d.get("anime"),
+                                "worth": d["worth"], "recruits": d.get("recruit_names", [])})
+    except Exception as e:
+        print("Character channel post error (add):", repr(e))
 
     await release_conv_log(context, update.effective_user.id, "addcharacter")
     return ConversationHandler.END
@@ -9935,8 +10527,11 @@ async def receive_photo(update, context):
         actor_id=update.effective_user.id,
     )
     if character:
-        await channel.post(context, "photo", name=character[1], code=code, photo=update.message.photo[-1].file_id,
-                           actor=update.effective_user)
+        try:
+            await channel.post(context, "photo", name=character[1], code=code, photo=update.message.photo[-1].file_id,
+                               actor=update.effective_user)
+        except Exception as e:
+            print("Character channel post error (photo):", repr(e))
 
 EDIT_NAME, EDIT_RECRUIT, EDIT_ANIME, EDIT_RARITY, EDIT_WORTH, EDIT_CODE = range(10, 16)
 
@@ -10152,10 +10747,13 @@ async def edit_code(update, context):
     old_view = {"name": old_row[1], "code": old_code, "tier": old_row[3], "series": old_row[2], "worth": old_row[4]}
     if old_recruit_names is not None:
         old_view["recruits"] = old_recruit_names
-    await channel.post(context, "char_edit", actor=update.effective_user, photo=old_row[5] if len(old_row) > 5 else None,
-                       old=old_view,
-                       new={"name": d["edit_name"], "code": new_code, "tier": d["edit_rarity"], "series": d["edit_anime"],
-                            "worth": d["edit_worth"], "recruits": new_recruit_names})
+    try:
+        await channel.post(context, "char_edit", actor=update.effective_user, photo=old_row[5] if len(old_row) > 5 else None,
+                           old=old_view,
+                           new={"name": d["edit_name"], "code": new_code, "tier": d["edit_rarity"], "series": d["edit_anime"],
+                                "worth": d["edit_worth"], "recruits": new_recruit_names})
+    except Exception as e:
+        print("Character channel post error (edit):", repr(e))
     context.user_data.clear()
     await release_conv_log(context, update.effective_user.id, "editcharacter")
     return ConversationHandler.END
@@ -14117,14 +14715,15 @@ COMMANDS = {
     "unbtransfer": "Owner/Executive: remove transfer block between two user IDs",
     "setrules": "Owner/Executive: set the bot usage rules (PM only)",
     "resetrules": "Owner/Executive: clear all bot usage rules (PM only)",
-    "setrange": "Owner/Executive: set or update an anime's code range (/setrange <anime> <start> <end>)",
-    "delrange": "Owner/Executive: delete an anime's code range (/delrange <anime>)",
-    "range": "Owner/Executive: show all code ranges, or one anime (/range <anime>)",
-    "freecode": "Owner/Executive: show used and free codes (all anime, or /freecode <anime>)",
-    "nextcode": "Owner/Executive: show the next free code (/nextcode [anime] [count])",
+    "setrange": "Owner/Executive: set or update an anime's code range (/setrange <anime> <start> <end>; weapons: /setrange weapon <series> <start> <end>)",
+    "delrange": "Owner/Executive: delete an anime's code range (/delrange <anime>; weapons: /delrange weapon <series>)",
+    "range": "Owner/Executive: show all code ranges, or one anime (/range <anime>; weapons: /range weapon [series])",
+    "freecode": "Owner/Executive: show used and free codes (all anime, or /freecode <anime>; weapons: /freecode weapon [series])",
+    "nextcode": "Owner/Executive: show the next free code (/nextcode [anime] [count]; weapons: /nextcode weapon [series] [count])",
     "editcode": "Owner/Executive: change a character's code directly (/editcode <code/name> <new code>)",
-    "fillranges": "Owner/Executive: move every character into its anime's code range (/fillranges [anime])",
+    "fillranges": "Owner/Executive: move every character, Evolution characters too, into its anime's code range (/fillranges [anime])",
     "undocodes": "Owner/Executive: undo the last /fillranges or range shift",
+    "editrange": "Owner/Executive: make an anime's range bigger, later ranges shift up (/editrange <anime> [new end])",
     "exportdb": "Owner: send the whole database as zip file(s) to your PM (/exportdb [collections])",
     "importdb": "Owner: restore the database from /exportdb zip files (/importdb [collections])",
 }
@@ -14949,7 +15548,7 @@ EXECUTIVE_COMMANDS = {
     "btransfer", "unbtransfer", "setrules", "resetrules", "dm", "dmhistory",
     "setrange", "delrange", "range", "ranges", "freecode", "freecodes", "nextcode",      # anime code ranges (Owner + Executive)
     "editcode",                                                                          # change a character's code directly
-    "fillranges", "undocodes",                                                           # move characters into their ranges / undo that
+    "fillranges", "undocodes", "editrange",                                              # move characters into their ranges / undo that / grow a range
 } | badge_banner.STAFF_COMMANDS | fusion.WEAPON_STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
@@ -14967,6 +15566,7 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("editcode", editcode_command))
     app.add_handler(CommandHandler("fillranges", fillranges_command))
     app.add_handler(CommandHandler("undocodes", undocodes_command))
+    app.add_handler(CommandHandler("editrange", editrange_command))
     app.add_handler(CommandHandler("restrictions", restrictions_list))
     app.add_handler(CommandHandler("botoff", bot_off))
     app.add_handler(CommandHandler("spawnoff", spawn_off_command))
@@ -15315,7 +15915,10 @@ def main():
     fusion.bind(is_owner=is_owner, is_executive=is_executive, symbols=SYMBOL, conv_timeout=CONV_TIMEOUT,
                 notify=notify_staff_action, log_action=log_character_action, mark_success=mark_success,
                 safe_reply=safe_reply_text, skip_keyboard=skip_keyboard, is_skip_text=is_skip_text,
-                display_user=display_user, rarity_text=rarity_text, cancel_all=cancel_conversation)
+                display_user=display_user, rarity_text=rarity_text, cancel_all=cancel_conversation,
+                rg_code_problem=rg_code_problem, rg_free_codes_markup=rg_free_codes_markup,      # anime code ranges (Evolution)
+                default_worth=default_worth_async,                                                 # 💰 Change Worth (Evolution)
+                rw_code_problem=rw_code_problem, rw_code_hint=rw_code_hint)                        # weapon code ranges
     fusion.register(app)  # stone tasks, /stone, /item, Evolution: /addevo /evolution /evolve /delevo
     theme.bind(is_owner=is_owner, default_start_text=START_TEXT, build_help_text=build_help_text,
                add_header=add_display_name_header)

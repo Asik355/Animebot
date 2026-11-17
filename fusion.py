@@ -506,8 +506,48 @@ _deps = {
 
 def bind(**kwargs):
     """Inject bot.py helpers: is_owner, is_executive, symbols, conv_timeout, notify, log_action, mark_success, safe_reply,
-    skip_keyboard, is_skip_text."""
+    skip_keyboard, is_skip_text, and the code-range / worth helpers: rg_code_problem(anime, code, exclude_code=None),
+    rg_free_codes_markup(user_id, anime, flow), default_worth(rarity) (async), rw_code_problem(series, code),
+    rw_code_hint(series)."""
     _deps.update({k: v for k, v in kwargs.items() if v is not None})
+
+
+# ---- anime code ranges / default worth (all of them live in bot.py and are injected with bind(); a missing one means
+# "no check", so this module also works on its own)
+async def _evo_code_problem(anime, code, exclude_code=None):
+    """Same range check and messages as a normal character (bot.rg_code_problem): the error text, or None."""
+    fn = _deps.get("rg_code_problem")
+    return await fn(anime, code, exclude_code) if fn else None
+
+
+async def _evo_free_markup(user_id, anime, flow):
+    """The '🔢 Show Free Codes' button (only when the anime has a range). flow: 'e' = /addevo, 'x' = /editevo."""
+    fn = _deps.get("rg_free_codes_markup")
+    return await fn(user_id, anime, flow) if fn else None
+
+
+async def _default_worth(rarity):
+    """Default worth of a tier from 💰 Change Worth, or None when the tier has no default."""
+    fn = _deps.get("default_worth")
+    return await fn(rarity) if fn else None
+
+
+async def _wcode_problem(series, code):
+    """Weapon code against the series' weapon range (same messages as characters): the error text, or None."""
+    fn = _deps.get("rw_code_problem")
+    return await fn(series, code) if fn else None
+
+
+async def _wcode_hint(series):
+    """'Next free code ...' line for the weapon code step ('' when the series has no weapon range)."""
+    fn = _deps.get("rw_code_hint")
+    if not fn:
+        return ""
+    try:
+        return await fn(series) or ""
+    except Exception as e:
+        logger.info("weapon code hint skipped: %s", e)
+        return ""
 
 
 EVO_MIN_STONES = 10          # hard minimum for the Evolution Stones requirement
@@ -1335,21 +1375,33 @@ async def addevo_rarity(update, context):
         await _reply(msg, "❌ Invalid rarity.")
         return E_RARITY
     context.user_data["evo_rarity"] = rarity
-    await _reply(msg, f"{_stepno(context, 6)} Worth in Berries:")
+    default = await _default_worth(rarity)           # 💰 Change Worth: the default worth of this tier (None = no default)
+    context.user_data["evo_worth_default"] = default
+    if default is None:
+        await _reply(msg, f"{_stepno(context, 6)} Worth in Berries:")
+    else:
+        await _reply(msg, f"{_stepno(context, 6)} The default worth of a {rarity} character is {default}.\n"
+                          "To change it, send a number. To keep it, tap ⏭ Skip.", reply_markup=_skip_markup())
     return E_WORTH
 
 
 async def addevo_worth(update, context):
     msg = update.effective_message
-    n = _parse_int(msg.text)
-    if n is None or n > EVO_MAX_WORTH:
-        await _reply(msg, "❌ Worth must be a whole number (0 or more).")
-        return E_WORTH
+    default = context.user_data.get("evo_worth_default")
+    if _is_skip(msg.text) and default is not None:
+        n = int(default)                              # Skip = keep the default worth of this tier
+    else:
+        n = _parse_int(msg.text)
+        if n is None or n > EVO_MAX_WORTH:
+            await _reply(msg, "❌ Worth must be a whole number (0 or more).")
+            return E_WORTH
     context.user_data["evo_worth"] = n
     if context.user_data.get("evo_kind") == "weapon":
-        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (0 or more; the weapon is needed too):")
+        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (0 or more; the weapon is needed too):",
+                     reply_markup=_remove_keyboard())
     else:
-        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (minimum {EVO_MIN_STONES}):")
+        await _reply(msg, f"{_stepno(context, 7)} Evolution Stones required (minimum {EVO_MIN_STONES}):",
+                     reply_markup=_remove_keyboard())
     return E_STONES
 
 
@@ -1375,7 +1427,8 @@ async def addevo_berries(update, context):
         await _reply(msg, "❌ Berries cost must be a whole number (0 or more).")
         return E_BERRIES
     context.user_data["evo_berries"] = n
-    await _reply(msg, f"{_stepno(context, 9)} Evolution Character Code (unique 4-digit code):")
+    markup = await _evo_free_markup(update.effective_user.id, context.user_data.get("evo_anime"), "e")
+    await _reply(msg, f"{_stepno(context, 9)} Evolution Character Code (unique 4-digit code):", reply_markup=markup)
     return E_CODE
 
 
@@ -1387,6 +1440,11 @@ async def addevo_code(update, context):
         return E_CODE
     if code in (context.user_data.get("evo_base"), context.user_data.get("evo_second")):
         await _reply(msg, "❌ The evolution code cannot be the same as an ingredient character (no self-evolution).")
+        return E_CODE
+    anime = context.user_data.get("evo_anime")
+    problem = await _evo_code_problem(anime, code)      # the anime's code range, same checks and messages as /addcharacter
+    if problem:
+        await _reply(msg, problem, reply_markup=await _evo_free_markup(update.effective_user.id, anime, "e"))
         return E_CODE
     if _row(code) is not None or await asyncio.to_thread(get_recipe_sync, code):
         await _reply(msg, "❌ Code already exists.")
@@ -1404,7 +1462,7 @@ async def addevo_photo(update, context):
     d = dict(context.user_data)
     pair = d.get("evo_kind") == "pair"
     with_weapon = d.get("evo_kind") == "weapon"
-    required = [k for k in _EVO_KEYS if k not in ("evo_base_name", "evo_second", "evo_second_name", "evo_qty2", "evo_kind", "evo_phase", "evo_weapon")]
+    required = [k for k in _EVO_KEYS if k not in ("evo_base_name", "evo_second", "evo_second_name", "evo_qty2", "evo_kind", "evo_phase", "evo_weapon", "evo_worth_default")]
     if pair:
         required += ["evo_second", "evo_qty2"]
     if with_weapon:
@@ -1470,10 +1528,13 @@ async def addevo_photo(update, context):
             _deps["mark_success"](update)
     except Exception as e:
         logger.info("addevo notification skipped: %s", e)
-    await channel.post(context, "evo_new", actor=user, photo=photo_id,
-                       new={"name": d["evo_name"], "code": d["evo_code"], "tier": d["evo_rarity"], "series": d["evo_anime"],
-                            "worth": d["evo_worth"], "recipe": _plain_recipe(recipe, weapon), "stones": d["evo_stones"],
-                            "berries": d["evo_berries"]})
+    try:
+        await channel.post(context, "evo_new", actor=user, photo=photo_id,
+                           new={"name": d["evo_name"], "code": d["evo_code"], "tier": d["evo_rarity"], "series": d["evo_anime"],
+                                "worth": d["evo_worth"], "recipe": _plain_recipe(recipe, weapon), "stones": d["evo_stones"],
+                                "berries": d["evo_berries"]})
+    except Exception as e:
+        logger.warning("addevo character channel post failed: %s", e)
     return -1
 
 
@@ -1712,7 +1773,16 @@ async def editevo_rarity(update, context):
             await _reply(msg, "❌ Invalid rarity.")
             return X_RARITY
         d["eevo_rarity"] = rarity
-    await _reply(msg, f"4️⃣ Worth in Berries, or ⏭ Skip.\nCurrent: {d['eevo_row'][4]}", reply_markup=_skip_markup())
+    default = None
+    if d["eevo_rarity"] != d["eevo_row"][3]:
+        default = await _default_worth(d["eevo_rarity"])      # tier changed -> worth follows the new tier's default
+    d["eevo_worth_default"] = default
+    if default is not None:
+        await _reply(msg, f"4️⃣ Rarity changed to {d['eevo_rarity']}. The default worth of a {d['eevo_rarity']} character is {default}.\n"
+                          f"To change it, send a number. To keep it, tap ⏭ Skip.\nCurrent: {d['eevo_row'][4]}",
+                     reply_markup=_skip_markup())
+    else:
+        await _reply(msg, f"4️⃣ Worth in Berries, or ⏭ Skip.\nCurrent: {d['eevo_row'][4]}", reply_markup=_skip_markup())
     return X_WORTH
 
 
@@ -1721,7 +1791,8 @@ async def editevo_worth(update, context):
         return -1
     msg, d = update.effective_message, context.user_data
     if _is_skip(msg.text):
-        d["eevo_worth"] = int(d["eevo_row"][4] or 0)
+        default = d.get("eevo_worth_default")
+        d["eevo_worth"] = int(default) if default is not None else int(d["eevo_row"][4] or 0)
     else:
         n = _parse_int(msg.text)
         if n is None or n > EVO_MAX_WORTH:
@@ -1745,6 +1816,9 @@ async def editevo_photo(update, context):
         return X_PHOTO
     await _reply(msg, f"6️⃣ Evolution character code (4 digits), or ⏭ Skip.\nCurrent: {d['eevo_code0']}",
                  reply_markup=_skip_markup())
+    markup = await _evo_free_markup(update.effective_user.id, d.get("eevo_anime"), "x")
+    if markup is not None:                    # only when the anime has a range (a second message: one message holds one keyboard)
+        await _reply(msg, "🔢 Need a free code? Tap the button.", reply_markup=markup)
     return X_CODE
 
 
@@ -1841,8 +1915,8 @@ async def stone_command(update, context):
 # ---------------------------------------------------------------- Different Card evolution: type chooser + extra steps
 E_TYPE, E_ACODE, E_AQTY, E_BCODE, E_BQTY = range(220, 225)
 X_BASE2, X_QTY2, X_KIND = range(225, 228)
-_EVO_KEYS = _EVO_KEYS + ("evo_kind", "evo_second", "evo_second_name", "evo_qty2", "evo_phase")
-_XKEYS = _XKEYS + ("eevo_kind", "eevo_second", "eevo_qty2")
+_EVO_KEYS = _EVO_KEYS + ("evo_kind", "evo_second", "evo_second_name", "evo_qty2", "evo_phase", "evo_worth_default")
+_XKEYS = _XKEYS + ("eevo_kind", "eevo_second", "eevo_qty2", "eevo_worth_default")
 _EMOJI = ["", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
 
 
@@ -2013,9 +2087,15 @@ async def editevo_code(update, context):
         if not _valid_code(code):
             await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
             return X_CODE
-        if code != d["eevo_code0"] and (_row(code) is not None or await asyncio.to_thread(get_recipe_sync, code)):
-            await _reply(msg, "❌ That code already exists.")
-            return X_CODE
+        if code != d["eevo_code0"]:
+            anime = d.get("eevo_anime")
+            problem = await _evo_code_problem(anime, code, exclude_code=d["eevo_code0"])   # its own code is never "taken"
+            if problem:
+                await _reply(msg, problem, reply_markup=await _evo_free_markup(update.effective_user.id, anime, "x"))
+                return X_CODE
+            if _row(code) is not None or await asyncio.to_thread(get_recipe_sync, code):
+                await _reply(msg, "❌ That code already exists.")
+                return X_CODE
         d["eevo_code"] = code
     if d.get("eevo_kind") is None:           # the recipe was deleted with /delevo: say which kind to recreate
         await _reply(msg, "This evolution has no recipe now. Which kind should it be? Send Same (copies of one card) "
@@ -3334,7 +3414,8 @@ async def addweapon_price(update, context):
         await _reply(msg, "❌ Price must be a whole number (0 or more).")
         return W_PRICE
     context.user_data["wpn_price"] = n
-    await _reply(msg, f"{_EMOJI[5]} Weapon Code (unique 4-digit code):")
+    hint = await _wcode_hint(context.user_data.get("wpn_anime"))
+    await _reply(msg, f"{_EMOJI[5]} Weapon Code (unique 4-digit code):" + hint)
     return W_CODE
 
 
@@ -3343,6 +3424,10 @@ async def addweapon_code(update, context):
     code = (msg.text or "").strip()
     if not _valid_code(code):
         await _reply(msg, "❌ Code must be exactly 4 digits (0001-9999).")
+        return W_CODE
+    problem = await _wcode_problem(context.user_data.get("wpn_anime"), code)     # the series' weapon range
+    if problem:
+        await _reply(msg, problem)
         return W_CODE
     if await asyncio.to_thread(get_weapon, code):
         await _reply(msg, "❌ Code already exists.")
@@ -4372,8 +4457,9 @@ def _wm_prompt(field, w=None):
     return "🖼 Photo. Send a picture of the weapon as a photo, not as a file." if new else f"🖼 Send the new photo{name} as a photo, not as a file."
 
 
-async def _wm_value(field, msg, code=None):
-    """Validate one typed value. Returns (value, None) or (None, error text)."""
+async def _wm_value(field, msg, code=None, draft=None):
+    """Validate one typed value. Returns (value, None) or (None, error text). `draft` (➕ Create Weapon) holds the values
+    typed so far: the code step needs its anime to check the series' weapon range."""
     text = (msg.text or "").strip()
     if field == "photo":
         if not getattr(msg, "photo", None):
@@ -4407,6 +4493,10 @@ async def _wm_value(field, msg, code=None):
         return n, None
     if not _valid_code(text):
         return None, "❌ The code must be exactly 4 digits (0001-9999), for example 0042."
+    if draft is not None:
+        problem = await _wcode_problem(draft.get("anime"), text)
+        if problem:
+            return None, problem
     if await asyncio.to_thread(get_weapon, text):
         return None, "❌ That code is already used by another weapon. Send another code."
     return text, None
@@ -4494,7 +4584,7 @@ async def wm_input(update, context):
     # ---------------- ➕ Create Weapon: ask each value, then preview
     if kind == "new":
         step, draft = st["step"], st["draft"]
-        value, err = await _wm_value(step, msg)
+        value, err = await _wm_value(step, msg, None, draft)
         if err:
             await _reply(msg, err + retry)
             return WM_INPUT
@@ -4502,7 +4592,8 @@ async def wm_input(update, context):
         i = WM_NEW_STEPS.index(step) + 1
         if i < len(WM_NEW_STEPS):
             st["step"] = WM_NEW_STEPS[i]
-            await _reply(msg, f"Step {i + 1} of {len(WM_NEW_STEPS)}\n" + _wm_prompt(st["step"]) + "\nSend /cancel to stop.")
+            hint = await _wcode_hint(draft.get("anime")) if st["step"] == "code" else ""
+            await _reply(msg, f"Step {i + 1} of {len(WM_NEW_STEPS)}\n" + _wm_prompt(st["step"]) + hint + "\nSend /cancel to stop.")
             return WM_INPUT
         context.user_data.pop("wm_edit", None)
         context.user_data["wm_draft"] = draft

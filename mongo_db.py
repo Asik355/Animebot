@@ -336,6 +336,7 @@ def ensure_indexes():
     col(CHARACTERS).create_index([("code_int", ASCENDING)], name="code_int")
     col(CHARACTERS).create_index([("rarity", ASCENDING)], name="rarity")
     col("anime_ranges").create_index([("anime_key", ASCENDING)], unique=True, name="uniq_anime_key")
+    col("weapon_ranges").create_index([("anime_key", ASCENDING)], unique=True, name="uniq_anime_key")
     col(COLLECTIONS).create_index([("user_id", ASCENDING), ("character_code", ASCENDING)], name="user_char")
     col(COLLECTIONS).create_index([("character_code", ASCENDING)], name="char")
     col(GROUPS).create_index([("approved", ASCENDING)], name="approved")
@@ -2415,18 +2416,233 @@ def outside_count(anime):
 
 
 # --------------------------------------------------------------------------
+# WEAPON CODE RANGES: one range of weapon codes per series (anime), kept in its OWN collection ("weapon_ranges") so the
+# character ranges above are never touched. Same shape and same rules as the character ranges: a range is
+# {anime_name, start_code, end_code, anime_key}; "anime" is the weapon's series. Weapon codes are 4-digit codes of the
+# `weapons` collection (a weapon and a character may share a number: they live in different collections).
+# --------------------------------------------------------------------------
+WEAPON_RANGES = "weapon_ranges"
+WEAPONS_COLLECTION = "weapons"
+
+
+@retry_read
+def get_weapon_ranges():
+    """Every weapon range, ordered by start code: [{anime_name, start_code, end_code, anime_key}]."""
+    rows = [_range_row(d) for d in col(WEAPON_RANGES).find({})]
+    rows.sort(key=lambda r: (r["start_code"], r["anime_key"]))
+    return rows
+
+
+@retry_read
+def get_weapon_range(series):
+    """The weapon range of one series (case-insensitive), or None."""
+    d = col(WEAPON_RANGES).find_one({"anime_key": anime_key(series)})
+    return _range_row(d) if d else None
+
+
+@retry_read
+def _weapon_docs():
+    return list(col(WEAPONS_COLLECTION).find({}, {"_id": 1, "code": 1, "name": 1, "anime": 1}))
+
+
+def _weapon_numeric_code(d):
+    code = str(d.get("code") or d.get("_id") or "")
+    return int(code) if code.isdigit() else None
+
+
+def _used_weapon_codes():
+    """Sorted list of every numeric weapon code currently in use."""
+    out = [n for n in (_weapon_numeric_code(d) for d in _weapon_docs()) if n is not None]
+    return sorted(set(out))
+
+
+def canonical_series_name(name):
+    """The spelling already used by weapons for this series (so 'bleach' becomes 'Bleach'); else the spelling characters
+    use for that anime; else the cleaned input."""
+    key = anime_key(name)
+    for d in _weapon_docs():
+        a = d.get("anime")
+        if a and anime_key(a) == key:
+            return " ".join(str(a).split())
+    return canonical_anime_name(name)
+
+
+def all_series_names():
+    """Every known series: the anime of weapons, of weapon ranges and of characters (a weapon can be added for any
+    anime), spelling of a weapon range first, sorted A-Z."""
+    names = {anime_key(n): n for n in all_anime_names()}
+    for d in _weapon_docs():
+        a = " ".join(str(d.get("anime") or "").split())
+        if a:
+            names[anime_key(a)] = a
+    for r in get_weapon_ranges():
+        names[r["anime_key"]] = r["anime_name"]
+    return sorted(names.values(), key=lambda n: n.casefold())
+
+
+def series_by_hash(h):
+    """Series name for a callback hash (see anime_hash), or None."""
+    for name in all_series_names():
+        if anime_hash(name) == h:
+            return name
+    return None
+
+
+def resolve_series(query):
+    """Same matching as resolve_anime() (exact / one partial / several partial / none + 3 closest), over the series names."""
+    key = anime_key(query)
+    names = all_series_names()
+    if not key or not names:
+        return {"status": "none", "closest": names[:3]}
+    by_key = {anime_key(n): n for n in names}
+    if key in by_key:
+        return {"status": "exact", "name": by_key[key]}
+    partial = [n for n in names if key in anime_key(n)]
+    if len(partial) == 1:
+        return {"status": "one", "name": partial[0]}
+    if len(partial) > 1:
+        return {"status": "multi", "names": partial}
+    close_keys = difflib.get_close_matches(key, list(by_key), n=3, cutoff=0.0)
+    return {"status": "none", "closest": [by_key[k] for k in close_keys]}
+
+
+def find_weapon_overlap(series, start, end):
+    """The OTHER series whose weapon range overlaps start-end: {anime_name, start_code, end_code}, or None."""
+    key = anime_key(series)
+    for r in get_weapon_ranges():
+        if r["anime_key"] != key and not (end < r["start_code"] or start > r["end_code"]):
+            return r
+    return None
+
+
+@retry_write
+def set_weapon_range(series, start, end, user_id=None):
+    """Create or update a series' weapon range. Same result shape as set_range():
+      {"ok": True, "created": bool, "range": {...}, "previous": {...}|None}
+      {"ok": False, "error": "invalid"|"overlap", "message": text, "overlap": {...}|None}
+    Weapons are never renumbered: existing weapons keep their codes."""
+    name = canonical_series_name(series)
+    if not name:
+        return {"ok": False, "error": "invalid", "message": "Series (anime) name is required.", "overlap": None}
+    s, e = parse_code(start), parse_code(end)
+    if s is None or e is None:
+        return {"ok": False, "error": "invalid", "message": f"Codes must be numbers from {fmt_code(CODE_MIN)} to {fmt_code(CODE_MAX)}.", "overlap": None}
+    if s > e:
+        return {"ok": False, "error": "invalid", "message": "The starting code must not be bigger than the ending code.", "overlap": None}
+    other = find_weapon_overlap(name, s, e)
+    if other:
+        return {"ok": False, "error": "overlap", "overlap": other,
+                "message": f"{name} ({fmt_code(s)}-{fmt_code(e)}) overlaps with {other['anime_name']} "
+                           f"({fmt_code(other['start_code'])}-{fmt_code(other['end_code'])}) in the weapon ranges."}
+    key = anime_key(name)
+    previous = get_weapon_range(name)
+    stamp = datetime.now(_IST).replace(tzinfo=None).isoformat(timespec="seconds")
+    col(WEAPON_RANGES).update_one(
+        {"anime_key": key},
+        {"$set": {"anime_name": name, "anime_key": key, "start_code": s, "end_code": e,
+                  "updated_at": stamp, "updated_by": int(user_id) if user_id is not None else None},
+         "$setOnInsert": {"created_at": stamp}},
+        upsert=True)
+    return {"ok": True, "created": previous is None, "previous": previous,
+            "range": {"anime_name": name, "start_code": s, "end_code": e, "anime_key": key}}
+
+
+@retry_write
+def delete_weapon_range(series):
+    """Delete a series' weapon range (weapons are not touched). True when a range was deleted."""
+    return col(WEAPON_RANGES).delete_one({"anime_key": anime_key(series)}).deleted_count > 0
+
+
+def weapon_range_status(series):
+    """Used/free numbers of one series' weapon range, or None when it has no weapon range (same keys as range_status)."""
+    r = get_weapon_range(series)
+    return _status_from(r, _used_weapon_codes()) if r else None
+
+
+def all_weapon_range_status():
+    """weapon_range_status() of every series that has a weapon range, ordered by start code."""
+    used = _used_weapon_codes()
+    return [_status_from(r, used) for r in get_weapon_ranges()]
+
+
+def next_free_weapon_codes(series, count=1):
+    """{"name", "start", "end", "codes": [next free weapon codes], "free_count", "full": bool}, or None without a range."""
+    st = weapon_range_status(series)
+    if st is None:
+        return None
+    codes = []
+    for a, b in st["free_runs"]:
+        for c in range(a, b + 1):
+            codes.append(c)
+            if len(codes) >= max(1, int(count)):
+                break
+        if len(codes) >= max(1, int(count)):
+            break
+    return {"name": st["name"], "start": st["start"], "end": st["end"], "codes": codes,
+            "free_count": st["free_count"], "full": not codes}
+
+
+def weapon_owner_name(code):
+    """Name of the weapon that uses this code, or None."""
+    for d in _weapon_docs():
+        if _weapon_numeric_code(d) == parse_code(code):
+            return d.get("name")
+    return None
+
+
+def check_weapon_code_for_series(series, code, exclude_code=None):
+    """Add validation of a weapon code against the series' weapon range (same statuses as check_code_for_anime):
+      {"status": "no_range"} | {"status": "ok", ...} | {"status": "outside", "name", "start", "end"}
+      | {"status": "taken", "name", "start", "end", "owner", "suggestions": [next 5 free codes]}
+    `exclude_code`: a weapon's own current code never counts as taken."""
+    r = get_weapon_range(series) if anime_key(series) else None
+    if r is None:
+        return {"status": "no_range"}
+    n = parse_code(code)
+    base = {"name": r["anime_name"], "start": r["start_code"], "end": r["end_code"]}
+    if n is None or not (r["start_code"] <= n <= r["end_code"]):
+        return {"status": "outside", **base}
+    if exclude_code is not None and str(exclude_code) == fmt_code(n):
+        return {"status": "ok", **base}
+    owner = weapon_owner_name(fmt_code(n))
+    if owner is not None:
+        nxt = next_free_weapon_codes(r["anime_name"], 5)
+        return {"status": "taken", **base, "owner": owner, "suggestions": nxt["codes"] if nxt else []}
+    return {"status": "ok", **base}
+
+
+def weapon_outside_count(series):
+    """How many existing weapons of this series have a code outside the series' weapon range (0 without a range)."""
+    r = get_weapon_range(series)
+    if r is None:
+        return 0
+    key = anime_key(series)
+    total = 0
+    for d in _weapon_docs():
+        if anime_key(d.get("anime")) != key:
+            continue
+        n = _weapon_numeric_code(d)
+        if n is None or not (r["start_code"] <= n <= r["end_code"]):
+            total += 1
+    return total
+
+
+# --------------------------------------------------------------------------
 # Changing character codes: one character (/editcode) or a whole anime when its range moves (Change codes button)
 # --------------------------------------------------------------------------
-def change_character_code_tx(session, old_code, new_code):
-    """Change ONE normal character's code inside a transaction. Everything that points at the code follows
+def change_character_code_tx(session, old_code, new_code, include_evolution=False):
+    """Change ONE character's code inside a transaction. Everything that points at the code follows
     (collections, favorites, Evolution recipes - see update_character_tx - and the shop). False when it does not exist
-    or is an Evolution character (those are edited with /editevo)."""
+    or is an Evolution character (those are edited with /editevo) - unless include_evolution=True, which range moves
+    use: an Evolution character is then renumbered with update_character_tx(evolution=True)."""
     old_code, new_code = str(old_code), str(new_code)
-    doc = col(CHARACTERS).find_one({"code": old_code, "char_type": {"$ne": CHAR_TYPE_EVOLUTION}}, session=session)
+    kind_filter = {} if include_evolution else {"char_type": {"$ne": CHAR_TYPE_EVOLUTION}}
+    doc = col(CHARACTERS).find_one({"code": old_code, **kind_filter}, session=session)
     if not doc:
         return False
+    is_evo = doc.get("char_type") == CHAR_TYPE_EVOLUTION
     if not update_character_tx(session, old_code, new_code, doc.get("name"), doc.get("anime"), doc.get("rarity"),
-                               doc.get("worth") or 0):
+                               doc.get("worth") or 0, evolution=is_evo):
         return False
     if new_code != old_code:
         col("shop_v3").update_many({"character_code": old_code}, {"$set": {"character_code": new_code}}, session=session)
@@ -2444,13 +2660,15 @@ def change_character_code(old_code, new_code):
 def plan_code_move(anime, old_start, old_end, new_start, new_end):
     """
     Plan for moving an anime's characters when its range changes from old_start-old_end to new_start-new_end: every
-    normal character whose code is inside the OLD range keeps its position (0001 -> 5000, 0002 -> 5001 ...). Nothing is written.
-      {"moves": [(old, new, name)] in a safe order, "shift": int, "evolution_left": int, "kept_outside": int, "error": text|None}
+    character (normal OR Evolution) whose code is inside the OLD range keeps its position (0001 -> 5000, 0002 -> 5001 ...).
+    Nothing is written.
+      {"moves": [(old, new, name)] in a safe order, "shift": int, "evolution_left": int (always 0: Evolution characters
+       move too), "evolution_moving": int, "kept_outside": int, "error": text|None}
     `error` is set (and nothing may be moved) when a new code would leave the new range or is used by another character.
     """
     key = anime_key(anime)
     shift = int(new_start) - int(old_start)
-    plan = {"moves": [], "shift": shift, "evolution_left": 0, "kept_outside": 0, "error": None}
+    plan = {"moves": [], "shift": shift, "evolution_left": 0, "evolution_moving": 0, "kept_outside": 0, "error": None}
     if shift == 0:
         return plan
     moving, others = {}, {}
@@ -2461,14 +2679,12 @@ def plan_code_move(anime, old_start, old_end, new_start, new_end):
         mine = anime_key(d.get("anime")) == key
         is_evo = d.get("char_type") == CHAR_TYPE_EVOLUTION
         if mine and old_start <= n <= old_end:
+            moving[n] = d.get("name")
             if is_evo:
-                plan["evolution_left"] += 1
-                others[n] = d.get("name")
-            else:
-                moving[n] = d.get("name")
+                plan["evolution_moving"] += 1
         else:
             others[n] = d.get("name")
-            if mine and not is_evo:
+            if mine:
                 plan["kept_outside"] += 1
     if not moving:
         return plan
@@ -2492,7 +2708,7 @@ def apply_code_move(moves):
     def _work(session):
         moved = 0
         for old, new, _name in moves:
-            if not change_character_code_tx(session, fmt_code(old), fmt_code(new)):
+            if not change_character_code_tx(session, fmt_code(old), fmt_code(new), include_evolution=True):
                 raise RuntimeError(f"Character {fmt_code(old)} could not be moved")
             moved += 1
         return moved
@@ -2504,7 +2720,7 @@ def apply_code_move(moves):
 
 # ==========================================================================
 # FILLING RANGES AND SHIFTING RANGES (renumbering many characters safely)
-#   plan_fill_ranges()  -> every normal character moves INTO its anime's range (characters already inside keep their code)
+#   plan_fill_ranges()  -> every character (normal and Evolution) moves INTO its anime's range (characters already inside keep their code)
 #   plan_range_extend() -> a range grows; the ranges it runs into (and their characters) shift up by the amount needed
 # Both only PLAN (nothing is written). The plan is saved as a "move job" and executed in small transactions:
 # every step is valid on its own and idempotent, so a stop halfway never breaks anything - the job just continues.
@@ -2560,12 +2776,13 @@ def _rows_for_planning():
 
 def plan_fill_ranges(spawned=None, only_anime=None):
     """
-    Plan that moves every NORMAL character into the range of its anime. Characters already inside keep their code; the
-    ones outside take the lowest free codes of the range, in the order of their current codes. Evolution characters,
-    characters of anime without a range, and characters spawned right now (`spawned` = codes) stay where they are.
+    Plan that moves every character (normal AND Evolution) into the range of its anime. Characters already inside keep
+    their code; the ones outside take the lowest free codes of the range, in the order of their current codes.
+    Characters of anime without a range, and characters spawned right now (`spawned` = codes) stay where they are.
     An anime whose characters do not all fit is skipped (extend its range first). `only_anime` limits the moves to one anime.
     Returns {"per_anime": [{name,start,end,total_slots,inside,moving,need,slots,status}], "steps": [...], "moving": int,
-             "inside": int, "skipped": [names], "deferred": int, "evolution": int, "unranged": {anime: count}, "samples": [...]}.
+             "inside": int, "skipped": [names], "deferred": int, "evolution": int (Evolution characters that move),
+             "unranged": {anime: count}, "samples": [...]}.
     """
     spawned = {int(c) for c in (spawned or []) if str(c).isdigit()}
     ranges = get_ranges()
@@ -2578,7 +2795,7 @@ def plan_fill_ranges(spawned=None, only_anime=None):
         out_by, in_by = {}, {}
         for r in numeric:
             rg = rmap.get(r["akey"])
-            if rg is None or r["evo"] or r["akey"] in skipped or (only_key and r["akey"] != only_key):
+            if rg is None or r["akey"] in skipped or (only_key and r["akey"] != only_key):
                 continue
             if rg["start_code"] <= r["code"] <= rg["end_code"]:
                 in_by.setdefault(r["akey"], []).append(r)
@@ -2600,9 +2817,10 @@ def plan_fill_ranges(spawned=None, only_anime=None):
         if not newly:
             break
     items, per_anime = [], []
+    evo_ids = {r["id"] for r in rows if r["evo"]}
     unranged = {}
     for r in rows:
-        if r["akey"] and r["akey"] not in rmap and not r["evo"] and r["code"] is not None:
+        if r["akey"] and r["akey"] not in rmap and r["code"] is not None:
             unranged[r["akey"]] = unranged.get(r["akey"], 0) + 1
     names = {}
     for d in _chars():
@@ -2616,13 +2834,13 @@ def plan_fill_ranges(spawned=None, only_anime=None):
         outs = sorted(out_by.get(k, []), key=lambda r: (r["code"], str(r["name"])))
         slots = slots_by.get(k, [])
         inside = len(in_by.get(k, []))
-        total_chars = sum(1 for r in numeric if r["akey"] == k and not r["evo"])
+        total_chars = sum(1 for r in numeric if r["akey"] == k)
         entry = {"name": rg["anime_name"], "start": rg["start_code"], "end": rg["end_code"], "inside": inside,
                  "moving": 0, "need": 0, "slots": 0, "status": "ok"}
         if k in skipped:
-            outside_all = [r for r in numeric if r["akey"] == k and not r["evo"]
+            outside_all = [r for r in numeric if r["akey"] == k
                            and not (rg["start_code"] <= r["code"] <= rg["end_code"]) and r["code"] not in spawned]
-            stay2 = {r["code"] for r in numeric if r["akey"] != k or r["evo"] or r["code"] in spawned
+            stay2 = {r["code"] for r in numeric if r["akey"] != k or r["code"] in spawned
                      or (rg["start_code"] <= r["code"] <= rg["end_code"])}
             free2 = [c for c in range(rg["start_code"], rg["end_code"] + 1) if c not in stay2]
             entry.update(status="too_small", need=len(outside_all), slots=len(free2))
@@ -2636,12 +2854,12 @@ def plan_fill_ranges(spawned=None, only_anime=None):
         per_anime.append(entry)
     used = {r["code"] for r in numeric}
     steps = _order_moves(items, used) if items else []
-    deferred = sum(1 for r in numeric if r["code"] in spawned and rmap.get(r["akey"]) is not None and not r["evo"]
+    deferred = sum(1 for r in numeric if r["code"] in spawned and rmap.get(r["akey"]) is not None
                    and not (rmap[r["akey"]]["start_code"] <= r["code"] <= rmap[r["akey"]]["end_code"])
                    and (not only_key or r["akey"] == only_key))
     return {"per_anime": per_anime, "steps": steps, "moving": len(items), "inside": sum(len(v) for v in in_by.values()),
             "skipped": [e["name"] for e in per_anime if e["status"] == "too_small"], "deferred": deferred,
-            "evolution": sum(1 for r in numeric if r["evo"]),
+            "evolution": sum(1 for it in items if it["id"] in evo_ids),
             "unranged": {names.get(k, k): n for k, n in sorted(unranged.items())},
             "samples": [(it["old"], it["new"], it["name"]) for it in sorted(items, key=lambda i: i["old"])[:5]]}
 
@@ -2650,7 +2868,8 @@ def plan_range_extend(anime, new_start, new_end, spawned=None):
     """
     Plan for growing an EXISTING range to new_start-new_end when it runs into the next ranges: every range that would
     overlap shifts up only as far as needed (gaps absorb part of it) and its characters move with it, keeping their
-    position (Bleach 0301 -> 0401). All or nothing: any problem sets "error" and nothing may be moved.
+    position (Bleach 0301 -> 0401); Evolution characters move with them. All or nothing: any problem sets "error" and
+    nothing may be moved.
     Returns {"ok": bool, "error": text|None, "shifts": [{name, old:(s,e), new:(s,e), shift, chars}], "steps": [...],
              "ranges_after": [{anime_key, anime_name, start, end}], "moving": int}.
     """
@@ -2687,7 +2906,7 @@ def plan_range_extend(anime, new_start, new_end, spawned=None):
     items, moving_codes = [], set()
     for sh in shifts:
         for r in numeric:
-            if r["akey"] == sh["key"] and not r["evo"] and sh["old"][0] <= r["code"] <= sh["old"][1]:
+            if r["akey"] == sh["key"] and sh["old"][0] <= r["code"] <= sh["old"][1]:
                 items.append({"id": r["id"], "old": r["code"], "new": r["code"] + sh["shift"], "name": r["name"]})
                 moving_codes.add(r["code"])
                 sh["chars"] += 1
@@ -2759,7 +2978,8 @@ def run_move_job(job_id, batch=40):
             if cur != fmt_code(st["old"]):
                 raise RuntimeError(f"{doc.get('name')} is at {cur}, not at {fmt_code(st['old'])} as planned")
             if not update_character_tx(session, cur, new, doc.get("name"), doc.get("anime"), doc.get("rarity"),
-                                       doc.get("worth") or 0):
+                                       doc.get("worth") or 0,
+                                       evolution=doc.get("char_type") == CHAR_TYPE_EVOLUTION):
                 raise RuntimeError(f"{doc.get('name')} could not be changed")
             col("shop_v3").update_many({"character_code": cur}, {"$set": {"character_code": new}}, session=session)
 
