@@ -856,6 +856,59 @@ def update_character_photo(code, photo):
     return res.matched_count == 1
 
 
+@retry_write
+def set_character_photo(code, photo, checked=None):
+    """Photo review: set (or clear, photo=None) the photo of ANY character (normal or Evolution) and optionally mark it
+    as reviewed. Nothing else on the character changes. True when the character exists."""
+    fields = {"photo_file_id": photo}
+    if checked is not None:
+        fields["photo_checked"] = bool(checked)
+    res = col(CHARACTERS).update_one({"code": str(code)}, {"$set": fields})
+    invalidate_character_cache()
+    return res.matched_count == 1
+
+
+def photo_review_rows():
+    """[(code number, anime, rarity)] of every character that has a photo and was not reviewed yet (Evolution too)."""
+    out = []
+    for d in _chars():
+        if d.get("photo_checked") or not d.get("photo_file_id") or not str(d["code"]).isdigit():
+            continue
+        out.append((int(d["code"]), " ".join(str(d.get("anime") or "").split()), d.get("rarity")))
+    return out
+
+
+def get_photo_review_state(code):
+    """(photo_file_id, checked) of a character, or None when it does not exist."""
+    for d in _chars():
+        if d["code"] == str(code):
+            return d.get("photo_file_id"), bool(d.get("photo_checked"))
+    return None
+
+
+def photo_review_queue(only_code=None, anime=None, rarity=None, start=None, end=None):
+    """Codes (ascending) of the characters that have a photo and were not marked as reviewed yet - normal and Evolution.
+    only_code opens that one character even if it was reviewed; anime / rarity / start-end (code numbers) limit the list."""
+    out = []
+    for d in _chars():
+        if only_code is not None:
+            if d["code"] != str(only_code):
+                continue
+        elif d.get("photo_checked"):
+            continue
+        if not d.get("photo_file_id"):
+            continue
+        n = int(d["code"]) if str(d["code"]).isdigit() else None
+        if (start is not None and (n is None or n < start)) or (end is not None and (n is None or n > end)):
+            continue
+        if anime and anime_key(d.get("anime")) != anime_key(anime):
+            continue
+        if rarity and d.get("rarity") != rarity:
+            continue
+        out.append(d["code"])
+    return out
+
+
 def update_character_tx(session, old_code, new_code, name, anime, rarity, worth, recruit_names=None, evolution=False):
     """
     The character-edit writes, to be run INSIDE a transaction (session may be None). Returns False (nothing written) when the
@@ -1268,9 +1321,18 @@ def replace_bot_groups(groups):
 
 
 def register_bot_group_info(chat_id, title, chat_type, username):
-    return _set_group_fields(
-        chat_id, {"registered": True, "title": title, "type": chat_type, "username": username}
-    )
+    fields = {"registered": True, "title": title, "type": chat_type, "username": username}
+    if title:
+        fields["known_title"] = title       # kept for good: cleanup_left_group / unregister_bot_group do not remove it
+    return _set_group_fields(chat_id, fields)
+
+
+def remember_group_title(chat_id, title):
+    """Keep a group's name even after the bot has left it (shown by /bangroup, /bannedgroups)."""
+    title = (title or "").strip()
+    if not title:
+        return False
+    return _set_group_fields(chat_id, {"known_title": title})
 
 
 def unregister_bot_group(chat_id):

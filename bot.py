@@ -2299,6 +2299,7 @@ def _addedit_page(role):
         entries.append(("/editcode <code/name> <new code>", "Change a character's 4-digit code (PM only)"))
         entries.append(("/addevo", "Add an Evolution (guided, PM only)"))
         entries.append(("/editevo <code/name>", "Edit an Evolution and its recipe (guided, PM only)"))
+        entries.append(("/reviewphotos [anime|rarity] [start] [end]", "Review character photos one by one: keep, replace or remove (PM only)"))
     if role == "owner":
         entries.append(("/delevo <code>", "Delete an Evolution recipe (Owner only)"))
     return _help_page(
@@ -2631,6 +2632,7 @@ def help_detail(role, key, owner_id):
             if k == "addedit" and role in ("owner", "executive"):
                 return text, InlineKeyboardMarkup([
                     [_module_button("💰 Change Worth", f"cw:{owner_id}:{role}:hub")],
+                    [_module_button("🖼 Review Photos", f"pr:{owner_id}:m")],
                     [InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
             return text, InlineKeyboardMarkup(
                 [[InlineKeyboardButton("« Back", callback_data=f"help:{owner_id}:{role}")]])
@@ -5927,6 +5929,303 @@ async def rw_callback(query, context, user, chat, uid, act, parts):
         return
 
     await query.answer(HELP_STALE_TEXT, show_alert=True)
+
+
+# ---------------------------------------------------------------------------------------------------
+# /reviewphotos (Owner + Executive, PM): go through the character photos one by one and Keep / Replace / Remove them.
+# Normal and Evolution characters. Kept photos are marked (photo_checked) and are not shown again. ⬅ Undo goes back one
+# character (it restores the old photo and mark) while the review is running. Callback data: pr:<user_id>:<k|r|d|s|u|x>
+# ---------------------------------------------------------------------------------------------------
+_pr_state = {}                        # user id -> {queue, pos, history, wait, msg_id, chat}
+
+
+def _pr_kb(uid, st):
+    rows = [[_rg_btn("✅ Keep", f"pr:{uid}:k"), _rg_btn("📷 Replace", f"pr:{uid}:r"), _rg_btn("🗑 Remove", f"pr:{uid}:d")],
+            [_rg_btn("⏭ Skip", f"pr:{uid}:s")]]
+    if st["history"]:
+        rows[1].append(_rg_btn("⬅ Undo", f"pr:{uid}:u"))
+    rows[1].append(_rg_btn("⏹ Stop", f"pr:{uid}:x"))
+    return InlineKeyboardMarkup(rows)
+
+
+async def _pr_drop_card(context, st):
+    if st.get("msg_id"):
+        try:
+            await context.bot.delete_message(chat_id=st["chat"], message_id=st["msg_id"])
+        except Exception:
+            pass
+        st["msg_id"] = None
+
+
+async def pr_show(context, uid):
+    """Show the card of the current character (skipping ones that vanished or lost their photo), or finish."""
+    st = _pr_state.get(uid)
+    if st is None:
+        return
+    await _pr_drop_card(context, st)
+    while st["pos"] < len(st["queue"]):
+        row = await asyncio.to_thread(get_character_by_code, st["queue"][st["pos"]])
+        if row is None or not row[5]:
+            st["pos"] += 1
+            continue
+        left = len(st["queue"]) - st["pos"]
+        caption = (f"🎭 {row[1]} [{row[0]}]\n📺 {row[2] or 'Not set'}\n🏷 {rarity_text(row[3])}\n\n"
+                   f"🖼 Photo {st['pos'] + 1} / {len(st['queue'])} | Left: {left}"
+                   + (f"\n📏 Range {st['range']}" if st.get("range") else ""))
+        kb = _pr_kb(uid, st)
+        try:
+            sent = await context.bot.send_photo(chat_id=st["chat"], photo=row[5], caption=caption, reply_markup=kb)
+        except Exception as e:
+            print("Photo review show error:", repr(e))
+            sent = await context.bot.send_message(chat_id=st["chat"], text=caption + "\n\n⚠️ This photo cannot be shown "
+                                                  "(Telegram no longer has it). Replace or Remove it.", reply_markup=kb)
+        st["msg_id"] = sent.message_id
+        return
+    _pr_state.pop(uid, None)
+    await context.bot.send_message(chat_id=st["chat"], text="✅ Photo review finished. Nothing left to review.")
+
+
+async def pr_apply(st, code, photo, checked, pos):
+    """Remember the old state of `code` for Undo, then write the new photo / mark."""
+    old = await asyncio.to_thread(mongo_db.get_photo_review_state, code)
+    if old is None:
+        return False
+    st["history"].append({"code": code, "photo": old[0], "checked": old[1], "pos": pos})
+    ok = await asyncio.to_thread(mongo_db.set_character_photo, code, photo, checked)
+    if ok and photo:
+        await asyncio.to_thread(clear_photo_restriction, code)
+    return ok
+
+
+def _pr_menu_back(uid):
+    return InlineKeyboardButton("« Back", callback_data=f"help:{uid}:{'owner' if is_owner(uid) else 'executive'}:addedit")
+
+
+async def _pr_menu_view(uid, kind, page=0):
+    """(text, markup) of the 🖼 Review Photos menu: m = main, an = anime list, rl = rarity list, cl = code blocks of 500."""
+    rows = await asyncio.to_thread(mongo_db.photo_review_rows)
+    total = len(rows)
+    back = [_rg_btn("« Back", f"pr:{uid}:m")]
+    if kind == "m":
+        text = (f"🖼 Review Photos\n\n{total} photo(s) are waiting to be reviewed (kept photos are not counted).\n"
+                "Pick what to review:")
+        kb = [[_rg_btn("▶️ All Characters", f"pr:{uid}:go")],
+              [_rg_btn("📺 By Anime", f"pr:{uid}:an:0"), _rg_btn("🏷 By Rarity", f"pr:{uid}:rl")],
+              [_rg_btn("🔢 By Code Range", f"pr:{uid}:cl")], [_pr_menu_back(uid)]]
+        return text, InlineKeyboardMarkup(kb)
+    if kind == "an":
+        counts = {}
+        for _n, anime, _r in rows:
+            if anime:
+                key = mongo_db.anime_key(anime)
+                counts[key] = (anime, counts.get(key, (anime, 0))[1] + 1)
+        items = sorted(counts.values(), key=lambda it: it[0].casefold())
+        part, page, pages, _off = _rg_slice(items, page, 8)
+        kb = _rg_grid([_rg_btn(f"{a[:22]} ({n})", f"pr:{uid}:as:{mongo_db.anime_hash(a)}") for a, n in part], 2)
+        if pages > 1:
+            kb.append(_rg_page_row(uid, f"pr:{uid}:an", page, pages))
+        kb.append(back)
+        return ("📺 Review by anime\n\nPick an anime (photos waiting):" if items else "📺 Review by anime\n\nNothing is waiting."), InlineKeyboardMarkup(kb)
+    if kind == "rl":
+        counts = {}
+        for _n, _a, rarity in rows:
+            counts[rarity] = counts.get(rarity, 0) + 1
+        names = [r for r in SYMBOL if counts.get(r)]
+        kb = _rg_grid([_rg_btn(f"{SYMBOL[r]} {r} ({counts[r]})", f"pr:{uid}:rs:{r}") for r in names], 2)
+        kb.append(back)
+        return ("🏷 Review by rarity\n\nPick a rarity (photos waiting):" if names else "🏷 Review by rarity\n\nNothing is waiting."), InlineKeyboardMarkup(kb)
+    counts = {}
+    for n, _a, _r in rows:
+        counts[(n - 1) // 500] = counts.get((n - 1) // 500, 0) + 1
+    kb = _rg_grid([_rg_btn(f"{b * 500 + 1:04d}-{min(b * 500 + 500, 9999):04d} ({counts[b]})", f"pr:{uid}:cs:{b * 500 + 1}")
+                   for b in sorted(counts)], 2)
+    kb.append(back)
+    return ("🔢 Review by code range\n\nPick a block of codes (photos waiting):" if counts else "🔢 Review by code range\n\nNothing is waiting."), InlineKeyboardMarkup(kb)
+
+
+async def _pr_begin(context, uid, chat_id, queue, span=""):
+    """Start a review of `queue` (codes) in the private chat."""
+    old = _pr_state.pop(uid, None)
+    if old:
+        await _pr_drop_card(context, old)
+    _pr_state[uid] = {"queue": queue, "pos": 0, "history": [], "wait": None, "msg_id": None, "chat": chat_id, "range": span}
+    await context.bot.send_message(chat_id=chat_id, text=f"🖼 Photo review: {len(queue)} photo(s). Tap Keep, Replace or Remove "
+                                                         "on each one. Undo goes back one step. Send /cancel to stop.")
+    await pr_show(context, uid)
+
+
+async def reviewphotos_command(update, context):
+    """/reviewphotos [anime | rarity] [start] [end] - review the character photos one by one (PM only).
+    Numbers are code numbers: `0250 9999` = codes 0250-9999, `0250` = from 0250 to the end, `0042 0042` = just that one."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not _rg_allowed(user.id):
+        return
+    if update.effective_chat.type != "private":
+        await safe_reply_text(msg, "⚠️ /reviewphotos can only be used in the bot's PM (private chat).")
+        return
+    words = list(context.args or [])
+    nums = []
+    while words and words[-1].isdigit() and len(words[-1]) <= 4 and len(nums) < 2:
+        nums.insert(0, int(words.pop()))
+    arg = " ".join(words).strip()
+    start = nums[0] if nums else None
+    end = nums[1] if len(nums) > 1 else None
+    if start is not None and ((not 1 <= start <= 9999) or (end is not None and (not 1 <= end <= 9999 or end < start))):
+        await safe_reply_text(msg, "❌ Codes must be from 0001 to 9999, and the end must not be smaller than the start.\n"
+                                   "Example: /reviewphotos 0250 9999")
+        return
+    only_code = anime = rarity = None
+    if start is not None and start == end and not arg:
+        only_code = f"{start:04d}"                                  # same start and end: open that one character
+    if arg:
+        if arg.title() in SYMBOL:
+            rarity = arg.title()
+        else:
+            res = await asyncio.to_thread(mongo_db.resolve_anime, arg)
+            if res["status"] not in ("exact", "one"):
+                await safe_reply_text(msg, f"❌ '{arg}' is not a rarity or a known anime.\n"
+                                           "Usage: /reviewphotos [anime | rarity] [start] [end]")
+                return
+            anime = res["name"]
+    queue = await asyncio.to_thread(mongo_db.photo_review_queue, only_code, anime, rarity, start, end)
+    if not queue:
+        await safe_reply_text(msg, "No photos to review here (every photo was already kept, or none has a photo).")
+        return
+    old = _pr_state.pop(user.id, None)
+    if old:
+        await _pr_drop_card(context, old)
+    span = (f"{start:04d}-{end:04d}" if end is not None else f"{start:04d}-9999") if start is not None else ""
+    _pr_state[user.id] = {"queue": queue, "pos": 0, "history": [], "wait": None, "msg_id": None, "chat": msg.chat_id,
+                          "range": span}
+    await safe_reply_text(msg, f"🖼 Photo review: {len(queue)} photo(s). Tap Keep, Replace or Remove on each one. "
+                               "Undo goes back one step. Send /cancel to stop.")
+    await pr_show(context, user.id)
+
+
+async def pr_callback(update, context):
+    query = update.callback_query
+    user = query.from_user
+    parts = (query.data or "").split(":")
+    try:
+        if len(parts) < 3 or not parts[1].isdigit():
+            await query.answer(HELP_STALE_TEXT, show_alert=True)
+            return
+        uid, act = int(parts[1]), parts[2]
+        if user.id != uid:
+            await query.answer(NOT_YOURS_TEXT, show_alert=True)
+            return
+        if not _rg_allowed(uid):
+            await deny_callback(query)
+            return
+        if act in ("m", "an", "rl", "cl"):               # the 🖼 Review Photos menu of /help -> Add & Edit
+            text, kb = await _pr_menu_view(uid, act, int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0)
+            await query.answer()
+            try:
+                await query.edit_message_text(text, reply_markup=kb)
+            except Exception as e:
+                print("Photo review menu error:", repr(e))
+            return
+        if act in ("go", "as", "rs", "cs"):              # a choice of the menu: start the review
+            chat = query.message.chat if query.message else None
+            if chat is None or chat.type != "private":
+                await query.answer("Open /help in a private chat with the bot to review photos.", show_alert=True)
+                return
+            arg = ":".join(parts[3:])
+            anime = rarity = start = end = None
+            span = ""
+            if act == "as":
+                anime = await asyncio.to_thread(mongo_db.anime_by_hash, arg)
+            elif act == "rs":
+                rarity = arg if arg in SYMBOL else None
+            elif act == "cs" and arg.isdigit():
+                start = int(arg)
+                end = min(start + 499, 9999)
+                span = f"{start:04d}-{end:04d}"
+            if (act == "as" and not anime) or (act == "rs" and not rarity) or (act == "cs" and start is None):
+                await query.answer(HELP_STALE_TEXT, show_alert=True)
+                return
+            queue = await asyncio.to_thread(mongo_db.photo_review_queue, None, anime, rarity, start, end)
+            if not queue:
+                await query.answer("No photos to review here (all kept, or none has a photo).", show_alert=True)
+                return
+            await query.answer()
+            await _pr_begin(context, uid, chat.id, queue, span)
+            return
+        st = _pr_state.get(uid)
+        if st is None or not query.message or query.message.message_id != st.get("msg_id"):
+            await query.answer("⌛ This review ended. Run /reviewphotos again.", show_alert=True)
+            return
+        st["wait"] = None
+        code = st["queue"][st["pos"]]
+        if act == "x":
+            left = len(st["queue"]) - st["pos"]
+            await query.answer()
+            await _pr_drop_card(context, st)
+            _pr_state.pop(uid, None)
+            await context.bot.send_message(chat_id=st["chat"], text=f"⏹ Photo review stopped. {left} photo(s) were not reviewed.")
+            return
+        if act == "r":
+            st["wait"] = code
+            await query.answer("Send the new photo now.")
+            await context.bot.send_message(chat_id=st["chat"], text=f"📷 Send the new photo for {code} (as a photo, not a file). "
+                                                                    "Tap another button to cancel this.")
+            return
+        if act == "u":
+            if not st["history"]:
+                await query.answer("Nothing to undo yet.", show_alert=True)
+                return
+            e = st["history"].pop()
+            await asyncio.to_thread(mongo_db.set_character_photo, e["code"], e["photo"], e["checked"])
+            st["pos"] = e["pos"]
+            await query.answer("Undone.")
+            await pr_show(context, uid)
+            return
+        if act == "k":
+            ok = await pr_apply(st, code, (await asyncio.to_thread(mongo_db.get_photo_review_state, code) or (None,))[0], True, st["pos"])
+        elif act == "d":
+            ok = await pr_apply(st, code, None, None, st["pos"])
+        elif act == "s":
+            ok = await pr_apply(st, code, (await asyncio.to_thread(mongo_db.get_photo_review_state, code) or (None,))[0], None, st["pos"])
+        else:
+            await query.answer(HELP_STALE_TEXT, show_alert=True)
+            return
+        if not ok:
+            await query.answer("That character no longer exists.", show_alert=True)
+        else:
+            await query.answer({"k": "✅ Kept", "d": "🗑 Photo removed", "s": "⏭ Skipped"}[act])
+        st["pos"] += 1
+        await pr_show(context, uid)
+    except Exception as e:
+        print("Photo review callback error:", repr(e))
+        try:
+            await query.answer("⚠️ Something went wrong. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def pr_photo_input(update, context):
+    """The new photo after 📷 Replace. Does nothing unless this user's review is waiting for one."""
+    msg, user = update.effective_message, update.effective_user
+    if not msg or not user or not msg.photo:
+        return
+    st = _pr_state.get(user.id)
+    if not st or not st.get("wait") or not _rg_allowed(user.id):
+        return
+    code, st["wait"] = st["wait"], None
+    if st["pos"] >= len(st["queue"]) or st["queue"][st["pos"]] != code:
+        return
+    try:
+        ok = await pr_apply(st, code, msg.photo[-1].file_id, True, st["pos"])
+    except Exception as e:
+        print("Photo review replace error:", repr(e))
+        await safe_reply_text(msg, "❌ Could not save the photo. Please try again.")
+        return
+    if not ok:
+        await safe_reply_text(msg, "❌ That character no longer exists.")
+    else:
+        await safe_reply_text(msg, f"✅ Photo replaced for {code}.")
+    st["pos"] += 1
+    await pr_show(context, user.id)
 
 
 async def _cw_hub(role, uid):
@@ -14435,6 +14734,8 @@ async def cancel_everything(update, context):
         stopped.append("Change Worth input")
     if _rg_state.pop(uid, None) is not None:
         stopped.append("Range Panel")
+    if _pr_state.pop(uid, None) is not None:
+        stopped.append("Photo review")
     if uid in _imp_state:
         _imp_cleanup(uid)
         stopped.append("Restore session")
@@ -14723,6 +15024,7 @@ COMMANDS = {
     "editcode": "Owner/Executive: change a character's code directly (/editcode <code/name> <new code>)",
     "fillranges": "Owner/Executive: move every character, Evolution characters too, into its anime's code range (/fillranges [anime])",
     "undocodes": "Owner/Executive: undo the last /fillranges or range shift",
+    "reviewphotos": "Owner/Executive: review character photos one by one - keep, replace or remove (/reviewphotos [anime|rarity] [start] [end])",
     "editrange": "Owner/Executive: make an anime's range bigger, later ranges shift up (/editrange <anime> [new end])",
     "exportdb": "Owner: send the whole database as zip file(s) to your PM (/exportdb [collections])",
     "importdb": "Owner: restore the database from /exportdb zip files (/importdb [collections])",
@@ -15548,7 +15850,7 @@ EXECUTIVE_COMMANDS = {
     "btransfer", "unbtransfer", "setrules", "resetrules", "dm", "dmhistory",
     "setrange", "delrange", "range", "ranges", "freecode", "freecodes", "nextcode",      # anime code ranges (Owner + Executive)
     "editcode",                                                                          # change a character's code directly
-    "fillranges", "undocodes", "editrange",                                              # move characters into their ranges / undo that / grow a range
+    "fillranges", "undocodes", "editrange", "reviewphotos",                                              # move characters into their ranges / undo that / grow a range
 } | badge_banner.STAFF_COMMANDS | fusion.WEAPON_STAFF_COMMANDS
 SCOUT_COMMANDS = {
     "addcharacter", "addphoto", "editphoto", "editcharacter", "edit", "clearspawn", "notifications", "notificationoff", "notificationon",
@@ -15567,6 +15869,7 @@ def register_executive_commands(app):
     app.add_handler(CommandHandler("fillranges", fillranges_command))
     app.add_handler(CommandHandler("undocodes", undocodes_command))
     app.add_handler(CommandHandler("editrange", editrange_command))
+    app.add_handler(CommandHandler("reviewphotos", reviewphotos_command))
     app.add_handler(CommandHandler("restrictions", restrictions_list))
     app.add_handler(CommandHandler("botoff", bot_off))
     app.add_handler(CommandHandler("spawnoff", spawn_off_command))
@@ -16049,6 +16352,8 @@ def main():
     app.add_handler(CallbackQueryHandler(change_worth_callback, pattern=r"^cw:"))
     app.add_handler(CallbackQueryHandler(range_callback, pattern=r"^rg:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, range_panel_input), group=53)
+    app.add_handler(CallbackQueryHandler(pr_callback, pattern=r"^pr:"))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, pr_photo_input), group=54)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, change_worth_input), group=52)
     app.add_handler(CallbackQueryHandler(event_claim_callback, pattern=r"^event:"))
     app.add_handler(CallbackQueryHandler(transfer_callback, pattern=r"^tr_(accept|decline):"))

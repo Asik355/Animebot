@@ -122,7 +122,19 @@ def _is_staff(uid):
 
 def _group_title(chat_id):
     doc = _col(mongo_db.GROUPS).find_one({"_id": int(chat_id)}) or {}
-    return doc.get("title") or ""
+    return doc.get("title") or doc.get("known_title") or ""
+
+
+async def _live_title(bot, chat_id):
+    """Ask Telegram for a group's name (works for some groups even after the bot left) and remember it."""
+    try:
+        chat = await asyncio.wait_for(bot.get_chat(int(chat_id)), timeout=6)
+        title = (getattr(chat, "title", None) or getattr(chat, "username", None) or "").strip()
+    except Exception:
+        return ""
+    if title:
+        await asyncio.to_thread(mongo_db.remember_group_title, chat_id, title)
+    return title
 
 
 def _group_choices(limit=12):
@@ -139,7 +151,10 @@ def _group_choices(limit=12):
         if cid in banned or cid > 0:                    # private chats (positive ids) are not groups
             continue
         gdoc = _col(mongo_db.GROUPS).find_one({"_id": cid}) or {}
-        out.append((cid, int(r["n"]), str(r.get("last") or ""), gdoc.get("title") or "", bool(gdoc.get("registered"))))
+        if gdoc.get("title") and not gdoc.get("known_title"):        # remember the name of a group the bot is still in
+            mongo_db.remember_group_title(cid, gdoc["title"])
+        out.append((cid, int(r["n"]), str(r.get("last") or ""), gdoc.get("title") or gdoc.get("known_title") or "",
+                    bool(gdoc.get("registered"))))
     out.sort(key=lambda x: x[2], reverse=True)
     return out[:limit]
 
@@ -307,8 +322,10 @@ def _confirm_kb(uid, chat_id):
                                   InlineKeyboardButton("↩️ Cancel", callback_data=f"sec:bn:{uid}")]])
 
 
-async def _confirm_text(chat_id):
+async def _confirm_text(chat_id, bot=None):
     title = await asyncio.to_thread(_group_title, chat_id)
+    if not title and bot is not None:
+        title = await _live_title(bot, chat_id)
     n = len(await asyncio.to_thread(_members_of, [chat_id]))
     return (f"🚫 Ban this group?\n\n🏷 {_h(title) or 'Title not stored'}\n🆔 <code>{chat_id}</code>\n"
             f"👥 {n} player(s) caught characters there. They will be blocked everywhere (groups, PM and buttons) unless "
@@ -324,9 +341,15 @@ async def bangroup_command(update, context):
         if chat_id is None:
             await _say(update, "❌ A group id looks like <code>-1001234567890</code>.\nUse /bangroup alone to pick from the groups in the database.")
             return
-        await _say(update, await _confirm_text(chat_id), reply_markup=_confirm_kb(uid, chat_id))
+        await _say(update, await _confirm_text(chat_id, context.bot), reply_markup=_confirm_kb(uid, chat_id))
         return
     choices = await asyncio.to_thread(_group_choices)
+    missing = [i for i, c in enumerate(choices) if not c[3]]
+    if missing:                                                   # names that were never stored: ask Telegram once
+        found = await asyncio.gather(*[_live_title(context.bot, choices[i][0]) for i in missing])
+        for i, name in zip(missing, found):
+            if name:
+                choices[i] = choices[i][:3] + (name,) + choices[i][4:]
     if not choices:
         await _say(update, "ℹ️ The database has no group with caught characters to pick from.\nUse /bangroup &lt;group id&gt;.")
         return
@@ -357,7 +380,7 @@ async def security_callback(update, context):
         chat_id = int(parts[3])
         if action == "bg":
             await q.answer()
-            await q.edit_message_text(await _confirm_text(chat_id), parse_mode="HTML", reply_markup=_confirm_kb(q.from_user.id, chat_id))
+            await q.edit_message_text(await _confirm_text(chat_id, context.bot), parse_mode="HTML", reply_markup=_confirm_kb(q.from_user.id, chat_id))
         elif action == "by":
             title, n = await asyncio.to_thread(_ban_group, chat_id, q.from_user.id)
             left = ""
@@ -403,7 +426,8 @@ async def bannedgroups_command(update, context):
     lines = ["🛡 Banned Groups", ""]
     for i, d in enumerate(docs, 1):
         n = len(await asyncio.to_thread(_members_of, [d["_id"]]))
-        lines.append(f"{i}. {_h(d.get('title') or '') or 'Title not stored'} · <code>{d['_id']}</code>\n    👥 {n} players · banned {_h(str(d.get('banned_at', '')))}")
+        shown = d.get("title") or await asyncio.to_thread(_group_title, d["_id"])
+        lines.append(f"{i}. {_h(shown or '') or 'Title not stored'} · <code>{d['_id']}</code>\n    👥 {n} players · banned {_h(str(d.get('banned_at', '')))}")
     lines += ["", "Lift a ban: /unbangroup &lt;group id&gt;"]
     await _say(update, "\n".join(lines))
 
